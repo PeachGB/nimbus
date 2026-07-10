@@ -10,9 +10,29 @@ use crate::{VaultResult, error::VaultError};
 
 /// Identifies an `Object` within a `Vault`'s origin. Meaning is origin-specific
 /// (a relative path for `OriginFileSystem`, an opaque id for `OriginHTTP`, etc).
+///
+/// # Examples
+///
+/// ```
+/// use nimbus_vault::object::ObjectId;
+///
+/// let id = ObjectId::from("photos/2024/summer.jpg");
+/// assert_eq!(id.as_str(), "photos/2024/summer.jpg");
+/// assert!(!id.is_root());
+///
+/// let root = ObjectId::default();
+/// assert_eq!(root.as_str(), "/");
+/// assert!(root.is_root());
+///
+/// // Vault methods accept anything that converts into an ObjectId:
+/// let from_string: ObjectId = String::from("notes.txt").into();
+/// let from_str: ObjectId = "notes.txt".into();
+/// assert_eq!(from_string, from_str);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ObjectId(String);
 impl ObjectId {
+    /// Borrows the id's underlying string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -62,14 +82,34 @@ impl From<ObjectId> for String {
 
 /// Free-form metadata attached to an `Object`, used e.g. by `Object::changed` to detect drift
 /// between a local and remote copy.
+///
+/// # Examples
+///
+/// ```
+/// use nimbus_vault::object::Metadata;
+///
+/// let mut meta = Metadata::new();
+/// meta.set_size(1024)
+///     .set_content_type("text/plain".to_string())
+///     .add_extra("checksum".to_string(), "abc123".to_string());
+///
+/// assert_eq!(meta.size, Some(1024));
+/// assert_eq!(meta.content_type.as_deref(), Some("text/plain"));
+/// assert_eq!(meta.extra.get("checksum").map(String::as_str), Some("abc123"));
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metadata {
+    /// Payload size in bytes, if known.
     pub size: Option<u64>,
+    /// MIME type of the payload, if known.
     pub content_type: Option<String>,
+    /// Last-modified timestamp, if known.
     pub modified: Option<DateTime<Utc>>,
+    /// Free-form, origin-specific key/value pairs not covered by the fields above.
     pub extra: HashMap<String, String>,
 }
 impl Metadata {
+    /// Builds an empty `Metadata` with every field unset.
     pub fn new() -> Self {
         Metadata {
             size: None,
@@ -78,18 +118,22 @@ impl Metadata {
             extra: HashMap::new(),
         }
     }
+    /// Sets `size` and returns `self` for chaining.
     pub fn set_size(&mut self, size: u64) -> &mut Self {
         self.size = Some(size);
         self
     }
+    /// Sets `content_type` and returns `self` for chaining.
     pub fn set_content_type(&mut self, ct: String) -> &mut Self {
         self.content_type = Some(ct);
         self
     }
+    /// Sets `modified` and returns `self` for chaining.
     pub fn set_modified(&mut self, dt: DateTime<Utc>) -> &mut Self {
         self.modified = Some(dt);
         self
     }
+    /// Inserts a key/value pair into `extra` and returns `self` for chaining.
     pub fn add_extra(&mut self, key: String, val: String) -> &mut Self {
         self.extra.insert(key, val);
         self
@@ -113,32 +157,84 @@ impl Hash for Metadata {
 }
 
 /// A node in a `Vault`'s tree: a file-like `Leaf`, a directory-like `Branch`, or the `Root`.
+///
+/// # Examples
+///
+/// Objects returned by an origin are typically matched by variant:
+///
+/// ```
+/// use nimbus_vault::object::{Metadata, Object, ObjectId};
+///
+/// let object = Object::Leaf {
+///     name: "notes.txt".to_string(),
+///     id: ObjectId::from("notes.txt"),
+///     meta: Metadata::new(),
+/// };
+///
+/// match &object {
+///     Object::Leaf { name, .. } => println!("file: {name}"),
+///     Object::Branch { name, .. } => println!("directory: {name}"),
+///     Object::Root { .. } => println!("root"),
+/// }
+///
+/// // or via the variant-agnostic accessors:
+/// assert_eq!(object.get_name(), "notes.txt");
+/// assert_eq!(object.get_id().as_str(), "notes.txt");
+/// assert!(object.get_meta().is_some());
+/// ```
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Object {
+    /// A file-like node with content but no children.
     Leaf {
+        /// The leaf's display name (typically the last path component).
         name: String,
+        /// The leaf's id within its origin.
         id: ObjectId,
+        /// The leaf's metadata.
         meta: Metadata,
     },
+    /// A directory-like node with children but no content of its own.
     Branch {
+        /// The branch's display name (typically the last path component).
         name: String,
+        /// The branch's id within its origin.
         id: ObjectId,
+        /// The branch's metadata.
         meta: Metadata,
+        /// The branch's children, once known (populated by `Vault::list`).
         children: Option<Vec<ObjectId>>,
     },
+    /// The vault's root node; has children but no name/metadata of its own.
     Root {
+        /// The root's id (conventionally `ObjectId::default()`, i.e. `"/"`).
         id: ObjectId,
+        /// The root's children, once known (populated by `Vault::list`).
         children: Option<Vec<ObjectId>>,
     },
 }
 
 /// Selects which `Object` variant to build in `Object::push`.
 pub enum ObjectType {
+    /// Build a `Object::Leaf`.
     Leaf,
+    /// Build a `Object::Branch`.
     Branch,
+    /// Build a `Object::Root`; always rejected by `Object::push` since a vault has exactly
+    /// one root.
     Root,
 }
 impl Object {
+    /// Builds the canonical root `Object`, with id `"/"` and no known children.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nimbus_vault::object::Object;
+    ///
+    /// let root = Object::root();
+    /// assert_eq!(root.get_id().as_str(), "/");
+    /// assert!(root.get_meta().is_none());
+    /// ```
     pub fn root() -> Self {
         Object::Root {
             id: ObjectId::from("/"),
@@ -156,6 +252,7 @@ impl Object {
             children: Some(children),
         }
     }
+    /// Returns this object's id, regardless of variant.
     pub fn get_id(&self) -> ObjectId {
         match self {
             Object::Root { id, .. } | Object::Leaf { id, .. } | Object::Branch { id, .. } => {
@@ -163,19 +260,58 @@ impl Object {
             }
         }
     }
+    /// Returns this object's display name, or `"root"` for `Object::Root`.
     pub fn get_name(&self) -> String {
         match self {
             Object::Leaf { name, .. } | Object::Branch { name, .. } => name.clone(),
             _ => String::from("root"),
         }
     }
+    /// Returns this object's metadata, or `None` for `Object::Root` (which has none).
     pub fn get_meta(&self) -> Option<Metadata> {
         match self {
             Object::Leaf { meta, .. } | Object::Branch { meta, .. } => Some(meta.clone()),
             _ => None,
         }
     }
-    ///add children to Branch
+    /// Appends a new child of `object_type` onto `self`, which must be a `Branch`/`Root`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nimbus_vault::object::{Metadata, Object, ObjectId, ObjectType};
+    ///
+    /// let mut root = Object::root();
+    /// root.push(
+    ///     ObjectType::Leaf,
+    ///     "notes.txt".to_string(),
+    ///     ObjectId::from("notes.txt"),
+    ///     Metadata::new(),
+    ///     None,
+    /// )?;
+    ///
+    /// let children = match &root {
+    ///     Object::Root { children, .. } => children.as_ref().unwrap(),
+    ///     _ => unreachable!(),
+    /// };
+    /// assert_eq!(children[0].as_str(), "notes.txt");
+    /// # Ok::<(), nimbus_vault::error::VaultError>(())
+    /// ```
+    ///
+    /// Pushing onto a `Leaf`, or pushing an `ObjectType::Root`, both fail with
+    /// `VaultError::InvalidMethodCall`:
+    ///
+    /// ```
+    /// use nimbus_vault::{error::VaultError, object::{Metadata, Object, ObjectId, ObjectType}};
+    ///
+    /// let mut leaf = Object::Leaf {
+    ///     name: "notes.txt".to_string(),
+    ///     id: ObjectId::from("notes.txt"),
+    ///     meta: Metadata::new(),
+    /// };
+    /// let result = leaf.push(ObjectType::Leaf, "x".to_string(), ObjectId::from("x"), Metadata::new(), None);
+    /// assert!(matches!(result, Err(VaultError::InvalidMethodCall)));
+    /// ```
     pub fn push(
         &mut self,
         object_type: ObjectType,
@@ -213,6 +349,29 @@ impl Object {
     }
     /// Compares metadata hashes to detect whether `remote` diverges from `self`.
     /// Returns `false` for objects with no metadata (e.g. `Root`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nimbus_vault::object::{Metadata, Object, ObjectId};
+    ///
+    /// let local = Object::Leaf {
+    ///     name: "notes.txt".to_string(),
+    ///     id: ObjectId::from("notes.txt"),
+    ///     meta: Metadata::new(),
+    /// };
+    /// let identical = local.clone();
+    /// assert!(!local.changed(&identical));
+    ///
+    /// let mut different_meta = Metadata::new();
+    /// different_meta.set_size(42);
+    /// let diverged = Object::Leaf {
+    ///     name: "notes.txt".to_string(),
+    ///     id: ObjectId::from("notes.txt"),
+    ///     meta: different_meta,
+    /// };
+    /// assert!(local.changed(&diverged));
+    /// ```
     pub fn changed(&self, remote: &Object) -> bool {
         let (Some(local_meta), Some(remote_meta)) = (self.get_meta(), remote.get_meta()) else {
             return false;

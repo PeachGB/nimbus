@@ -12,6 +12,49 @@ use crate::{
     origin::{ByteStream, Origin},
 };
 
+/// An [`crate::origin::Origin`] backed by a shell command per operation. Each command is a
+/// `{placeholder}`-templated string, substituted with the object id/name/metadata plus any
+/// `extra_vars`; `list`/`get` expect the command's stdout to be JSON matching `Object`,
+/// `fetch`/`send` stream the payload over stdout/stdin.
+///
+/// # Examples
+///
+/// ```
+/// use nimbus_vault::{object::ObjectId, origin::{Origin, command::OriginCommand}};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let origin = OriginCommand::new(
+///     "printf hello".to_string(),            // fetch_cmd
+///     "echo '[]'".to_string(),                // list_cmd
+///     r#"echo '{"Leaf":{"name":"f","id":"{id}","meta":{"size":null,"content_type":null,"modified":null,"extra":{}}}}'"#.to_string(), // get_cmd
+///     "true".to_string(),                     // put_cmd
+///     "true".to_string(),                     // send_cmd
+///     "true".to_string(),                     // delete_cmd
+///     None,                                   // extra_vars
+/// );
+///
+/// let object = origin.get(&ObjectId::from("f1")).await?;
+/// assert_eq!(object.get_id().as_str(), "f1"); // `{id}` was substituted into the template
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Declaratively, via `[origin_config]` in a vault's TOML config:
+///
+/// ```toml
+/// [origin_config]
+/// type = "command"
+/// list_cmd   = "ls {root}"
+/// fetch_cmd  = "cat {root}/{id}"
+/// get_cmd    = "stat {root}/{id}"
+/// put_cmd    = "touch {root}/{id}"
+/// send_cmd   = "tee {root}/{id}"
+/// delete_cmd = "rm {root}/{id}"
+///
+/// [origin_config.extras]
+/// root = "/srv/data"
+/// ```
 pub struct OriginCommand {
     fetch_cmd: String,
     list_cmd: String,
@@ -22,17 +65,26 @@ pub struct OriginCommand {
     delete_cmd: String,
     extra_vars: HashMap<String, String>,
 }
+
+/// Identifies which of `OriginCommand`'s configured command templates to run.
 pub enum CmdType {
+    /// Runs `fetch_cmd`.
     Fetch,
+    /// Runs `list_cmd`.
     List,
+    /// Runs `get_cmd`.
     Get,
 
+    /// Runs `put_cmd`.
     Put,
+    /// Runs `send_cmd`.
     Send,
 
+    /// Runs `delete_cmd`.
     Delete,
 }
 impl CmdType {
+    /// The config field name this variant corresponds to (e.g. `"fetch_cmd"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             CmdType::Fetch => "fetch_cmd",
@@ -43,11 +95,14 @@ impl CmdType {
             CmdType::Delete => "delete_cmd",
         }
     }
+    /// Owned version of [`CmdType::as_str`].
     pub fn to_string(&self) -> String {
         self.as_str().to_string()
     }
 }
 impl OriginCommand {
+    /// Builds an `OriginCommand` from one command template per operation, plus optional extra
+    /// `{placeholder}` substitutions shared by every template.
     pub fn new(
         fetch_cmd: String,
         list_cmd: String,

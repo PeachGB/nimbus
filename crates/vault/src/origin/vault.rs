@@ -13,11 +13,50 @@ use crate::{
 /// directly with one another without either side needing to know the other is a `Vault` rather
 /// than a plain origin. Also the type built by `OriginConfig::Vault`, letting a vault config
 /// reference another vault's config file as its origin.
+///
+/// # Examples
+///
+/// ```
+/// use std::{fs, sync::Arc};
+/// use nimbus_vault::{origin::vault::OriginVault, vault::Vault};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // two independent vaults, each backed by its own directory
+/// let source_dir = tempfile::tempdir()?;
+/// let source_data = source_dir.path().join("data");
+/// fs::create_dir_all(&source_data)?;
+/// fs::write(source_data.join("notes.txt"), b"hello")?;
+/// let source_config = source_dir.path().join("vault.toml");
+/// fs::write(&source_config, format!(
+///     "name = \"source\"\n\n[origin_config]\ntype = \"fs\"\nroot = \"{}\"\n",
+///     source_data.display(),
+/// ))?;
+///
+/// let dest_dir = tempfile::tempdir()?;
+/// let dest_data = dest_dir.path().join("data");
+/// fs::create_dir_all(&dest_data)?;
+/// let dest_config = dest_dir.path().join("vault.toml");
+/// fs::write(&dest_config, format!(
+///     "name = \"dest\"\n\n[origin_config]\ntype = \"fs\"\nroot = \"{}\"\n",
+///     dest_data.display(),
+/// ))?;
+///
+/// let source = Vault::new(source_config)?;
+/// let dest = Arc::new(Vault::new(dest_config)?);
+/// let dest_as_origin = OriginVault::new(dest); // wrap `dest` so it can act as a remote
+///
+/// source.push(&"".into(), &dest_as_origin).await?; // sync source's tree into dest
+/// assert!(dest_data.join("notes.txt").is_file());
+/// # Ok(())
+/// # }
+/// ```
 pub struct OriginVault {
     vault: Arc<Vault>,
 }
 
 impl OriginVault {
+    /// Wraps `vault` so it can be used as an `Origin`.
     pub fn new(vault: Arc<Vault>) -> Self {
         OriginVault { vault }
     }

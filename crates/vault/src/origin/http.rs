@@ -8,6 +8,61 @@ use crate::{
     origin::{ByteStream, Origin},
 };
 
+/// An [`crate::origin::Origin`] backed by a REST-ish HTTP API. Each operation is a
+/// `{id}`-templated path appended to `base_url`; `get`/`list` are `GET`s deserialized as
+/// JSON, `fetch` streams the response body, `put` `PUT`s the `Object` as a JSON body, `send`
+/// `PUT`s the payload stream as the request body, and `delete` is a `DELETE`. Any non-2xx
+/// response becomes a `VaultError`, with 404 mapped to `NotFound`.
+///
+/// # Examples
+///
+/// ```
+/// use httpmock::MockServer; // test-only mock server, shown here to keep the example runnable
+/// use nimbus_vault::{object::ObjectId, origin::{Origin, http::OriginHTTP}};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let server = MockServer::start();
+/// server.mock(|when, then| {
+///     when.method(httpmock::Method::GET).path("/get/notes.txt");
+///     then.status(200).json_body(serde_json::json!({
+///         "Leaf": {
+///             "name": "notes.txt",
+///             "id": "notes.txt",
+///             "meta": { "size": 5, "content_type": null, "modified": null, "extra": {} },
+///         }
+///     }));
+/// });
+///
+/// let origin = OriginHTTP::new(
+///     server.base_url(),
+///     "/fetch/{id}".to_string(),
+///     "/list/{id}".to_string(),
+///     "/get/{id}".to_string(),
+///     "/put/{id}".to_string(),
+///     "/send/{id}".to_string(),
+///     "/delete/{id}".to_string(),
+/// );
+///
+/// let object = origin.get(&ObjectId::from("notes.txt")).await?;
+/// assert_eq!(object.get_name(), "notes.txt");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Declaratively, via `[origin_config]` in a vault's TOML config:
+///
+/// ```toml
+/// [origin_config]
+/// type = "http"
+/// base_url   = "https://example.com"
+/// list_url   = "/list/{id}"
+/// fetch_url  = "/fetch/{id}"
+/// get_url    = "/get/{id}"
+/// put_url    = "/put/{id}"
+/// send_url   = "/send/{id}"
+/// delete_url = "/delete/{id}"
+/// ```
 pub struct OriginHTTP {
     base_url: String,
 
@@ -23,6 +78,7 @@ pub struct OriginHTTP {
 }
 
 impl OriginHTTP {
+    /// Builds an `OriginHTTP` from `base_url` plus one `{id}`-templated path per operation.
     pub fn new(
         base_url: String,
         fetch_url: String,

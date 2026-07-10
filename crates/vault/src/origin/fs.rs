@@ -10,10 +10,49 @@ use crate::{
     origin::{ByteStream, Origin},
 };
 
+/// An [`crate::origin::Origin`] backed by a directory on disk, via `tokio::fs`. `ObjectId`s
+/// are relative paths resolved against `root`.
+///
+/// # Examples
+///
+/// ```
+/// use nimbus_vault::{
+///     object::{Metadata, Object, ObjectId},
+///     origin::{Origin, fs::OriginFileSystem},
+/// };
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let dir = tempfile::tempdir()?;
+/// let origin = OriginFileSystem::new(dir.path().to_path_buf());
+///
+/// let file = Object::Leaf {
+///     name: "notes.txt".to_string(),
+///     id: ObjectId::from("notes.txt"),
+///     meta: Metadata::new(),
+/// };
+/// origin.put(&file).await?; // creates the file
+/// assert!(dir.path().join("notes.txt").is_file());
+///
+/// let fetched = origin.get(&ObjectId::from("notes.txt")).await?;
+/// assert!(matches!(fetched, Object::Leaf { .. }));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Declaratively, via `[origin_config]` in a vault's TOML config:
+///
+/// ```toml
+/// [origin_config]
+/// type = "fs"
+/// root = "/srv/data"
+/// ```
 pub struct OriginFileSystem {
     root: PathBuf,
 }
 impl OriginFileSystem {
+    /// Builds an `OriginFileSystem` rooted at `root`; every `ObjectId` is resolved relative
+    /// to it.
     pub fn new(root: PathBuf) -> Self {
         OriginFileSystem { root }
     }
