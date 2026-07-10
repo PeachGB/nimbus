@@ -10,7 +10,7 @@ This repo is a Cargo workspace with four crates:
 
 | Crate         | Status  | What it is                                              |
 |---------------|---------|----------------------------------------------------------|
-| `nimbus-vault`  | working | The core library: `Object`, `Vault`, `Origin` and its three implementations. |
+| `nimbus-vault`  | working | The core library: `Object`, `Vault`, `Origin` and its four implementations. |
 | `nimbus-cli`    | WIP     | Command-line interface built on `nimbus-vault`. |
 | `nimbus-daemon` | stub    | Background sync process (not yet implemented). |
 | `nimbus-tui`    | stub    | Terminal UI frontend (not yet implemented). |
@@ -30,7 +30,7 @@ crate with real functionality right now.
 
   ```rust
   #[async_trait::async_trait]
-  pub trait Origin {
+  pub trait Origin: Send + Sync {
       async fn fetch(&self, id: &ObjectId) -> VaultResult<ByteStream>;
       async fn list(&self, id: &ObjectId) -> VaultResult<Vec<Object>>;
       async fn get(&self, id: &ObjectId) -> VaultResult<Object>;
@@ -49,12 +49,14 @@ crate with real functionality right now.
   `find(path)` resolves a `/`-separated path to an `ObjectId` by walking the tree
   one `list` call per component.
 
-Three built-in origins ship in `nimbus-vault`:
+Four built-in origins ship in `nimbus-vault`:
 
 - `OriginFileSystem` (`fs`) — a directory on disk, via `tokio::fs`.
 - `OriginHTTP` (`http`) — any REST-ish API, with a `{id}`-templated URL per operation.
 - `OriginCommand` (`command`) — a shell command per operation; the universal escape
   hatch (see below).
+- `OriginVault` (`vault`) — another `Vault`, wrapped so it can act as an origin
+  in its own right (see [Using a vault as an origin](#using-a-vault-as-an-origin)).
 
 A vault is fully described by a TOML file, deserialized into `VaultConfig` /
 `OriginConfig`:
@@ -80,6 +82,15 @@ get_cmd    = "stat {id}"
 put_cmd    = "touch {id}"
 send_cmd   = "touch {id}"
 delete_cmd = "rm {id}"
+```
+
+```toml
+# vault.toml — backed by another vault
+name = "outer-vault"
+
+[origin_config]
+type = "vault"
+path = "inner.toml"
 ```
 
 ```rust
@@ -151,15 +162,52 @@ use nimbus_vault::config::OriginConfig;
 let origin = OriginConfig::from_file("origin.toml".into())?;
 ```
 
+`OriginConfig::build` takes `self` by value rather than `&self`, so building an
+origin moves each variant's fields (command strings, URLs, the filesystem root,
+...) straight into the `Origin` it constructs instead of cloning them — `build`
+consumes the config, it doesn't just read it.
+
 Any program that can read arguments, print JSON, and read/write stdio can be an
 origin — a database CLI, a `curl` wrapper, a custom binary, anything.
+
+## Using a vault as an origin
+
+`OriginVault` wraps an `Arc<Vault>` and implements `Origin` by forwarding every
+call to the wrapped vault's own method of the same name. That means one `Vault`
+can act as the `remote` for another vault's `push`/`pull`, so two vaults can sync
+directly with each other:
+
+```rust
+use nimbus_vault::origin::vault::OriginVault;
+
+let dest_vault = Arc::new(Vault::new("dest.toml".into())?);
+let dest_as_origin = OriginVault::new(dest_vault);
+
+source_vault.push(&root_id, &dest_as_origin).await?;
+```
+
+It's also reachable declaratively, by pointing an `origin_config` at another
+vault's own config file:
+
+```toml
+# outer.toml
+name = "outer-vault"
+
+[origin_config]
+type = "vault"
+path = "inner.toml"
+```
+
+Building `outer.toml` opens `inner.toml` as a full `Vault` (via `Vault::new`) and
+wraps it in an `OriginVault`, so any error opening the inner vault (missing file,
+invalid TOML, bad origin config) propagates straight out of the outer build.
 
 ## Syncing between origins
 
 `Vault::pull(id, remote)` / `Vault::push(id, remote)` recursively sync the subtree
-at `id` between the vault's own origin and any other `&dyn Origin`, using
-`Object::changed` (a metadata hash comparison) to skip objects that haven't
-changed:
+at `id` between the vault's own origin and any other `&dyn Origin` — a plain
+origin, or another `Vault` wrapped in `OriginVault` — using `Object::changed` (a
+metadata hash comparison) to skip objects that haven't changed:
 
 ```rust
 // bring the vault's local origin up to date with `remote`
@@ -177,7 +225,7 @@ vault.push(&root_id, remote.as_ref()).await?;
   chunks, never as one big in-memory blob.
 - **Origin-agnostic sync** — `pull`/`push` are written entirely against the
   `Origin` trait, so the same sync logic works between any two backends: disk,
-  HTTP, shell command, or a mix of the three.
+  HTTP, shell command, another vault, or a mix of the four.
 
 ## License
 
