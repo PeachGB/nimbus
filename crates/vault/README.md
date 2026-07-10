@@ -102,3 +102,7 @@ cargo fmt -p vault
 ## Status
 
 102 unit tests covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via a mock `Origin`, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`put`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — and an end-to-end `push` between two real fs-backed vaults via `OriginVault`), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`), `origin::http` (against a mock server via `httpmock`), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

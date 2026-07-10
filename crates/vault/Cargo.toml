@@ -2,6 +2,9 @@
 name = "nimbus-vault"
 version = "0.1.0"
 edition = "2024"
+description = "A generic sync abstraction: a tree of objects (a vault) whose actual storage lives behind a pluggable origin."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PeachGB/nimbus/tree/main/crates/vault"
 
 [dependencies]
 async-trait.workspace = true
