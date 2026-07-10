@@ -163,7 +163,7 @@ impl Origin for OriginCommand {
             .stdout(std::process::Stdio::piped())
             .spawn()?;
 
-        let mut stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| VaultError::Generic("failed to open stdout".into()))?;

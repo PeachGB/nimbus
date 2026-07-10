@@ -21,6 +21,11 @@ impl ObjectId {
         self.0.as_str() == "/"
     }
 }
+impl From<&ObjectId> for ObjectId {
+    fn from(id: &ObjectId) -> Self {
+        id.clone()
+    }
+}
 
 impl Default for ObjectId {
     /// Defaults to `"/"`, the conventional root id used when a `VaultConfig` omits `root_id`.

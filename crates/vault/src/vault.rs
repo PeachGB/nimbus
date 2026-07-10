@@ -693,4 +693,39 @@ mod tests {
         let result = vault.push(&root, &FailingGetOrigin).await;
         assert!(matches!(result, Err(VaultError::Generic(_))));
     }
+
+    #[tokio::test]
+    async fn push_syncs_into_another_vault_wrapped_as_an_origin_via_origin_vault() {
+        use crate::origin::vault::OriginVault;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_root = tmp.path().join("source");
+        let dest_root = tmp.path().join("dest");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&dest_root).unwrap();
+        std::fs::write(source_root.join("file.txt"), b"payload").unwrap();
+
+        let source_origin = crate::origin::fs::OriginFileSystem::new(source_root);
+        let source_vault = Vault::from_origin(
+            "source".to_string(),
+            ObjectId::from(""),
+            Arc::new(source_origin),
+        );
+
+        let dest_origin = crate::origin::fs::OriginFileSystem::new(dest_root.clone());
+        let dest_vault = Arc::new(Vault::from_origin(
+            "dest".to_string(),
+            ObjectId::from(""),
+            Arc::new(dest_origin),
+        ));
+        let dest_as_origin = OriginVault::new(dest_vault);
+
+        source_vault
+            .push(&ObjectId::from(""), &dest_as_origin)
+            .await
+            .unwrap();
+
+        let contents = std::fs::read(dest_root.join("file.txt")).unwrap();
+        assert_eq!(contents, b"payload");
+    }
 }

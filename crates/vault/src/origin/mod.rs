@@ -9,10 +9,11 @@ use bytes::Bytes;
 pub mod command;
 pub mod fs;
 pub mod http;
+pub mod vault;
 
 pub type ByteStream = BoxStream<'static, VaultResult<Bytes>>;
 #[async_trait::async_trait]
-pub trait Origin {
+pub trait Origin: Send + Sync {
     async fn fetch(&self, id: &ObjectId) -> VaultResult<ByteStream>;
     async fn list(&self, id: &ObjectId) -> VaultResult<Vec<Object>>;
     async fn get(&self, id: &ObjectId) -> VaultResult<Object>;

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use toml;
 
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     VaultResult,
     object::ObjectId,
-    origin::{Origin, command::OriginCommand, fs::OriginFileSystem, http::OriginHTTP},
+    origin::{
+        Origin, command::OriginCommand, fs::OriginFileSystem, http::OriginHTTP, vault::OriginVault,
+    },
+    vault::Vault,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -20,7 +23,7 @@ impl VaultConfig {
     pub fn build(from: PathBuf) -> VaultResult<(String, ObjectId, Box<dyn Origin>)> {
         let cfg = std::fs::read_to_string(from)?;
         let cfg: VaultConfig = toml::from_str(&cfg)?;
-        let origin = cfg.origin_config.build();
+        let origin = cfg.origin_config.build()?;
         Ok((cfg.name, cfg.root_id, origin))
     }
 }
@@ -212,6 +215,63 @@ mod tests {
         let result = OriginConfig::from_file(path);
         assert!(matches!(result, Err(VaultError::Toml(_))));
     }
+
+    #[test]
+    fn build_constructs_vault_origin_wrapping_another_vault() {
+        let dir = tempdir().unwrap();
+        let fs_root = dir.path().join("data");
+        std::fs::create_dir_all(&fs_root).unwrap();
+
+        let inner_config_path = dir.path().join("inner.toml");
+        std::fs::write(
+            &inner_config_path,
+            format!(
+                r#"
+                name = "inner-vault"
+
+                [origin_config]
+                type = "fs"
+                root = "{}"
+                "#,
+                fs_root.display()
+            ),
+        )
+        .unwrap();
+
+        let (_dir2, outer_path) = write_config(&format!(
+            r#"
+            name = "outer-vault"
+
+            [origin_config]
+            type = "vault"
+            path = "{}"
+            "#,
+            inner_config_path.display()
+        ));
+
+        let (name, _root_id, _origin) = VaultConfig::build(outer_path).unwrap();
+        assert_eq!(name, "outer-vault");
+    }
+
+    #[test]
+    fn build_propagates_error_when_inner_vault_config_is_missing() {
+        let dir = tempdir().unwrap();
+        let missing_inner_path = dir.path().join("missing-inner.toml");
+
+        let (_dir2, outer_path) = write_config(&format!(
+            r#"
+            name = "outer-vault"
+
+            [origin_config]
+            type = "vault"
+            path = "{}"
+            "#,
+            missing_inner_path.display()
+        ));
+
+        let result = VaultConfig::build(outer_path);
+        assert!(matches!(result, Err(VaultError::Io(_))));
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -242,6 +302,9 @@ pub enum OriginConfig {
 
         delete_url: String,
     },
+    Vault {
+        path: PathBuf,
+    },
 }
 impl OriginConfig {
     /// Reads an `OriginConfig` from the TOML file at `from` and builds the `Origin` it
@@ -251,10 +314,10 @@ impl OriginConfig {
     pub fn from_file(from: PathBuf) -> VaultResult<Box<dyn Origin>> {
         let cfg = std::fs::read_to_string(from)?;
         let cfg: OriginConfig = toml::from_str(&cfg)?;
-        Ok(cfg.build())
+        cfg.build()
     }
     /// Constructs the `Origin` described by this config.
-    pub fn build(&self) -> Box<dyn Origin> {
+    pub fn build(self) -> VaultResult<Box<dyn Origin>> {
         match self {
             OriginConfig::Command {
                 list_cmd,
@@ -264,16 +327,10 @@ impl OriginConfig {
                 send_cmd,
                 delete_cmd,
                 extras,
-            } => Box::new(OriginCommand::new(
-                fetch_cmd.clone(),
-                list_cmd.clone(),
-                get_cmd.clone(),
-                put_cmd.clone(),
-                send_cmd.clone(),
-                delete_cmd.clone(),
-                extras.clone(),
-            )),
-            OriginConfig::Fs { root } => Box::new(OriginFileSystem::new(root.clone())),
+            } => Ok(Box::new(OriginCommand::new(
+                fetch_cmd, list_cmd, get_cmd, put_cmd, send_cmd, delete_cmd, extras,
+            ))),
+            OriginConfig::Fs { root } => Ok(Box::new(OriginFileSystem::new(root))),
             OriginConfig::Http {
                 base_url,
                 list_url,
@@ -283,16 +340,14 @@ impl OriginConfig {
                 send_url,
                 delete_url,
             } => {
-                let base_url = base_url.clone().unwrap_or_default();
-                Box::new(OriginHTTP::new(
-                    base_url,
-                    fetch_url.clone(),
-                    list_url.clone(),
-                    get_url.clone(),
-                    put_url.clone(),
-                    send_url.clone(),
-                    delete_url.clone(),
-                ))
+                let base_url = base_url.unwrap_or_default();
+                Ok(Box::new(OriginHTTP::new(
+                    base_url, fetch_url, list_url, get_url, put_url, send_url, delete_url,
+                )))
+            }
+            OriginConfig::Vault { path } => {
+                let vault = Vault::new(path)?;
+                Ok(Box::new(OriginVault::new(Arc::new(vault))))
             }
         }
     }
