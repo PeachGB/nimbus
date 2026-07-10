@@ -1,0 +1,12 @@
+[package]
+name = "nimbus-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nimbus-vault = {path = "../vault/"}
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+toml.workspace = true
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
