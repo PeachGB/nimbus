@@ -1,8 +1,18 @@
-nimbus new vault_name
+nimbus new vault.toml
+(registers a vault from vault.toml; see README.md for the config format)
 
+nimbus vaults
+(prints registered vault names)
+
+nimbus select my-vault
 nimbus ls
-(prints vault_name)
+(lists my-vault's current directory)
 
-nimbus cd vault_name
+nimbus cd docs
+nimbus put ./notes.txt
+(copies ./notes.txt from the local vault into my-vault:/docs)
 
-nimbus upload {PATH}
+nimbus get notes.txt ./downloads
+(copies my-vault:/docs/notes.txt out to ./downloads)
+
+See README.md for the full command reference.

@@ -1,103 +1,223 @@
-use clap::{Command, arg};
+use clap::{Parser, Subcommand};
 
 use crate::state::App;
+use anyhow::Result;
 
-mod state;
-/*
-    Object: file or folder
-    List Of Commands:
-        ls //if Root list all vaults, if in a vault, list vault contents
-        new <VAULT NAME> //creates a new vault
-        cd <PATH> changes the current working directory to a vault or an object inside a vault
-        put <PATH> <OPTIONAL: as [NAME]> //puts an object onto the vault
-        get <NAME> <OPTIONAL: [DESTINATION PATH]> //gets a object from vault if path is not specified, path is the current directory from where nimbus was called
-        cp <NAME> <NAME>: // copies a object inside the same vault
-        mv <NAME> <NAME>: //moves a object inside the same vault
-        origin <VAULT NAME> <ORIGIN> //sets the origin of the vault either the file system, a db or a remote origin
-        sync //syncs vault with his origin
+pub mod config;
+pub mod state;
 
+const LOCAL_VAULT_NAME: &str = "LOCAL";
 
-
-
-
-*/
-
-const AUTHOR: &str = "PeachGB";
-const VERSION: &str = "0.1.0";
-const ABOUT: &str = "A CLI tool for managing and syncing Objects in vaults.\n\n\
-A vault is a tree like structure like a filesystem \n\
-Vaults store metadata and a way to get the object. \n\
-You can make vaults out of APIs, your own filesystem, etc";
+#[derive(Parser)]
+#[command(version,long_about=None)]
+#[command(propagate_version = true)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+#[derive(Subcommand)]
+enum Commands {
+    ///list directory objects, if in root, list all available vaults
+    Ls,
+    ///lists vaults
+    Vaults,
+    Select {
+        vault: String,
+    },
+    New {
+        path: String,
+    },
+    ///changes current working directory, if in root, selects working vault
+    Cd {
+        path: String,
+    },
+    ///puts file inside vault
+    Put {
+        path: String,
+        vault: Option<String>,
+        dest: Option<String>,
+    },
+    ///gets object inside vault
+    Get {
+        path: String,
+        vault: Option<String>,
+        dest: Option<String>,
+    },
+    ///deletes an object inside the specified vault
+    Delete {
+        path: String,
+        vault: Option<String>,
+        #[arg(short, long)]
+        force: bool,
+    },
+    ///copies a object inside the same vault
+    Cp {
+        path: String,
+        destination: String,
+        vault: Option<String>,
+    },
+    ///moves a object inside the same vault
+    Mv {
+        path: String,
+        destination: String,
+        vault: Option<String>,
+    },
+    ///push local vault into vault
+    Push {
+        vault: Option<String>,
+    },
+    ///pulls from origin onto local vault
+    Pull {
+        vault: Option<String>,
+    },
+}
 
 #[tokio::main]
-async fn main() {
-    let nimbus = Command::new("Nimbus")
-        .version(VERSION)
-        .author(AUTHOR)
-        .about(ABOUT)
-        .subcommand(
-            Command::new("ls")
-                .about("Lists all vaults or contents of a vault")
-                .arg(arg!(<VAULT_NAME> "Optional vault name to list contents")),
-        )
-        .subcommand(
-            Command::new("new")
-                .about("Creates a new vault")
-                .arg(arg!(<PATH> "Path to the new vault").required(true)),
-        )
-        .subcommand(
-            Command::new("cd")
-                .about(
-                    "Changes the current working directory to a vault or an object inside a vault",
-                )
-                .arg(arg!(<PATH> "Path to the vault or object")),
-        )
-        .subcommand(
-            Command::new("put")
-                .about("Puts an object onto the vault")
-                .arg(arg!(<PATH> "Path to the object"))
-                .arg(arg!([NAME] "Optional name for the object in the vault")),
-        )
-        .subcommand(
-            Command::new("get")
-                .about("Gets an object from the vault")
-                .arg(arg!(<NAME> "Name of the object to get"))
-                .arg(arg!([DESTINATION_PATH] "Optional destination path")),
-        )
-        .subcommand(
-            Command::new("cp")
-                .about("Copies an object inside the same vault")
-                .arg(arg!(<NAME> "Name of the object to copy"))
-                .arg(arg!(<DESTINATION_NAME> "Name of the destination object")),
-        )
-        .subcommand(
-            Command::new("mv")
-                .about("Moves an object inside the same vault")
-                .arg(arg!(<NAME> "Name of the object to move"))
-                .arg(arg!(<DESTINATION_NAME> "Name of the destination object")),
-        )
-        .subcommand(
-            Command::new("origin")
-                .about("Sets the origin of the vault")
-                .arg(arg!(<VAULT_NAME> "Name of the vault").required(true))
-                .arg(arg!(<ORIGIN> "Origin to set (file system, db, remote)").required(true)),
-        )
-        .subcommand(Command::new("sync").about("Syncs the vault contents with his origin"))
-        .get_matches();
+async fn main() -> Result<()> {
+    let mut app = App::init()?;
+    let cli = Cli::parse();
+    app.parse(cli).await?;
+    app.save()?;
+    Ok(())
+}
 
-    let app = App::init();
-    match nimbus.subcommand() {
-        Some(("ls", sub_matches)) => app.ls(),
-        Some(("new", sub_matches)) => app.new(),
-        Some(("cd", sub_matches)) => app.cd(),
-        Some(("put", sub_matches)) => app.put(),
-        Some(("get", sub_matches)) => app.get(),
-        Some(("cp", sub_matches)) => app.cp(),
-        Some(("mv", sub_matches)) => app.mv(),
-        Some(("origin", sub_matches)) => app.origin(),
-        Some(("sync", sub_matches)) => app.sync(),
-        Some((_, _)) => todo!(),
-        None => todo!(),
-        _ => todo!(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Commands {
+        let mut full = vec!["nimbus"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).unwrap().command
+    }
+
+    #[test]
+    fn parses_ls_and_vaults() {
+        assert!(matches!(parse(&["ls"]), Commands::Ls));
+        assert!(matches!(parse(&["vaults"]), Commands::Vaults));
+    }
+
+    #[test]
+    fn parses_select() {
+        match parse(&["select", "myvault"]) {
+            Commands::Select { vault } => assert_eq!(vault, "myvault"),
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parses_new() {
+        match parse(&["new", "vault.toml"]) {
+            Commands::New { path } => assert_eq!(path, "vault.toml"),
+            _ => panic!("expected New"),
+        }
+    }
+
+    #[test]
+    fn parses_cd() {
+        match parse(&["cd", "docs"]) {
+            Commands::Cd { path } => assert_eq!(path, "docs"),
+            _ => panic!("expected Cd"),
+        }
+    }
+
+    #[test]
+    fn parses_put_with_optional_args_defaulting_to_none() {
+        match parse(&["put", "notes.txt"]) {
+            Commands::Put { path, vault, dest } => {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(vault, None);
+                assert_eq!(dest, None);
+            }
+            _ => panic!("expected Put"),
+        }
+    }
+
+    #[test]
+    fn parses_put_with_all_args() {
+        match parse(&["put", "notes.txt", "myvault", "docs"]) {
+            Commands::Put { path, vault, dest } => {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(vault, Some("myvault".to_string()));
+                assert_eq!(dest, Some("docs".to_string()));
+            }
+            _ => panic!("expected Put"),
+        }
+    }
+
+    #[test]
+    fn parses_get() {
+        match parse(&["get", "notes.txt", "myvault"]) {
+            Commands::Get { path, vault, dest } => {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(vault, Some("myvault".to_string()));
+                assert_eq!(dest, None);
+            }
+            _ => panic!("expected Get"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_with_force_flag() {
+        match parse(&["delete", "notes.txt", "--force"]) {
+            Commands::Delete { path, vault, force } => {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(vault, None);
+                assert!(force);
+            }
+            _ => panic!("expected Delete"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_without_force_flag_defaults_to_false() {
+        match parse(&["delete", "notes.txt"]) {
+            Commands::Delete { force, .. } => assert!(!force),
+            _ => panic!("expected Delete"),
+        }
+    }
+
+    #[test]
+    fn parses_cp_and_mv() {
+        match parse(&["cp", "a.txt", "dir"]) {
+            Commands::Cp {
+                path, destination, ..
+            } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(destination, "dir");
+            }
+            _ => panic!("expected Cp"),
+        }
+        match parse(&["mv", "a.txt", "dir"]) {
+            Commands::Mv {
+                path, destination, ..
+            } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(destination, "dir");
+            }
+            _ => panic!("expected Mv"),
+        }
+    }
+
+    #[test]
+    fn parses_push_and_pull_with_optional_vault() {
+        assert!(matches!(parse(&["push"]), Commands::Push { vault: None }));
+        match parse(&["pull", "myvault"]) {
+            Commands::Pull { vault } => assert_eq!(vault, Some("myvault".to_string())),
+            _ => panic!("expected Pull"),
+        }
+    }
+
+    #[test]
+    fn missing_required_argument_fails_to_parse() {
+        // `select` requires a vault name; omitting it should fail parsing.
+        let result = Cli::try_parse_from(["nimbus", "select"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_fails_to_parse() {
+        let result = Cli::try_parse_from(["nimbus", "not-a-command"]);
+        assert!(result.is_err());
     }
 }

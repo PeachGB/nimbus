@@ -26,12 +26,12 @@ use crate::{
 /// let dir = tempfile::tempdir()?;
 /// let origin = OriginFileSystem::new(dir.path().to_path_buf());
 ///
-/// let file = Object::Leaf {
+/// let mut file = Object::Leaf {
 ///     name: "notes.txt".to_string(),
 ///     id: ObjectId::from("notes.txt"),
 ///     meta: Metadata::new(),
 /// };
-/// origin.put(&file).await?; // creates the file
+/// origin.put(&mut file, &ObjectId::from("")).await?; // creates the file
 /// assert!(dir.path().join("notes.txt").is_file());
 ///
 /// let fetched = origin.get(&ObjectId::from("notes.txt")).await?;
@@ -131,8 +131,11 @@ impl Origin for OriginFileSystem {
         Ok(Box::pin(stream))
     }
 
-    async fn put(&self, object: &Object) -> VaultResult<()> {
-        let path = self.path(&object.get_id());
+    async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+        let parent_path = self.path(destination);
+        let path = parent_path.join(object.get_name());
+        let new_id = ObjectId::from(path.to_string_lossy().into_owned());
+        let _ = object.with_id(new_id);
 
         match object {
             Object::Branch { .. } => {
@@ -149,7 +152,7 @@ impl Origin for OriginFileSystem {
                 "Cannot put root object".to_string(),
             ))?,
         }
-        Ok(())
+        Ok(object.clone())
     }
 
     async fn send(&self, object: &Object, mut payload: ByteStream) -> VaultResult<()> {
@@ -295,12 +298,12 @@ mod tests {
     async fn put_creates_file_for_leaf() {
         let dir = tempdir().unwrap();
         let origin = origin_at(dir.path().to_path_buf());
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file.txt".to_string(),
             id: ObjectId::from("file.txt"),
             meta: Metadata::new(),
         };
-        origin.put(&object).await.unwrap();
+        origin.put(&mut object, &ObjectId::from("")).await.unwrap();
         assert!(dir.path().join("file.txt").is_file());
     }
 
@@ -308,13 +311,13 @@ mod tests {
     async fn put_creates_directory_for_branch() {
         let dir = tempdir().unwrap();
         let origin = origin_at(dir.path().to_path_buf());
-        let object = Object::Branch {
+        let mut object = Object::Branch {
             name: "sub".to_string(),
             id: ObjectId::from("sub"),
             meta: Metadata::new(),
             children: None,
         };
-        origin.put(&object).await.unwrap();
+        origin.put(&mut object, &ObjectId::from("")).await.unwrap();
         assert!(dir.path().join("sub").is_dir());
     }
 
@@ -322,8 +325,8 @@ mod tests {
     async fn put_rejects_root_object() {
         let dir = tempdir().unwrap();
         let origin = origin_at(dir.path().to_path_buf());
-        let object = Object::root();
-        let result = origin.put(&object).await;
+        let mut object = Object::root();
+        let result = origin.put(&mut object, &ObjectId::from("")).await;
         assert!(result.is_err());
     }
 

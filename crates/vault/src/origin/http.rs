@@ -104,7 +104,7 @@ impl OriginHTTP {
         format!(
             "{}{}",
             self.base_url.trim_end_matches('/'),
-            template.replace("{id}", id.as_str())
+            template.replace(&format!("{{{}}}", crate::PLACEHOLDER_ID), id.as_str())
         )
     }
 
@@ -152,11 +152,12 @@ impl Origin for OriginHTTP {
         self.get_json(&self.get_url, id).await
     }
 
-    async fn put(&self, object: &Object) -> VaultResult<()> {
-        let url = self.url(&self.put_url, &object.get_id());
+    async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+        let url = self.url(&self.put_url, destination);
         self.execute(self.client.put(&url).json(object), &url)
             .await?;
-        Ok(())
+        let new_id = ObjectId::from(format!("{}/{}", destination.as_str(), object.get_name()));
+        self.get(&new_id).await
     }
 
     async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()> {
@@ -317,41 +318,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_sends_object_as_json_body() {
+    async fn put_sends_object_as_json_body_to_destination_url() {
         let server = MockServer::start();
-        let mock = server.mock(|when, then| {
+        let put_mock = server.mock(|when, then| {
             when.method(Method::PUT)
-                .path("/put/f1")
+                .path("/put/dir")
                 .json_body(serde_json::json!({
                     "Leaf": {"name": "file.txt", "id": "f1", "meta": {"size": null, "content_type": null, "modified": null, "extra": {}}}
                 }));
             then.status(201);
         });
+        // put's returned Object comes from a follow-up get on "{destination}/{name}"
+        let get_mock = server.mock(|when, then| {
+            when.method(Method::GET).path("/get/dir/file.txt");
+            then.status(200).json_body(serde_json::json!({
+                "Leaf": {"name": "file.txt", "id": "dir/file.txt", "meta": {"size": null, "content_type": null, "modified": null, "extra": {}}}
+            }));
+        });
         let origin = make_origin(&server);
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file.txt".to_string(),
             id: ObjectId::from("f1"),
             meta: Metadata::new(),
         };
-        origin.put(&object).await.unwrap();
-        mock.assert();
+        let result = origin
+            .put(&mut object, &ObjectId::from("dir"))
+            .await
+            .unwrap();
+        assert_eq!(result.get_id().as_str(), "dir/file.txt");
+        put_mock.assert();
+        get_mock.assert();
     }
 
     #[tokio::test]
     async fn put_errors_on_failure_status() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(Method::PUT).path("/put/f1");
+            when.method(Method::PUT).path("/put/dir");
             then.status(500);
         });
         let origin = make_origin(&server);
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file.txt".to_string(),
             id: ObjectId::from("f1"),
             meta: Metadata::new(),
         };
-        let result = origin.put(&object).await;
+        let result = origin.put(&mut object, &ObjectId::from("dir")).await;
         assert!(matches!(result, Err(VaultError::OriginError(_))));
+    }
+
+    #[tokio::test]
+    async fn put_propagates_not_found_from_follow_up_get() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(Method::PUT).path("/put/dir");
+            then.status(201);
+        });
+        server.mock(|when, then| {
+            when.method(Method::GET).path("/get/dir/file.txt");
+            then.status(404);
+        });
+        let origin = make_origin(&server);
+        let mut object = Object::Leaf {
+            name: "file.txt".to_string(),
+            id: ObjectId::from("f1"),
+            meta: Metadata::new(),
+        };
+        let result = origin.put(&mut object, &ObjectId::from("dir")).await;
+        assert!(matches!(result, Err(VaultError::NotFound(_))));
     }
 
     #[tokio::test]

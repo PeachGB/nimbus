@@ -16,12 +16,17 @@
 //! - [`origin::Origin`] — the trait every backend implements: `fetch`, `list`, `get`, `put`,
 //!   `send`, `delete`. `fetch`/`send` are streaming
 //!   ([`origin::ByteStream`] = `BoxStream<'static, VaultResult<Bytes>>`) — content moves in
-//!   chunks, it's never buffered whole into RAM.
+//!   chunks, it's never buffered whole into RAM. `put(object, destination)` writes `object`
+//!   under `destination` and returns the `Object` as it now exists at the origin —
+//!   implementations may, but aren't required to, rename `object` in place, so callers should
+//!   always act on the returned value rather than assuming `object` itself changed.
 //! - [`vault::Vault`] — owns one `Origin` plus an in-memory metadata cache. `get`/`list`
 //!   populate the cache; `list` always re-hits the origin (it's the source of truth) while
 //!   refreshing the cache. `find` resolves a `/`-separated path to an `ObjectId` by walking
-//!   the tree one `list` call per component. `pull`/`push` recursively sync a subtree between
-//!   the vault's own origin and any other `&dyn Origin`.
+//!   the tree one `list` call per component. `put` only updates the cache on success, and
+//!   caches the `Object` `put` returned. `pull`/`push` recursively sync a subtree between the
+//!   vault's own origin and any other `&dyn Origin`, threading `put`'s return value through to
+//!   the following `send`.
 //!
 //! Four built-in origins ship in this crate:
 //!
@@ -93,12 +98,12 @@
 //! let vault = Vault::new(config_path)?;
 //!
 //! // create an object
-//! let notes = Object::Leaf {
+//! let mut notes = Object::Leaf {
 //!     name: "notes.txt".to_string(),
 //!     id: ObjectId::from("notes.txt"),
 //!     meta: Metadata::new(),
 //! };
-//! vault.put(&notes).await?;
+//! vault.put(&mut notes, &ObjectId::from("")).await?;
 //! vault.send(&notes, Box::pin(futures::stream::once(async {
 //!     Ok(bytes::Bytes::from_static(b"hello vault"))
 //! }))).await?;
@@ -142,6 +147,13 @@
 //!
 //! Every fallible operation in this crate returns [`VaultResult`], an alias for
 //! `Result<T, `[`error::VaultError`]`>`.
+//!
+//! # Constants
+//!
+//! The `{placeholder}` keys, `OriginConfig::Command` field names, and root id/name
+//! conventions shared across [`object`] and the [`origin::command`]/[`origin::http`]
+//! implementations are defined once here (e.g. [`ROOT_ID`], [`PLACEHOLDER_ID`],
+//! [`FETCH_CMD_FIELD`]) rather than being hardcoded independently in each module.
 
 /// On-disk (TOML) configuration for a [`vault::Vault`] and the [`origin::Origin`] it wraps.
 pub mod config;
@@ -158,3 +170,53 @@ pub mod vault;
 
 /// The result type used throughout this crate, shorthand for `Result<T, `[`error::VaultError`]`>`.
 pub type VaultResult<T> = Result<T, error::VaultError>;
+
+/// Conventional root [`object::ObjectId`] value, used by [`object::ObjectId::default`] and
+/// [`object::Object::root`].
+pub const ROOT_ID: &str = "/";
+/// Display name reported by [`object::Object::get_name`] for the `Root` variant, which has no
+/// real name of its own.
+pub const ROOT_NAME: &str = "##ROOT##";
+
+/// Template placeholder key substituted with an object's id in
+/// [`origin::command::OriginCommand`]/[`origin::http::OriginHTTP`] templates (rendered as
+/// `{id}`).
+pub const PLACEHOLDER_ID: &str = "id";
+/// Template placeholder key substituted with an object's name in
+/// [`origin::command::OriginCommand`] templates (rendered as `{name}`).
+pub const PLACEHOLDER_NAME: &str = "name";
+/// Template placeholder key substituted with an object's payload size in
+/// [`origin::command::OriginCommand`] templates (rendered as `{size}`).
+pub const PLACEHOLDER_SIZE: &str = "size";
+/// Template placeholder key substituted with an object's content type in
+/// [`origin::command::OriginCommand`] templates (rendered as `{content_type}`).
+pub const PLACEHOLDER_CONTENT_TYPE: &str = "content_type";
+/// Template placeholder key substituted with an object's modified timestamp in
+/// [`origin::command::OriginCommand`] templates (rendered as `{modified}`).
+pub const PLACEHOLDER_MODIFIED: &str = "modified";
+/// `extra_vars` key [`origin::command::OriginCommand`]'s `put` uses to expose its
+/// `destination` argument to the `put_cmd` template (rendered as `{destination}`), when not
+/// already set.
+pub const PLACEHOLDER_DESTINATION: &str = "destination";
+/// Fallback content type substituted into command templates when an object's metadata doesn't
+/// specify one.
+pub const UNKNOWN_CONTENT_TYPE: &str = "unknown";
+
+/// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the fetch
+/// command template.
+pub const FETCH_CMD_FIELD: &str = "fetch_cmd";
+/// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the list
+/// command template.
+pub const LIST_CMD_FIELD: &str = "list_cmd";
+/// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the get
+/// command template.
+pub const GET_CMD_FIELD: &str = "get_cmd";
+/// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the put
+/// command template.
+pub const PUT_CMD_FIELD: &str = "put_cmd";
+/// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the send
+/// command template.
+pub const SEND_CMD_FIELD: &str = "send_cmd";
+/// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the delete
+/// command template.
+pub const DELETE_CMD_FIELD: &str = "delete_cmd";

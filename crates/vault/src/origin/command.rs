@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, lock::Mutex};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::process::Output;
@@ -63,7 +63,7 @@ pub struct OriginCommand {
     put_cmd: String,
     send_cmd: String,
     delete_cmd: String,
-    extra_vars: HashMap<String, String>,
+    extra_vars: Mutex<HashMap<String, String>>,
 }
 
 /// Identifies which of `OriginCommand`'s configured command templates to run.
@@ -87,12 +87,12 @@ impl CmdType {
     /// The config field name this variant corresponds to (e.g. `"fetch_cmd"`).
     pub fn as_str(&self) -> &'static str {
         match self {
-            CmdType::Fetch => "fetch_cmd",
-            CmdType::List => "list_cmd",
-            CmdType::Get => "get_cmd",
-            CmdType::Put => "put_cmd",
-            CmdType::Send => "send_cmd",
-            CmdType::Delete => "delete_cmd",
+            CmdType::Fetch => crate::FETCH_CMD_FIELD,
+            CmdType::List => crate::LIST_CMD_FIELD,
+            CmdType::Get => crate::GET_CMD_FIELD,
+            CmdType::Put => crate::PUT_CMD_FIELD,
+            CmdType::Send => crate::SEND_CMD_FIELD,
+            CmdType::Delete => crate::DELETE_CMD_FIELD,
         }
     }
     /// Owned version of [`CmdType::as_str`].
@@ -120,7 +120,7 @@ impl OriginCommand {
             put_cmd,
             send_cmd,
             delete_cmd,
-            extra_vars: extra_vars.unwrap_or_default(),
+            extra_vars: Mutex::new(extra_vars.unwrap_or_default()),
         }
     }
     fn interpolate_one<I: AsRef<str>>(template: &mut String, key: &str, val: I) {
@@ -131,17 +131,18 @@ impl OriginCommand {
             *template = template.replace(&format!("{{{k}}}"), v);
         }
     }
-    fn bootstrap_cmd_id(&self, t: &CmdType, id: &ObjectId) -> String {
+    async fn bootstrap_cmd_id(&self, t: &CmdType, id: &ObjectId) -> String {
         let mut cmd = match t {
-            CmdType::Fetch => self.fetch_cmd.replace("{id}", id.as_str()),
-            CmdType::List => self.list_cmd.replace("{id}", id.as_str()),
-            CmdType::Get => self.get_cmd.replace("{id}", id.as_str()),
-            CmdType::Put => self.put_cmd.replace("{id}", id.as_str()),
-            CmdType::Delete => self.delete_cmd.replace("{id}", id.as_str()),
-            CmdType::Send => self.send_cmd.replace("{id}", id.as_str()),
+            CmdType::Fetch => self.fetch_cmd.clone(),
+            CmdType::List => self.list_cmd.clone(),
+            CmdType::Get => self.get_cmd.clone(),
+            CmdType::Put => self.put_cmd.clone(),
+            CmdType::Delete => self.delete_cmd.clone(),
+            CmdType::Send => self.send_cmd.clone(),
         };
-
-        Self::interpolate(&mut cmd, &self.extra_vars);
+        Self::interpolate_one(&mut cmd, crate::PLACEHOLDER_ID, id.as_str());
+        let vars = self.extra_vars.lock().await;
+        Self::interpolate(&mut cmd, &vars);
 
         cmd
     }
@@ -161,7 +162,8 @@ impl OriginCommand {
                     Some(s) => s.to_string(),
                     None => 0.to_string(),
                 };
-                let content_type = content_type.unwrap_or(String::from("unknown"));
+                let content_type =
+                    content_type.unwrap_or(String::from(crate::UNKNOWN_CONTENT_TYPE));
                 let modified = match modified {
                     Some(date) => date.to_string(),
                     None => String::from(""),
@@ -173,11 +175,11 @@ impl OriginCommand {
                     _ => unreachable!(),
                 };
                 let c = &mut command;
-                Self::interpolate_one(c, "id", object.get_id());
-                Self::interpolate_one(c, "name", object.get_name());
-                Self::interpolate_one(c, "size", size);
-                Self::interpolate_one(c, "content_type", content_type);
-                Self::interpolate_one(c, "modified", modified);
+                Self::interpolate_one(c, crate::PLACEHOLDER_ID, object.get_id());
+                Self::interpolate_one(c, crate::PLACEHOLDER_NAME, object.get_name());
+                Self::interpolate_one(c, crate::PLACEHOLDER_SIZE, size);
+                Self::interpolate_one(c, crate::PLACEHOLDER_CONTENT_TYPE, content_type);
+                Self::interpolate_one(c, crate::PLACEHOLDER_MODIFIED, modified);
                 Self::interpolate(c, &extra);
 
                 command
@@ -193,7 +195,7 @@ impl OriginCommand {
             .map_err(|e| VaultError::Generic(format!("command output was not valid JSON: {}", e)))
     }
     async fn cmd(&self, t: CmdType, id: &ObjectId) -> VaultResult<Output> {
-        let cmd = self.bootstrap_cmd_id(&t, id);
+        let cmd = self.bootstrap_cmd_id(&t, id).await;
         let output = Command::new("sh").arg("-c").arg(&cmd).output().await?;
 
         if !output.status.success() {
@@ -211,7 +213,7 @@ impl OriginCommand {
 #[async_trait::async_trait]
 impl Origin for OriginCommand {
     async fn fetch(&self, id: &ObjectId) -> VaultResult<ByteStream> {
-        let cmd = self.bootstrap_cmd_id(&CmdType::Fetch, id);
+        let cmd = self.bootstrap_cmd_id(&CmdType::Fetch, id).await;
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -234,7 +236,16 @@ impl Origin for OriginCommand {
         let object: Object = self.cmd_json(CmdType::Get, id).await?;
         Ok(object)
     }
-    async fn put(&self, obj: &Object) -> VaultResult<()> {
+    async fn put(&self, obj: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+        {
+            let mut vars = self.extra_vars.lock().await;
+            if !vars.contains_key(crate::PLACEHOLDER_DESTINATION) {
+                vars.insert(
+                    crate::PLACEHOLDER_DESTINATION.into(),
+                    destination.to_string(),
+                );
+            }
+        }
         let cmd = self.bootstrap_cmd_object(&CmdType::Put, obj)?;
         let output = Command::new("sh")
             .arg("-c")
@@ -250,8 +261,8 @@ impl Origin for OriginCommand {
                 stderr.trim()
             )));
         }
-
-        Ok(())
+        let new_id = ObjectId::from(format!("{}/{}", destination.as_str(), obj.get_name()));
+        self.get(&new_id).await
     }
     async fn send(&self, object: &Object, mut payload: ByteStream) -> VaultResult<()> {
         let cmd = self.bootstrap_cmd_object(&CmdType::Send, object)?;
@@ -300,7 +311,7 @@ mod tests {
             put_cmd: "echo put {id} {name}".to_string(),
             send_cmd: "echo send {id}".to_string(),
             delete_cmd: "echo delete {id}".to_string(),
-            extra_vars: HashMap::new(),
+            extra_vars: Mutex::new(HashMap::new()),
         };
         overrides(&mut cmd);
         cmd
@@ -334,16 +345,18 @@ mod tests {
         assert_eq!(template, "1 and 2");
     }
 
-    #[test]
-    fn bootstrap_cmd_id_substitutes_id_and_extra_vars() {
+    #[tokio::test]
+    async fn bootstrap_cmd_id_substitutes_id_and_extra_vars() {
         let mut extra = HashMap::new();
         extra.insert("token".to_string(), "secret".to_string());
         let cmd = make_command(|c| {
             c.fetch_cmd = "fetch --id {id} --token {token}".to_string();
-            c.extra_vars = extra;
+            c.extra_vars = Mutex::new(extra);
         });
 
-        let result = cmd.bootstrap_cmd_id(&CmdType::Fetch, &ObjectId::from("obj1"));
+        let result = cmd
+            .bootstrap_cmd_id(&CmdType::Fetch, &ObjectId::from("obj1"))
+            .await;
         assert_eq!(result, "fetch --id obj1 --token secret");
     }
 
@@ -455,13 +468,46 @@ mod tests {
     async fn put_succeeds_on_zero_exit() {
         let cmd = make_command(|c| {
             c.put_cmd = "true".to_string();
+            c.get_cmd = r#"echo '{"Leaf":{"name":"file.txt","id":"{id}","meta":{"size":null,"content_type":null,"modified":null,"extra":{}}}}'"#.to_string();
         });
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file.txt".to_string(),
             id: ObjectId::from("f1"),
             meta: Metadata::new(),
         };
-        cmd.put(&object).await.unwrap();
+        // put also runs a follow-up `get` on "{destination}/{name}" to return the created
+        // Object; this must not deadlock on `extra_vars` (see
+        // `put_does_not_deadlock_on_extra_vars_mutex` below).
+        let result = cmd.put(&mut object, &ObjectId::from("dir")).await.unwrap();
+        assert_eq!(result.get_id().as_str(), "dir/file.txt");
+    }
+
+    #[tokio::test]
+    async fn put_does_not_deadlock_on_extra_vars_mutex() {
+        // `put` locks `extra_vars` to set the `destination` var, then (on success) calls
+        // `self.get()` internally, which also locks `extra_vars`. If the first lock is still
+        // held at that point, this hangs forever instead of erroring or returning.
+        let cmd = make_command(|c| {
+            c.put_cmd = "true".to_string();
+            c.get_cmd = r#"echo '{"Leaf":{"name":"file.txt","id":"{id}","meta":{"size":null,"content_type":null,"modified":null,"extra":{}}}}'"#.to_string();
+        });
+        let mut object = Object::Leaf {
+            name: "file.txt".to_string(),
+            id: ObjectId::from("f1"),
+            meta: Metadata::new(),
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cmd.put(&mut object, &ObjectId::from("dir")),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "put() deadlocked instead of completing within the timeout"
+        );
+        assert!(outcome.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -469,12 +515,12 @@ mod tests {
         let cmd = make_command(|c| {
             c.put_cmd = "false".to_string();
         });
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file.txt".to_string(),
             id: ObjectId::from("f1"),
             meta: Metadata::new(),
         };
-        let result = cmd.put(&object).await;
+        let result = cmd.put(&mut object, &ObjectId::from("")).await;
         assert!(matches!(result, Err(VaultError::Generic(_))));
     }
 

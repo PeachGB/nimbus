@@ -50,8 +50,8 @@ pub type ByteStream = BoxStream<'static, VaultResult<Bytes>>;
 ///     async fn get(&self, id: &ObjectId) -> VaultResult<Object> {
 ///         Err(VaultError::NotFound(id.to_string()))
 ///     }
-///     async fn put(&self, _object: &Object) -> VaultResult<()> {
-///         Ok(())
+///     async fn put(&self, object: &mut Object, _destination: &ObjectId) -> VaultResult<Object> {
+///         Ok(object.clone())
 ///     }
 ///     async fn send(&self, _object: &Object, _payload: ByteStream) -> VaultResult<()> {
 ///         Ok(())
@@ -74,7 +74,7 @@ pub trait Origin: Send + Sync {
     /// Fetches `id`'s metadata as an `Object`.
     async fn get(&self, id: &ObjectId) -> VaultResult<Object>;
     /// Writes `object`'s metadata (without payload) to the origin.
-    async fn put(&self, object: &Object) -> VaultResult<()>;
+    async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object>;
     /// Streams `payload` to the origin as `object`'s contents.
     async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()>;
     /// Deletes `id` from the origin.

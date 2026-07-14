@@ -11,12 +11,13 @@ This repo is a Cargo workspace with four crates:
 | Crate         | Status  | What it is                                              |
 |---------------|---------|----------------------------------------------------------|
 | `nimbus-vault`  | working | The core library: `Object`, `Vault`, `Origin` and its four implementations. |
-| `nimbus-cli`    | WIP     | Command-line interface built on `nimbus-vault`. |
+| `nimbus-cli`    | working | Command-line interface built on `nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
 | `nimbus-daemon` | stub    | Background sync process (not yet implemented). |
 | `nimbus-tui`    | stub    | Terminal UI frontend (not yet implemented). |
 
-The rest of this document focuses mostly on `nimbus-vault`, since it's the only
-crate with real functionality right now.
+The rest of this document focuses mostly on `nimbus-vault`, since it's the library
+every other crate builds on. See [`crates/cli/README.md`](crates/cli/README.md) for
+`nimbus-cli`'s own commands, configuration, and session-persistence model.
 
 ## The model
 
@@ -34,7 +35,7 @@ crate with real functionality right now.
       async fn fetch(&self, id: &ObjectId) -> VaultResult<ByteStream>;
       async fn list(&self, id: &ObjectId) -> VaultResult<Vec<Object>>;
       async fn get(&self, id: &ObjectId) -> VaultResult<Object>;
-      async fn put(&self, object: &Object) -> VaultResult<()>;
+      async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object>;
       async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()>;
       async fn delete(&self, id: &ObjectId) -> VaultResult<()>;
   }
@@ -42,6 +43,14 @@ crate with real functionality right now.
 
   `fetch`/`send` are streaming (`ByteStream = BoxStream<'static, VaultResult<Bytes>>`) —
   content moves in chunks, it's never buffered whole into RAM.
+
+  `put(object, destination)` writes `object` under `destination` and returns the
+  `Object` as it now exists at the origin. Implementations are allowed, but not
+  required, to rename `object` in place (`OriginFileSystem` does, via
+  `Object::with_id`; `OriginHTTP`/`OriginCommand` don't) — callers should always
+  use the *returned* `Object` for anything downstream, never assume `object` was
+  mutated. `Vault::put`/`Vault::pull`/`Vault::push` follow this rule and only
+  cache on success.
 
 - **`Vault`** — owns one `Origin` plus an in-memory metadata cache
   (`Mutex<HashMap<ObjectId, Object>>`). `get`/`list` populate the cache; `list`
@@ -112,32 +121,43 @@ crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
 
 ## CLI
 
-`nimbus-cli` is under active development; the command surface defined in
-`crates/cli/src/main.rs` is:
+`nimbus-cli` manages a set of named vaults plus a special local vault (your own
+filesystem), and moves objects between them:
 
 ```
-nimbus ls     <VAULT_NAME>                       # list vaults, or a vault's contents
-nimbus new    <PATH>                             # create a new vault from a config
-nimbus cd     <PATH>                             # change into a vault or object
-nimbus put    <PATH> [NAME]                      # put an object into the vault
-nimbus get    <NAME> [DESTINATION_PATH]           # get an object out of the vault
-nimbus cp     <NAME> <DESTINATION_NAME>           # copy an object within a vault
-nimbus mv     <NAME> <DESTINATION_NAME>           # move an object within a vault
-nimbus origin <VAULT_NAME> <ORIGIN>               # set a vault's origin
-nimbus sync                                       # sync the vault with its origin
+nimbus ls                                   # list the current vault's cwd, or all known vaults if none selected
+nimbus vaults                               # list all known vaults
+nimbus select <VAULT>                       # make <VAULT> the current vault
+nimbus new <CONFIG_PATH>                    # register a vault from its TOML config file
+nimbus cd <PATH>                            # change directory inside the current vault
+nimbus put <PATH> [VAULT] [DEST]            # copy a real filesystem path into a vault
+nimbus get <PATH> [VAULT] [DEST]            # copy an object out to a real filesystem path
+nimbus cp <PATH> <DESTINATION> [VAULT]      # copy an object within a vault
+nimbus mv <PATH> <DESTINATION> [VAULT]      # move an object within a vault
+nimbus delete <PATH> [VAULT] [--force]      # delete an object
+nimbus push [VAULT]                         # sync the local vault out to a vault
+nimbus pull [VAULT]                         # sync a vault into the local vault
 ```
 
-The argument parsing is wired up, but most subcommands are still stubs
-(`todo!()`) — treat the CLI as scaffolding rather than a finished tool for now.
-`nimbus-daemon` and `nimbus-tui` are placeholder binaries with no logic yet.
+See [`crates/cli/README.md`](crates/cli/README.md) for the full command reference,
+the local-vault security boundary, session persistence, and known gaps.
+`nimbus-daemon` and `nimbus-tui` are still placeholder binaries with no logic yet.
 
 ## Writing a custom origin: `OriginCommand`
 
 `OriginCommand` is the escape hatch for anything that isn't a plain filesystem or
 HTTP API: it shells out to a user-configured command per operation. `list`/`get`
 expect the command's stdout to be JSON matching the `Object` schema; `fetch`
-streams stdout as the payload; `send` streams the payload to the command's stdin.
-Templates support `{id}` plus any `extras` you define.
+streams stdout as the payload; `send` streams the payload to the command's stdin;
+`put` runs `put_cmd` and then re-`get`s `"{destination}/{name}"` to return the
+stored `Object` (it does not rename the object you passed in). Templates support
+`{id}` plus any `extras` you define — `put` also injects a `{destination}` var
+(unless you've already set one yourself).
+
+`extra_vars` lives behind an internal `futures::lock::Mutex` so `put` can record
+`destination` there without needing `&mut self`; it's scoped to just that
+read-modify-write, since holding it any longer would deadlock against `put`'s own
+follow-up `get` call (which locks the same mutex).
 
 ```toml
 # origin.toml — no vault needed, just an origin
@@ -207,7 +227,9 @@ invalid TOML, bad origin config) propagates straight out of the outer build.
 `Vault::pull(id, remote)` / `Vault::push(id, remote)` recursively sync the subtree
 at `id` between the vault's own origin and any other `&dyn Origin` — a plain
 origin, or another `Vault` wrapped in `OriginVault` — using `Object::changed` (a
-metadata hash comparison) to skip objects that haven't changed:
+metadata hash comparison) to skip objects that haven't changed. When an object
+needs syncing, they `put` it and then `send` its payload to whatever `Object`
+`put` returned, not the pre-`put` object — see the `put` contract above:
 
 ```rust
 // bring the vault's local origin up to date with `remote`

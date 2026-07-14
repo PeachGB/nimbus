@@ -48,12 +48,13 @@ use crate::{
 /// }
 ///
 /// // write under a new id
-/// let copy = Object::Leaf {
+/// let mut copy = Object::Leaf {
 ///     name: "notes-copy.txt".to_string(),
 ///     id: ObjectId::from("notes-copy.txt"),
 ///     meta: Metadata::new(),
 /// };
-/// vault.put(&copy).await?;
+/// let root = vault.find("".into()).await?;
+/// vault.put(&mut copy, &root).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -81,6 +82,15 @@ pub struct Vault {
 }
 
 impl Vault {
+    ///public constructor by field for vault
+    pub fn from_parts(name: String, origin: Arc<dyn Origin>, root: ObjectId) -> VaultResult<Self> {
+        Ok(Vault {
+            name,
+            origin,
+            objects: Mutex::new(HashMap::new()),
+            root,
+        })
+    }
     /// Reads a `VaultConfig` from the TOML file at `from` and builds the `Vault` it describes.
     ///
     /// # Examples
@@ -94,12 +104,7 @@ impl Vault {
     /// ```
     pub fn new(from: PathBuf) -> VaultResult<Self> {
         let (name, root_id, origin) = VaultConfig::build(from)?;
-        Ok(Vault {
-            name,
-            origin: Arc::from(origin),
-            objects: Mutex::new(HashMap::new()),
-            root: root_id,
-        })
+        Self::from_parts(name, Arc::from(origin), root_id)
     }
 
     #[cfg(test)]
@@ -114,6 +119,10 @@ impl Vault {
     /// Returns the vault's configured name.
     pub fn get_name(&self) -> &String {
         &self.name
+    }
+    /// Returns the vault root id
+    pub fn get_id(&self) -> ObjectId {
+        self.root.clone()
     }
     /// Returns a clone of the `Arc` to the vault's `Origin`.
     pub fn get_origin(&self) -> Arc<dyn Origin> {
@@ -243,12 +252,13 @@ impl Vault {
     /// use futures::stream;
     /// # use nimbus_vault::{object::{Metadata, Object, ObjectId}, vault::Vault};
     /// # async fn example(vault: Vault) -> nimbus_vault::VaultResult<()> {
-    /// let object = Object::Leaf {
+    /// let mut object = Object::Leaf {
     ///     name: "notes.txt".to_string(),
     ///     id: ObjectId::from("notes.txt"),
     ///     meta: Metadata::new(),
     /// };
-    /// vault.put(&object).await?; // create the object first
+    /// let root = vault.find("".into()).await?;
+    /// vault.put(&mut object, &root).await?; // create the object first
     ///
     /// let payload = Box::pin(stream::once(async { Ok(Bytes::from_static(b"hello")) }));
     /// vault.send(&object, payload).await?; // then write its contents
@@ -265,23 +275,24 @@ impl Vault {
     /// ```no_run
     /// # use nimbus_vault::{object::{Metadata, Object, ObjectId}, vault::Vault};
     /// # async fn example(vault: Vault) -> nimbus_vault::VaultResult<()> {
-    /// let folder = Object::Branch {
+    /// let mut folder = Object::Branch {
     ///     name: "photos".to_string(),
     ///     id: ObjectId::from("photos"),
     ///     meta: Metadata::new(),
     ///     children: None,
     /// };
-    /// vault.put(&folder).await?;
+    /// let root = vault.find("".into()).await?;
+    /// vault.put(&mut folder, &root).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn put(&self, object: &Object) -> VaultResult<()> {
-        self.origin.put(&object).await?;
+    pub async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+        let stored = self.origin.put(object, destination).await?;
         self.objects
             .lock()
             .await
-            .insert(object.get_id(), object.clone());
-        Ok(())
+            .insert(stored.get_id(), stored.clone());
+        Ok(stored)
     }
     /// Deletes `id` from the origin and evicts it from the cache.
     ///
@@ -339,7 +350,7 @@ impl Vault {
     /// ```
     pub async fn pull(&self, id: &ObjectId, remote: &dyn Origin) -> VaultResult<()> {
         let remote_children = remote.list(id).await?;
-        for remote_obj in remote_children {
+        for mut remote_obj in remote_children {
             let remote_id = remote_obj.get_id();
             let needs_sync = match self.get(remote_id.clone()).await {
                 Ok(local_obj) => local_obj.changed(&remote_obj),
@@ -348,10 +359,10 @@ impl Vault {
             };
 
             if needs_sync {
-                self.put(&remote_obj).await?;
-                if let Object::Leaf { .. } = remote_obj {
+                let stored = self.put(&mut remote_obj, id).await?;
+                if let Object::Leaf { .. } = stored {
                     let bytes = remote.fetch(&remote_id).await?;
-                    self.send(&remote_obj, bytes).await?;
+                    self.send(&stored, bytes).await?;
                 }
             }
             if matches!(remote_obj, Object::Branch { .. } | Object::Root { .. }) {
@@ -379,7 +390,7 @@ impl Vault {
     pub async fn push(&self, id: &ObjectId, remote: &dyn Origin) -> VaultResult<()> {
         let local_children = self.list(id.clone()).await?;
 
-        for local_obj in local_children {
+        for mut local_obj in local_children {
             let local_id = local_obj.get_id();
 
             let needs_sync = match remote.get(&local_id).await {
@@ -389,10 +400,10 @@ impl Vault {
             };
 
             if needs_sync {
-                remote.put(&local_obj).await?;
-                if let Object::Leaf { .. } = local_obj {
+                let stored = remote.put(&mut local_obj, id).await?;
+                if let Object::Leaf { .. } = stored {
                     let bytes = self.fetch(local_id.clone()).await?;
-                    remote.send(&local_obj, bytes).await?;
+                    remote.send(&stored, bytes).await?;
                 }
             }
 
@@ -451,8 +462,8 @@ mod tests {
                 meta: Metadata::new(),
             })
         }
-        async fn put(&self, _object: &Object) -> VaultResult<()> {
-            Ok(())
+        async fn put(&self, object: &mut Object, _destination: &ObjectId) -> VaultResult<Object> {
+            Ok(object.clone())
         }
         async fn send(&self, _object: &Object, _payload: ByteStream) -> VaultResult<()> {
             Ok(())
@@ -535,13 +546,20 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| VaultError::NotFound(id.to_string()))
         }
-        async fn put(&self, object: &Object) -> VaultResult<()> {
-            self.put_calls.lock().unwrap().push(object.get_id());
+        async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+            let id = object.get_id();
+            self.put_calls.lock().unwrap().push(id.clone());
             self.objects
                 .lock()
                 .unwrap()
-                .insert(object.get_id(), object.clone());
-            Ok(())
+                .insert(id.clone(), object.clone());
+            self.children
+                .lock()
+                .unwrap()
+                .entry(destination.clone())
+                .or_default()
+                .push(id);
+            Ok(object.clone())
         }
         async fn send(&self, object: &Object, mut payload: ByteStream) -> VaultResult<()> {
             self.send_calls.lock().unwrap().push(object.get_id());
@@ -569,11 +587,72 @@ mod tests {
         async fn get(&self, _id: &ObjectId) -> VaultResult<Object> {
             Err(VaultError::Generic("boom".into()))
         }
-        async fn put(&self, _object: &Object) -> VaultResult<()> {
+        async fn put(&self, _object: &mut Object, _destination: &ObjectId) -> VaultResult<Object> {
             Err(VaultError::Generic("put should not be called".into()))
         }
         async fn send(&self, _object: &Object, _payload: ByteStream) -> VaultResult<()> {
             Err(VaultError::Generic("send should not be called".into()))
+        }
+        async fn delete(&self, _id: &ObjectId) -> VaultResult<()> {
+            Ok(())
+        }
+    }
+
+    /// An `Origin` whose `put` mirrors `OriginHTTP`/`OriginCommand`: it does *not* mutate the
+    /// `&mut Object` it's given in place, instead returning a freshly-built `Object` renamed to
+    /// `"{destination}/{name}"`. Used to verify that callers rely on `put`'s return value
+    /// rather than assuming the input object was renamed in place (which only `OriginFileSystem`
+    /// currently does). Optionally fails instead, to verify failure doesn't leave stale state.
+    struct RenamingOrigin {
+        fail: bool,
+        put_calls: Mutex<Vec<ObjectId>>,
+        send_calls: Mutex<Vec<ObjectId>>,
+    }
+
+    impl RenamingOrigin {
+        fn new() -> Self {
+            RenamingOrigin {
+                fail: false,
+                put_calls: Mutex::new(Vec::new()),
+                send_calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn failing() -> Self {
+            RenamingOrigin {
+                fail: true,
+                put_calls: Mutex::new(Vec::new()),
+                send_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Origin for RenamingOrigin {
+        async fn fetch(&self, _id: &ObjectId) -> VaultResult<ByteStream> {
+            Ok(Box::pin(stream::once(async {
+                Ok(Bytes::from_static(b"payload"))
+            })))
+        }
+        async fn list(&self, _id: &ObjectId) -> VaultResult<Vec<Object>> {
+            Ok(vec![])
+        }
+        async fn get(&self, id: &ObjectId) -> VaultResult<Object> {
+            Err(VaultError::NotFound(id.to_string()))
+        }
+        async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+            self.put_calls.lock().unwrap().push(object.get_id());
+            if self.fail {
+                return Err(VaultError::Generic("put failed".into()));
+            }
+            let new_id = ObjectId::from(format!("{}/{}", destination.as_str(), object.get_name()));
+            let mut renamed = object.clone();
+            renamed.with_id(new_id);
+            Ok(renamed)
+        }
+        async fn send(&self, object: &Object, mut payload: ByteStream) -> VaultResult<()> {
+            self.send_calls.lock().unwrap().push(object.get_id());
+            while payload.next().await.is_some() {}
+            Ok(())
         }
         async fn delete(&self, _id: &ObjectId) -> VaultResult<()> {
             Ok(())
@@ -668,12 +747,15 @@ mod tests {
     #[tokio::test]
     async fn put_caches_object_so_get_skips_origin() {
         let (vault, origin) = make_vault_with_origin();
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file".to_string(),
             id: ObjectId::from("f1"),
             meta: Metadata::new(),
         };
-        vault.put(&object).await.unwrap();
+        vault
+            .put(&mut object, &ObjectId::from("root"))
+            .await
+            .unwrap();
         let cached = vault.get("f1").await.unwrap();
         assert_eq!(cached.get_name(), "file");
         assert!(origin.get_calls.lock().unwrap().is_empty());
@@ -682,15 +764,111 @@ mod tests {
     #[tokio::test]
     async fn delete_evicts_object_from_cache() {
         let (vault, origin) = make_vault_with_origin();
-        let object = Object::Leaf {
+        let mut object = Object::Leaf {
             name: "file".to_string(),
             id: ObjectId::from("f1"),
             meta: Metadata::new(),
         };
-        vault.put(&object).await.unwrap();
+        vault
+            .put(&mut object, &ObjectId::from("root"))
+            .await
+            .unwrap();
         vault.delete(&ObjectId::from("f1")).await.unwrap();
         vault.get("f1").await.unwrap();
         assert_eq!(origin.get_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_caches_under_the_returned_id_not_the_input_id() {
+        // Some origins (OriginHTTP, OriginCommand) don't rename the input object in place —
+        // they report the real id via `put`'s return value instead. `Vault::put` must cache
+        // (and return) that value, not the caller's stale input id.
+        let vault = Vault::from_origin(
+            "v".to_string(),
+            ObjectId::from("root"),
+            Arc::new(RenamingOrigin::new()),
+        );
+        let mut object = Object::Leaf {
+            name: "file.txt".to_string(),
+            id: ObjectId::from("f1"),
+            meta: Metadata::new(),
+        };
+
+        let returned = vault
+            .put(&mut object, &ObjectId::from("dir"))
+            .await
+            .unwrap();
+        assert_eq!(returned.get_id().as_str(), "dir/file.txt");
+
+        // Cached under the returned id, servable without hitting the origin again.
+        let cached = vault.get("dir/file.txt").await.unwrap();
+        assert_eq!(cached.get_id().as_str(), "dir/file.txt");
+    }
+
+    #[tokio::test]
+    async fn put_does_not_cache_when_origin_put_fails() {
+        let vault = Vault::from_origin(
+            "v".to_string(),
+            ObjectId::from("root"),
+            Arc::new(RenamingOrigin::failing()),
+        );
+        let mut object = Object::Leaf {
+            name: "file.txt".to_string(),
+            id: ObjectId::from("f1"),
+            meta: Metadata::new(),
+        };
+
+        let result = vault.put(&mut object, &ObjectId::from("dir")).await;
+        assert!(result.is_err());
+
+        // Neither the input id nor the would-be renamed id should have been cached.
+        let by_input_id = vault.get("f1").await;
+        assert!(matches!(by_input_id, Err(VaultError::NotFound(_))));
+        let by_renamed_id = vault.get("dir/file.txt").await;
+        assert!(matches!(by_renamed_id, Err(VaultError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn pull_sends_leaf_payload_to_the_id_put_actually_returned() {
+        // RenamingOrigin as `self`'s origin doesn't mutate `remote_obj` in place, so `pull`
+        // must use `put`'s return value (not the stale `remote_obj`) as the `send` target.
+        let renaming = Arc::new(RenamingOrigin::new());
+        let vault = Vault::from_origin(
+            "local".to_string(),
+            ObjectId::from("root"),
+            renaming.clone(),
+        );
+
+        let remote = MapOrigin::empty();
+        remote.insert(&ObjectId::from("root"), leaf("f1", "f1"));
+        remote.set_payload(&ObjectId::from("f1"), b"remote-data");
+
+        vault.pull(&ObjectId::from("root"), &remote).await.unwrap();
+
+        assert_eq!(
+            renaming.send_calls.lock().unwrap().as_slice(),
+            &[ObjectId::from("root/f1")]
+        );
+    }
+
+    #[tokio::test]
+    async fn push_sends_leaf_payload_to_the_id_put_actually_returned() {
+        let local_origin = Arc::new(MapOrigin::empty());
+        local_origin.insert(&ObjectId::from("root"), leaf("f1", "f1"));
+        local_origin.set_payload(&ObjectId::from("f1"), b"local-data");
+        let vault = Vault::from_origin("local".to_string(), ObjectId::from("root"), local_origin);
+
+        let remote = RenamingOrigin::new();
+        vault.push(&ObjectId::from("root"), &remote).await.unwrap();
+
+        assert_eq!(
+            remote.put_calls.lock().unwrap().as_slice(),
+            &[ObjectId::from("f1")]
+        );
+        assert_eq!(
+            remote.send_calls.lock().unwrap().as_slice(),
+            &[ObjectId::from("root/f1")]
+        );
     }
 
     #[tokio::test]

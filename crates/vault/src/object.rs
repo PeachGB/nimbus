@@ -38,7 +38,7 @@ impl ObjectId {
     }
     /// Whether this id refers to the vault's root (`"/"`), the `ObjectId::default()` value.
     pub fn is_root(&self) -> bool {
-        self.0.as_str() == "/"
+        self.0.as_str() == crate::ROOT_ID
     }
 }
 impl From<&ObjectId> for ObjectId {
@@ -50,7 +50,7 @@ impl From<&ObjectId> for ObjectId {
 impl Default for ObjectId {
     /// Defaults to `"/"`, the conventional root id used when a `VaultConfig` omits `root_id`.
     fn default() -> Self {
-        ObjectId(String::from("/"))
+        ObjectId(String::from(crate::ROOT_ID))
     }
 }
 impl std::fmt::Display for ObjectId {
@@ -237,7 +237,7 @@ impl Object {
     /// ```
     pub fn root() -> Self {
         Object::Root {
-            id: ObjectId::from("/"),
+            id: ObjectId::from(crate::ROOT_ID),
             children: None,
         }
     }
@@ -260,11 +260,20 @@ impl Object {
             }
         }
     }
-    /// Returns this object's display name, or `"root"` for `Object::Root`.
+    /// Overwrites this object's id in place and returns `self` for chaining.
+    pub fn with_id(&mut self, obj_id: ObjectId) -> &mut Self {
+        match self {
+            Object::Root { id, .. } | Object::Leaf { id, .. } | Object::Branch { id, .. } => {
+                *id = obj_id;
+            }
+        }
+        self
+    }
+    /// Returns this object's display name, or [`crate::ROOT_NAME`] for `Object::Root`.
     pub fn get_name(&self) -> String {
         match self {
             Object::Leaf { name, .. } | Object::Branch { name, .. } => name.clone(),
-            _ => String::from("root"),
+            _ => String::from(crate::ROOT_NAME),
         }
     }
     /// Returns this object's metadata, or `None` for `Object::Root` (which has none).
@@ -399,7 +408,7 @@ mod tests {
     #[test]
     fn object_id_default_and_is_root() {
         let default_id = ObjectId::default();
-        assert_eq!(default_id.as_str(), "/");
+        assert_eq!(default_id.as_str(), crate::ROOT_ID);
         assert!(default_id.is_root());
         assert!(!ObjectId::from("child").is_root());
     }
@@ -429,8 +438,8 @@ mod tests {
     #[test]
     fn root_object_has_slash_id_and_no_children() {
         let root = Object::root();
-        assert_eq!(root.get_id().as_str(), "/");
-        assert_eq!(root.get_name(), "root");
+        assert_eq!(root.get_id().as_str(), crate::ROOT_ID);
+        assert_eq!(root.get_name(), crate::ROOT_NAME);
         assert!(root.get_meta().is_none());
     }
 

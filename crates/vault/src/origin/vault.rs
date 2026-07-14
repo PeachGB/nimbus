@@ -76,8 +76,8 @@ impl Origin for OriginVault {
         self.vault.get(id).await
     }
 
-    async fn put(&self, object: &Object) -> VaultResult<()> {
-        self.vault.put(object).await
+    async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+        self.vault.put(object, destination).await
     }
 
     async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()> {
@@ -159,12 +159,15 @@ mod tests {
         let vault = Vault::new(config_path).unwrap();
         let origin = OriginVault::new(Arc::new(vault));
 
-        let leaf = Object::Leaf {
+        let mut leaf = Object::Leaf {
             name: "new.txt".to_string(),
             id: ObjectId::from("root/new.txt"),
             meta: Metadata::new(),
         };
-        origin.put(&leaf).await.unwrap();
+        origin
+            .put(&mut leaf, &ObjectId::from("root"))
+            .await
+            .unwrap();
         assert!(fs_root.join("root/new.txt").is_file());
 
         let payload: ByteStream = Box::pin(stream::once(async move {
