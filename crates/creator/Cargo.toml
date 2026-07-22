@@ -1,0 +1,15 @@
+[package]
+name = "nimbus-creator"
+version = "0.1.0"
+edition = "2024"
+description = "An interactive TUI wizard that builds a nimbus-vault vault.toml; embeddable from nimbus-cli or nimbus-tui, or run standalone."
+
+[dependencies]
+color-eyre.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+nimbus-vault = { path = "../vault" }
+dirs = "6.0.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

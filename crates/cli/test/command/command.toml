@@ -1,0 +1,13 @@
+name = "cmd-vault"
+
+[origin_config]
+type = "command"
+list_cmd   = "{root}/cmd-vault.sh list {id}"
+get_cmd    = "{root}/cmd-vault.sh get {id}"
+fetch_cmd  = "cat {root}/data/{id}"
+put_cmd    = "touch /home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/command/data/{name}"
+send_cmd   = "/home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/command/send.sh"
+delete_cmd = "rm -rf {root}/data/{id}"
+
+[origin_config.extras]
+root = "/home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/command"

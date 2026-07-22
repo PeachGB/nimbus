@@ -1,0 +1,5 @@
+name = "nested-vault"
+
+[origin_config]
+type = "vault"
+path = "/home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/fs/fs.toml"

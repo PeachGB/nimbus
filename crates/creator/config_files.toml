@@ -1,0 +1,6 @@
+name = "config files"
+root_id = "/"
+
+[origin_config]
+type = "fs"
+root = "~/.config/"

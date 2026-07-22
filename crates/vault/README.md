@@ -113,10 +113,10 @@ These are `pub`, so external code (e.g. a custom `Origin`) can reuse the same ke
 ## Commands
 
 ```bash
-cargo check -p vault
-cargo test -p vault
-cargo clippy -p vault -- -D warnings
-cargo fmt -p vault
+cargo check -p nimbus-vault
+cargo test -p nimbus-vault
+cargo clippy -p nimbus-vault -- -D warnings
+cargo fmt -p nimbus-vault
 ```
 
 ## Status

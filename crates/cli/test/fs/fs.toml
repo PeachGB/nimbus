@@ -1,0 +1,5 @@
+name = "fs-vault"
+
+[origin_config]
+type = "fs"
+root = "/home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/fs/data"

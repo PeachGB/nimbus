@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cli", "crates/daemon", "crates/tui", "crates/vault"]
+members = ["crates/cli", "crates/core", "crates/daemon", "crates/tui", "crates/vault","crates/creator"]
 
 [workspace.dependencies]
 thiserror = "2.0.18"
@@ -13,4 +13,7 @@ serde = {version = "1.0.228", features = ["derive"]}
 serde_json = {version = "1.0.150"}
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 toml = "1.1.2"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+color-eyre = "0.6.5"
 

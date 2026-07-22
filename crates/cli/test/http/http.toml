@@ -1,0 +1,11 @@
+name = "http-vault"
+
+[origin_config]
+type = "http"
+base_url   = "http://127.0.0.1:8787"
+list_url   = "/list/{id}"
+fetch_url  = "/fetch/{id}"
+get_url    = "/get/{id}"
+put_url    = "/put/{id}"
+send_url   = "/send/{id}"
+delete_url = "/delete/{id}"

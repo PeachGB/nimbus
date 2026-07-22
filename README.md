@@ -6,18 +6,21 @@ arbitrary shell command. Syncing "a folder on disk" and "objects behind a REST A
 run through the exact same code path, because both are just implementations of one
 `Origin` trait.
 
-This repo is a Cargo workspace with four crates:
+This repo is a Cargo workspace with six crates:
 
-| Crate         | Status  | What it is                                              |
-|---------------|---------|----------------------------------------------------------|
-| `nimbus-vault`  | working | The core library: `Object`, `Vault`, `Origin` and its four implementations. |
-| `nimbus-cli`    | working | Command-line interface built on `nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
-| `nimbus-daemon` | stub    | Background sync process (not yet implemented). |
-| `nimbus-tui`    | stub    | Terminal UI frontend (not yet implemented). |
+| Crate            | Status  | What it is                                              |
+|------------------|---------|----------------------------------------------------------|
+| `nimbus-vault`   | working | The core library: `Object`, `Vault`, `Origin` and its four implementations. |
+| `nimbus-core`    | working | Session/vault-management logic (`App`) shared by nimbus's frontends — see [`crates/core/README.md`](crates/core/README.md). |
+| `nimbus-creator` | working | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend — see [`crates/creator/README.md`](crates/creator/README.md). |
+| `nimbus-cli`     | working | An interactive REPL built on `nimbus-core`/`nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
+| `nimbus-daemon`  | stub    | Background sync process (not yet implemented) — see [`crates/daemon/README.md`](crates/daemon/README.md). |
+| `nimbus-tui`     | stub    | Terminal UI frontend (not yet implemented) — see [`crates/tui/README.md`](crates/tui/README.md). |
 
 The rest of this document focuses mostly on `nimbus-vault`, since it's the library
 every other crate builds on. See [`crates/cli/README.md`](crates/cli/README.md) for
-`nimbus-cli`'s own commands, configuration, and session-persistence model.
+`nimbus-cli`'s own commands, configuration, and session-persistence model, and
+[`crates/core/README.md`](crates/core/README.md) for the `App` logic it's built on.
 
 ## The model
 
@@ -121,26 +124,32 @@ crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
 
 ## CLI
 
-`nimbus-cli` manages a set of named vaults plus a special local vault (your own
-filesystem), and moves objects between them:
+`nimbus-cli` starts an interactive REPL that manages a set of named vaults plus a
+special local vault (your own filesystem, named `LOCAL`), and moves objects
+between them:
 
 ```
-nimbus ls                                   # list the current vault's cwd, or all known vaults if none selected
-nimbus vaults                               # list all known vaults
-nimbus select <VAULT>                       # make <VAULT> the current vault
-nimbus new <CONFIG_PATH>                    # register a vault from its TOML config file
-nimbus cd <PATH>                            # change directory inside the current vault
-nimbus put <PATH> [VAULT] [DEST]            # copy a real filesystem path into a vault
-nimbus get <PATH> [VAULT] [DEST]            # copy an object out to a real filesystem path
-nimbus cp <PATH> <DESTINATION> [VAULT]      # copy an object within a vault
-nimbus mv <PATH> <DESTINATION> [VAULT]      # move an object within a vault
-nimbus delete <PATH> [VAULT] [--force]      # delete an object
-nimbus push [VAULT]                         # sync the local vault out to a vault
-nimbus pull [VAULT]                         # sync a vault into the local vault
+nimbus> ls                                   # list the current vault's cwd, or all known vaults if none selected
+nimbus> vaults                               # list all known vaults
+nimbus> select <VAULT>                       # make <VAULT> the current vault
+nimbus> new <CONFIG_PATH>                    # register a vault from its TOML config file
+nimbus> new                                  # launch an interactive wizard to build and register one
+nimbus> cd <PATH>                            # change directory inside the current vault
+nimbus> put <PATH> [VAULT] [DEST]            # copy a real filesystem path into a vault
+nimbus> get <PATH> [VAULT] [DEST]            # copy an object out to a real filesystem path
+nimbus> cp <PATH> <DESTINATION> [VAULT]      # copy an object within a vault
+nimbus> mv <PATH> <DESTINATION> [VAULT]      # move an object within a vault
+nimbus> delete <PATH> [VAULT] [--force]      # delete an object
+nimbus> push [VAULT]                         # sync the local vault out to a vault
+nimbus> pull [VAULT]                         # sync a vault into the local vault
+nimbus> exit                                 # save session state and quit
 ```
 
 See [`crates/cli/README.md`](crates/cli/README.md) for the full command reference,
-the local-vault security boundary, session persistence, and known gaps.
+the local-vault security boundary, and session persistence — the REPL logic itself
+(the `App` type) lives in [`nimbus-core`](crates/core/README.md), so `nimbus-cli` is
+a fairly thin binary over it. `nimbus new` with no path launches an interactive
+vault-builder wizard from [`nimbus-creator`](crates/creator/README.md).
 `nimbus-daemon` and `nimbus-tui` are still placeholder binaries with no logic yet.
 
 ## Writing a custom origin: `OriginCommand`
