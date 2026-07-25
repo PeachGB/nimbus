@@ -7,9 +7,16 @@ license = "MIT"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive"] }
 color-eyre.workspace = true
 crossterm.workspace = true
+nimbus-core = { version = "0.1.0", path = "../core" }
+nimbus-creator = { path = "../creator" }
+nimbus-vault = { version = "0.1.1", path = "../vault" }
 ratatui.workspace = true
+chrono.workspace = true
+tokio.workspace = true
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]

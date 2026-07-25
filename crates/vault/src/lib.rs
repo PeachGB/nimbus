@@ -70,6 +70,10 @@
 //! origin directly, or for building the `remote` argument to
 //! [`vault::Vault::pull`]/[`vault::Vault::push`].
 //!
+//! A config file can live anywhere, but [`config::VaultConfig::default_path`] gives the
+//! conventional home for one — `vaults/<name>.toml` under [`config_home`] — which is where
+//! nimbus's own tooling writes new vaults so they can be found again later.
+//!
 //! # Quick start
 //!
 //! A fully self-contained, end-to-end example — writing a vault config, creating an object,
@@ -195,9 +199,18 @@ pub const PLACEHOLDER_CONTENT_TYPE: &str = "content_type";
 /// [`origin::command::OriginCommand`] templates (rendered as `{modified}`).
 pub const PLACEHOLDER_MODIFIED: &str = "modified";
 /// `extra_vars` key [`origin::command::OriginCommand`]'s `put` uses to expose its
-/// `destination` argument to the `put_cmd` template (rendered as `{destination}`), when not
-/// already set.
+/// `destination` argument to the `put_cmd` template (rendered as `{destination}`). Refreshed
+/// on every `put`.
 pub const PLACEHOLDER_DESTINATION: &str = "destination";
+/// Template placeholder key substituted with an object's kind in
+/// [`origin::command::OriginCommand`] templates (rendered as `{kind}`), taking the value
+/// [`OBJECT_KIND_LEAF`] or [`OBJECT_KIND_BRANCH`]. Without it a `put_cmd` has no way to tell
+/// whether it is being asked to create a file or a directory.
+pub const PLACEHOLDER_KIND: &str = "kind";
+/// Value substituted for [`PLACEHOLDER_KIND`] when putting a file.
+pub const OBJECT_KIND_LEAF: &str = "leaf";
+/// Value substituted for [`PLACEHOLDER_KIND`] when putting a directory.
+pub const OBJECT_KIND_BRANCH: &str = "branch";
 /// Fallback content type substituted into command templates when an object's metadata doesn't
 /// specify one.
 pub const UNKNOWN_CONTENT_TYPE: &str = "unknown";
@@ -220,3 +233,22 @@ pub const SEND_CMD_FIELD: &str = "send_cmd";
 /// [`config::OriginConfig::Command`]/[`origin::command::CmdType`] field name for the delete
 /// command template.
 pub const DELETE_CMD_FIELD: &str = "delete_cmd";
+
+/// Directory nimbus keeps its own configuration in: `.nimbus` under the platform config
+/// directory (`$XDG_CONFIG_HOME` on Linux), falling back to the temp directory when there
+/// isn't one.
+///
+/// Defined here rather than in each binary so the CLI's own config and the vault configs
+/// written by the creator wizard can't drift apart.
+///
+/// # Examples
+///
+/// ```
+/// let home = nimbus_vault::config_home();
+/// assert!(home.ends_with(".nimbus"));
+/// ```
+pub fn config_home() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".nimbus")
+}

@@ -58,8 +58,8 @@ async fn bootstrap_cmd_id_substitutes_id_and_extra_vars() {
     assert_eq!(result, "fetch --id obj1 --token secret");
 }
 
-#[test]
-fn bootstrap_cmd_object_substitutes_metadata_fields() {
+#[tokio::test]
+async fn bootstrap_cmd_object_substitutes_metadata_fields() {
     let cmd = make_command(|c| {
         c.put_cmd = "put {id} {name} {size} {content_type}".to_string();
     });
@@ -71,12 +71,15 @@ fn bootstrap_cmd_object_substitutes_metadata_fields() {
         meta,
     };
 
-    let result = cmd.bootstrap_cmd_object(&CmdType::Put, &object).unwrap();
+    let result = cmd
+        .bootstrap_cmd_object(&CmdType::Put, &object)
+        .await
+        .unwrap();
     assert_eq!(result, "put f1 file.txt 10 text/plain");
 }
 
-#[test]
-fn bootstrap_cmd_object_defaults_missing_metadata_fields() {
+#[tokio::test]
+async fn bootstrap_cmd_object_defaults_missing_metadata_fields() {
     let cmd = make_command(|c| {
         c.put_cmd = "put {size} {content_type} {modified}".to_string();
     });
@@ -86,12 +89,15 @@ fn bootstrap_cmd_object_defaults_missing_metadata_fields() {
         meta: Metadata::new(),
     };
 
-    let result = cmd.bootstrap_cmd_object(&CmdType::Put, &object).unwrap();
+    let result = cmd
+        .bootstrap_cmd_object(&CmdType::Put, &object)
+        .await
+        .unwrap();
     assert_eq!(result, "put 0 unknown ");
 }
 
-#[test]
-fn bootstrap_cmd_object_uses_send_cmd_template_for_send() {
+#[tokio::test]
+async fn bootstrap_cmd_object_uses_send_cmd_template_for_send() {
     let cmd = make_command(|c| {
         c.put_cmd = "put {id}".to_string();
         c.send_cmd = "send {id}".to_string();
@@ -102,27 +108,30 @@ fn bootstrap_cmd_object_uses_send_cmd_template_for_send() {
         meta: Metadata::new(),
     };
 
-    let result = cmd.bootstrap_cmd_object(&CmdType::Send, &object).unwrap();
+    let result = cmd
+        .bootstrap_cmd_object(&CmdType::Send, &object)
+        .await
+        .unwrap();
     assert_eq!(result, "send f1");
 }
 
-#[test]
-fn bootstrap_cmd_object_rejects_non_put_send_types() {
+#[tokio::test]
+async fn bootstrap_cmd_object_rejects_non_put_send_types() {
     let cmd = make_command(|_| {});
     let object = Object::Leaf {
         name: "file.txt".to_string(),
         id: ObjectId::from("f1"),
         meta: Metadata::new(),
     };
-    let result = cmd.bootstrap_cmd_object(&CmdType::Get, &object);
+    let result = cmd.bootstrap_cmd_object(&CmdType::Get, &object).await;
     assert!(matches!(result, Err(VaultError::InvalidMethodCall)));
 }
 
-#[test]
-fn bootstrap_cmd_object_errors_on_root_object() {
+#[tokio::test]
+async fn bootstrap_cmd_object_errors_on_root_object() {
     let cmd = make_command(|_| {});
     let object = Object::root();
-    let result = cmd.bootstrap_cmd_object(&CmdType::Put, &object);
+    let result = cmd.bootstrap_cmd_object(&CmdType::Put, &object).await;
     assert!(matches!(result, Err(VaultError::Unreachable)));
 }
 
@@ -241,4 +250,144 @@ async fn fetch_streams_command_stdout() {
         collected.extend_from_slice(&chunk.unwrap());
     }
     assert_eq!(collected, b"hello");
+}
+
+// --- regressions: templating available to put/send ---
+
+#[tokio::test]
+async fn bootstrap_cmd_object_substitutes_configured_extras() {
+    // `put_cmd`/`send_cmd` used to interpolate only the *object's* metadata extras, so a config
+    // referencing a shared `{helper}`/`{root}` ran with the literal braces still in it.
+    let mut extras = HashMap::new();
+    extras.insert("helper".to_string(), "/opt/helper.sh".to_string());
+    extras.insert("root".to_string(), "/srv/data".to_string());
+    let cmd = OriginCommand::new(
+        "fetch".to_string(),
+        "list".to_string(),
+        "get".to_string(),
+        "{helper} put {root} {name}".to_string(),
+        "{helper} send {root} {id}".to_string(),
+        "delete".to_string(),
+        Some(extras),
+    );
+    let object = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("f1"),
+        meta: Metadata::new(),
+    };
+
+    let put = cmd
+        .bootstrap_cmd_object(&CmdType::Put, &object)
+        .await
+        .unwrap();
+    assert_eq!(put, "/opt/helper.sh put /srv/data file.txt");
+
+    let send = cmd
+        .bootstrap_cmd_object(&CmdType::Send, &object)
+        .await
+        .unwrap();
+    assert_eq!(send, "/opt/helper.sh send /srv/data f1");
+}
+
+#[tokio::test]
+async fn bootstrap_cmd_object_substitutes_the_object_kind() {
+    // Without `{kind}` a `put_cmd` cannot tell a file from a directory, which makes `mkdir`
+    // impossible to implement against a command origin.
+    let cmd = make_command(|c| {
+        c.put_cmd = "put {kind} {name}".to_string();
+    });
+
+    let leaf = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("f1"),
+        meta: Metadata::new(),
+    };
+    assert_eq!(
+        cmd.bootstrap_cmd_object(&CmdType::Put, &leaf)
+            .await
+            .unwrap(),
+        "put leaf file.txt"
+    );
+
+    let branch = Object::Branch {
+        name: "docs".to_string(),
+        id: ObjectId::from("docs"),
+        meta: Metadata::new(),
+        children: None,
+    };
+    assert_eq!(
+        cmd.bootstrap_cmd_object(&CmdType::Put, &branch)
+            .await
+            .unwrap(),
+        "put branch docs"
+    );
+}
+
+#[tokio::test]
+async fn object_extras_take_precedence_over_configured_extras() {
+    let mut extras = HashMap::new();
+    extras.insert("target".to_string(), "default".to_string());
+    let cmd = OriginCommand::new(
+        "fetch".to_string(),
+        "list".to_string(),
+        "get".to_string(),
+        "put {target}".to_string(),
+        "send".to_string(),
+        "delete".to_string(),
+        Some(extras),
+    );
+    let mut meta = Metadata::new();
+    meta.add_extra("target".to_string(), "per-object".to_string());
+    let object = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("f1"),
+        meta,
+    };
+
+    assert_eq!(
+        cmd.bootstrap_cmd_object(&CmdType::Put, &object)
+            .await
+            .unwrap(),
+        "put per-object"
+    );
+}
+
+#[tokio::test]
+async fn put_refreshes_the_destination_placeholder_on_every_call() {
+    // `{destination}` used to be inserted only when absent, so every put after the first was
+    // sent to wherever the first one happened to go.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().display().to_string();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+
+    let cmd = OriginCommand::new(
+        "fetch".to_string(),
+        "list".to_string(),
+        r#"printf '{"Leaf":{"name":"{name}","id":"{id}","meta":{"size":0,"content_type":null,"modified":null,"extra":{}}}}'"#.to_string(),
+        format!("touch {root}/{{destination}}/{{name}}"),
+        "true".to_string(),
+        "true".to_string(),
+        None,
+    );
+
+    let mut first = Object::Leaf {
+        name: "one.txt".to_string(),
+        id: ObjectId::from("one.txt"),
+        meta: Metadata::new(),
+    };
+    cmd.put(&mut first, &ObjectId::from("a")).await.unwrap();
+
+    let mut second = Object::Leaf {
+        name: "two.txt".to_string(),
+        id: ObjectId::from("two.txt"),
+        meta: Metadata::new(),
+    };
+    cmd.put(&mut second, &ObjectId::from("b")).await.unwrap();
+
+    assert!(dir.path().join("a/one.txt").exists());
+    assert!(
+        dir.path().join("b/two.txt").exists(),
+        "second put went to the first put's destination"
+    );
 }

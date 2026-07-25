@@ -1,5 +1,10 @@
 # vaults de prueba
 
+> **Ver también [`dev/testenv/`](../../../dev/testenv/README.md)**, que arma lo mismo
+> pero automatizado: un vault por cada tipo de origin, con el server HTTP y el
+> helper de `command` incluidos, y aislado via `XDG_STATE_HOME`/`XDG_CONFIG_HOME`
+> para no tocar tu registro real. Esta carpeta queda para pruebas a mano.
+
 Un config por cada `type` de `OriginConfig` (`crates/vault/src/config.rs`), para
 probar el REPL a mano contra cada uno. Las rutas dentro de los `.toml` están
 hardcodeadas en absoluto (`/home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/...`);
@@ -51,18 +56,21 @@ select cmd-vault
 ls
 ```
 
-Limitación real del origin, no de este test setup: `OriginCommand::put`/`send`
-interpolan `{id}`/`{name}`/etc. desde los metadatos del objeto
-(`bootstrap_cmd_object`), pero **no** desde `extras` — así que `put_cmd`/
-`send_cmd` no pueden usar `{root}` (por eso están hardcodeados acá). Peor
-todavía: `send` invoca el comando como `sh <cmd>` (un solo argv, sin `-c`,
-ver `origin/command.rs::send`), así que `send_cmd` tiene que ser literalmente
-la ruta a un script sin espacios ni placeholders — no hay forma de que ese
-script sepa a qué objeto corresponde el payload. `command/send.sh` sólo
-vuelca stdin a un archivo fijo (`data/last-upload.bin`) para confirmar que el
-pipe llega; no es un `send` correcto por-objeto. Si te importa `put`/`send`
-sobre este origin en serio, ese es el próximo bug a mirar en
-`crates/vault/src/origin/command.rs`.
+**Las limitaciones que documentaba esta sección ya están arregladas** (ver
+`crates/vault/README.md#command-templating`):
+
+- `put_cmd`/`send_cmd` ahora sí interpolan los `extras` configurados, así que
+  pueden usar `{root}`/`{helper}` como cualquier otro template. Antes sólo
+  interpolaban el `meta.extra` del objeto, por eso acá están hardcodeados.
+- `send` ahora corre bajo `sh -c` como el resto, así que `send_cmd` puede ser un
+  comando con argumentos y placeholders — ya no tiene que ser la ruta pelada a un
+  script. `command/send.sh` vuelca stdin a un archivo fijo
+  (`data/last-upload.bin`), que era el único `send` posible antes; para un `send`
+  correcto por objeto mirá `dev/testenv/cmd_origin.sh`.
+- Se agregó `{kind}` (`leaf`/`branch`), sin el cual `put_cmd` no podía distinguir
+  crear un archivo de crear un directorio (y `mkdir` era imposible).
+
+Los `.toml` de esta carpeta no se actualizaron para aprovechar nada de eso.
 
 ## http/ — `type = "http"`
 
@@ -82,10 +90,10 @@ select http-vault
 ls
 ```
 
-`server.py` implementa `list`/`get`/`fetch`/`put`/`send`/`delete` completos
-(a diferencia del origin `command`, acá `put`/`send` sí quedan bien
-resueltos), así que es el mejor lugar para probar el ciclo completo
-`put`/`get`/`delete` sin tocar el vault `LOCAL`.
+`server.py` implementa `list`/`get`/`fetch`/`put`/`send`/`delete` completos, así
+que sirve para probar el ciclo entero `put`/`get`/`delete` sin tocar el vault
+`LOCAL`. (`dev/testenv/http_origin.py` es la versión mantenida del mismo
+contrato.)
 
 ## vault-of-vault/ — `type = "vault"`
 

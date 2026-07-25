@@ -80,6 +80,15 @@ pub struct Vault {
     objects: Mutex<HashMap<ObjectId, Object>>,
     root: ObjectId,
 }
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault")
+            .field("name", &self.name)
+            .field("objects", &self.objects)
+            .field("root", &self.root)
+            .finish()
+    }
+}
 
 impl Vault {
     ///public constructor by field for vault

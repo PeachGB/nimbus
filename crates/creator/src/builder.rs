@@ -64,7 +64,11 @@ impl OriginKind {
     /// The fields the wizard must collect for this origin kind, in prompt order.
     pub fn fields(&self) -> Vec<FieldSpec> {
         match self {
-            OriginKind::Fs => vec![path_field("root", "root directory (tab to complete)", false)],
+            OriginKind::Fs => vec![path_field(
+                "root",
+                "root directory (tab to complete)",
+                false,
+            )],
             OriginKind::Http => vec![
                 field("base_url", "base url (optional)", true),
                 field("list_url", "list url ({id}-templated)", false),

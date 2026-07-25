@@ -86,8 +86,41 @@ impl VaultConfig {
     /// Serializes this config to TOML and writes it to `path`.
     pub fn save(&self, path: &std::path::Path) -> VaultResult<()> {
         let toml = toml::to_string_pretty(self)?;
+        // The conventional directory (see [`Self::default_dir`]) won't exist until the first
+        // vault is created, so saving there has to be able to make it.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(path, toml)?;
         Ok(())
+    }
+
+    /// Directory new vault configs are written to by default: `vaults/` under
+    /// [`crate::config_home`]. Keeping them together is what lets a vault be found again
+    /// later without remembering where it was saved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let dir = nimbus_vault::config::VaultConfig::default_dir();
+    /// assert!(dir.ends_with("vaults"));
+    /// ```
+    pub fn default_dir() -> PathBuf {
+        crate::config_home().join("vaults")
+    }
+
+    /// The default config path for a vault called `name`, inside [`Self::default_dir`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let path = nimbus_vault::config::VaultConfig::default_path("backup");
+    /// assert!(path.ends_with("backup.toml"));
+    /// ```
+    pub fn default_path(name: &str) -> PathBuf {
+        Self::default_dir().join(format!("{name}.toml"))
     }
 }
 

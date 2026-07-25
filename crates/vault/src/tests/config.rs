@@ -240,3 +240,55 @@ fn build_propagates_error_when_inner_vault_config_is_missing() {
     let result = VaultConfig::build(outer_path);
     assert!(matches!(result, Err(VaultError::Io(_))));
 }
+
+// --- default location for new vault configs ---
+
+#[test]
+fn default_path_is_a_named_file_in_the_default_dir() {
+    let path = VaultConfig::default_path("backup");
+    assert_eq!(path.parent(), Some(VaultConfig::default_dir().as_path()));
+    assert_eq!(path.file_name().unwrap(), "backup.toml");
+}
+
+#[test]
+fn default_dir_lives_under_the_nimbus_config_home() {
+    assert!(VaultConfig::default_dir().starts_with(crate::config_home()));
+}
+
+#[test]
+fn save_creates_the_directory_it_is_asked_to_write_into() {
+    // The conventional vaults directory doesn't exist until the first vault is created.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nested/deeper/vault.toml");
+    let config = VaultConfig::new(
+        "v".to_string(),
+        ObjectId::default(),
+        OriginConfig::Fs {
+            root: dir.path().to_path_buf(),
+        },
+    );
+
+    config.save(&path).unwrap();
+    assert!(path.is_file());
+}
+
+#[test]
+fn save_still_works_for_a_bare_relative_filename() {
+    // `Path::parent()` of "vault.toml" is Some(""), which `create_dir_all` would choke on.
+    let dir = tempdir().unwrap();
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    let config = VaultConfig::new(
+        "v".to_string(),
+        ObjectId::default(),
+        OriginConfig::Fs {
+            root: dir.path().to_path_buf(),
+        },
+    );
+    let result = config.save(std::path::Path::new("bare.toml"));
+
+    std::env::set_current_dir(previous).unwrap();
+    result.unwrap();
+    assert!(dir.path().join("bare.toml").is_file());
+}

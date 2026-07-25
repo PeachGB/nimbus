@@ -8,9 +8,11 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper, Result};
 
+/// Every subcommand `Commands` accepts, for first-word completion. Kept in sync by hand — a
+/// command missing here still runs, it just won't be offered.
 const SUBCOMMANDS: &[&str] = &[
-    "ls", "vaults", "select", "new", "cd", "put", "get", "delete", "cp", "mv", "push", "pull",
-    "exit",
+    "ls", "vaults", "select", "new", "forget", "cd", "put", "get", "mkdir", "touch", "rename",
+    "delete", "cp", "mv", "push", "pull", "exit",
 ];
 
 /// Completes subcommand names as the first word of the line, and vault/directory names as

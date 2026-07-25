@@ -203,6 +203,13 @@ impl Origin for OriginFileSystem {
                 .await
                 .map_err(|e| VaultError::OriginError(format!("Failed to write to file: {}", e)))?;
         }
+
+        // `tokio::fs::File` buffers, and its `Drop` only kicks off a best-effort background
+        // flush — so without this the bytes aren't guaranteed to be on disk when `send` returns
+        // and a read straight afterwards can come back short or empty.
+        file.flush()
+            .await
+            .map_err(|e| VaultError::OriginError(format!("Failed to flush file: {}", e)))?;
         Ok(())
     }
 

@@ -1,19 +1,96 @@
 # nimbus-core
 
-Session/vault-management logic shared by nimbus's frontends (currently [`nimbus-cli`](../cli); [`nimbus-tui`](../tui) is still an unimplemented stub). Owns the `App` — registered vaults, the current vault/working directory, and the local staging vault — plus the on-disk config `App` is built from. Frontends drive it through `App`'s methods and are responsible for their own input/output loop; `nimbus-core` has no terminal/UI code of its own.
+Session/vault-management logic shared by nimbus's frontends ([`nimbus-cli`](../cli) and
+[`nimbus-tui`](../tui)). Owns the `App` — registered vaults, the current vault/working directory,
+and the local staging vault — plus the on-disk config `App` is built from. Frontends drive it
+through `App`'s methods and are responsible for their own input/output loop; `nimbus-core` has no
+terminal/UI code of its own.
 
 ## What's here
 
-- **`config.rs`** — `CliConfig`: the on-disk shape read from `~/.config/.nimbus/cli_config.toml` (`default_local_vault`, defaulting to `true`; `local_vault_path`, defaulting to `$HOME`). `CliConfig::load()` returns the default config if the file doesn't exist yet, rather than erroring.
-- **`app.rs`** — `App`: holds every registered `Vault` (by name), the special `LOCAL` vault (the user's own filesystem, when `default_local_vault` is enabled), the current vault/cwd, and vault-config paths so they can be re-registered on the next run. `App::init()` loads `CliConfig`, restores previously-registered vaults from `~/.local/state/nimbus/session.toml`, and (re-)registers `LOCAL` if configured. `App::save()` writes the registered vault-config paths back to that session file.
+- **`config.rs`** — `CliConfig`: the on-disk shape read from `<config>/.nimbus/cli_config.toml`
+  (`default_local_vault`, defaulting to `true`; `local_vault_path`, defaulting to `$HOME`). The
+  directory comes from `nimbus_vault::config_home()` rather than being rebuilt here, so the CLI
+  config and the vault configs written by [`nimbus-creator`](../creator) can't drift apart.
+  `CliConfig::load()` returns the default config if the file doesn't exist yet, rather than
+  erroring.
+- **`app.rs`** — `App`: holds every registered `Vault` (by name), the special `LOCAL` vault (the
+  user's own filesystem, when `default_local_vault` is enabled), the current vault/cwd, and
+  vault-config paths so they can be re-registered on the next run. `App::init()` loads
+  `CliConfig`, restores previously-registered vaults from `<state>/nimbus/session.toml`, and
+  (re-)registers `LOCAL` if configured. `App::save()` writes the registered vault-config paths
+  back to that session file.
+
+  The session path is a **field** (`state_path`), not a constant, so tests can point it at a
+  scratch file. That isn't stylistic: `save()` used to write the real session file
+  unconditionally, so `cargo test` rewrote the developer's own vault registry.
 
 ## Commands exposed by `App`
 
-`ls`, `vaults`, `select`, `new_vault`, `cd` (plus `cd_completions`, used by `nimbus-cli`'s tab completion), `put`, `get`, `cp`, `mv`, `delete`, `push`, `pull`, `exit`. See [`crates/cli/README.md`](../cli/README.md) for the user-facing command reference these map to.
+`ls`, `vaults`, `select`, `new_vault`, `forget_vault`, `cd` (plus `cd_completions`, used by
+`nimbus-cli`'s tab completion), `put`, `get`, `mkdir`, `touch`, `rename`, `cp`, `mv`, `delete`,
+`push`, `pull`. See [`crates/cli/README.md`](../cli/README.md) for the user-facing command
+reference these map to.
 
-- `put`/`get`/`cp`/`mv` all follow the same pattern: resolve the source path to an `ObjectId` via `Vault::find`, `get` its `Object`, `put` it under the resolved destination, and — for `Leaf`s only — `fetch` the payload from the source and `send` it to whatever `Object` `put` returned (not the pre-`put` object; see [`crates/vault/README.md`](../vault/README.md#the-put-contract)).
-- `put`/`get` additionally resolve local-filesystem paths through `resolve_local_path`, which canonicalizes the input and rejects anything outside the configured local root — this is the boundary that keeps `LOCAL` from touching files outside `local_vault_path`.
-- `cd` with no vault selected treats the path's first component as a vault name (`select`s it) and recurses on the remainder; with a vault selected, it resolves the path relative to the current directory via `Vault::find`.
+Alongside those are data-returning methods, for frontends that render rather than print:
+`vault_names()`, `list_cwd()`, `fetch_object_bytes(id)` and `write_object_bytes(id, bytes)`. The
+last two are what let the TUI open a file in an editor and save the result back.
+
+- `put`/`get`/`cp`/`mv` all follow the same pattern: resolve the source path to an `ObjectId` via
+  `Vault::find`, `get` its `Object`, `put` it under the resolved destination, and — for `Leaf`s
+  only — `fetch` the payload from the source and `send` it to whatever `Object` `put` returned
+  (not the pre-`put` object; see
+  [`crates/vault/README.md`](../vault/README.md#the-put-contract)).
+- `put`/`get` additionally resolve local-filesystem paths through `resolve_local_path`, which
+  canonicalizes the input and rejects anything outside the configured local root — this is the
+  boundary that keeps `LOCAL` from touching files outside `local_vault_path`. `get` with **no**
+  destination targets the local vault's root, not the process's working directory, which would
+  otherwise fail anywhere except inside the local root.
+- `cd` with no vault selected treats the path's first component as a vault name (`select`s it)
+  and recurses on the remainder; with a vault selected, it resolves the path relative to the
+  current directory via `Vault::find`.
+
+## Path specs
+
+`resolve_spec` is how nearly every command turns a typed argument into a `(vault, absolute path)`
+pair:
+
+| Spec | Resolves to |
+|------|-------------|
+| `notes.txt` | relative to `cwd_path`, in the current (or explicitly named) vault |
+| `/docs/notes.txt` | absolute within that vault |
+| `backup:/inbox` | the vault named `backup`, from **its** root |
+
+`split_vault_spec` only treats a `name:` prefix as a vault when `name` is actually registered, so
+an object whose name contains a colon still resolves as a path. A qualified spec resolves from
+that vault's root because there is no meaningful "current directory" in a vault you aren't
+standing in.
+
+## Recursion, renaming, and the guards
+
+- **`deep_copy`** is what makes `cp`/`mv`/`rename` work on directories. `Vault::put` on a
+  `Branch` only creates the entry itself — it knows nothing about children — so without recursion
+  a moved directory would arrive empty and the source would then be deleted. It takes an optional
+  `rename_to`, which applies to the **top level only**; descendants keep their own names.
+- **`rename`** is a copy under the new name followed by deleting the original, because `Origin`
+  has no rename primitive (`put` always writes an object under its own `get_name()`). Correct for
+  every origin, but it costs a **full data copy** — worth knowing for a large object on a remote
+  origin. A real `Origin::rename` with an `fs::rename` fast path is the fix if that ever matters.
+- **`cp`/`mv` destinations** may be an existing directory (the object keeps its name) or a path
+  that doesn't exist yet (it lands in its parent under that new name). An existing *file* is
+  refused rather than overwritten, because `put` truncates.
+- The **into-itself guard** rejects any destination whose path starts with the source's, with no
+  exemption for the two being equal — pasting a directory into itself resolves to exactly that,
+  and `deep_copy` would otherwise recurse into the copy it had just made, forever. `starts_with`
+  is component-wise, so `cp a.txt a.txt.bak` and `cp docs docs2` are unaffected.
+- **`delete`** refuses a non-empty directory unless forced. The check only runs for directories:
+  asking an origin to list a leaf is an error, not an empty listing, so applying it universally
+  made every file undeletable without `--force`.
+- **`new_vault`** refuses a name already registered to a *different* config path — silently
+  replacing the entry would leave the original vault unreachable, with nothing pointing at its
+  data. Re-registering the **same** path is allowed, and is how an edit to a config file gets
+  picked up. `forget_vault` frees a name; it is registry bookkeeping only and never touches the
+  vault's config file or the data in its origin.
 
 ## Commands
 

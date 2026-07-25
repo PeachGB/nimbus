@@ -33,7 +33,9 @@ Each vault you register (other than the automatic `LOCAL` one) is defined by its
 nimbus> new /path/to/vault.toml
 ```
 
-or launch the interactive wizard (built on [`nimbus-creator`](../creator)) by running `new` with no path — it prompts for a name, root id, origin type, and that origin's fields, then writes and registers the resulting `vault.toml`.
+or launch the interactive wizard (built on [`nimbus-creator`](../creator)) by running `new` with no path — it prompts for a name, root id, origin type, and that origin's fields, then writes and registers the resulting `vault.toml`. The wizard defaults to saving under `~/.config/.nimbus/vaults/<name>.toml`, so vaults you create stay together and can be found again; the path is editable, and it refuses to overwrite an existing config.
+
+Registering a name that's already taken by a *different* config is refused, since replacing it would leave the original vault unreachable. Use `forget <vault>` to free the name first. Re-registering the **same** config path is fine — that's how an edit to a config file gets picked up.
 
 ## Session model
 
@@ -59,6 +61,7 @@ cd                     # (no argument) return to the root — deselects the curr
 ```
 new <config.toml>      # register a new vault from its config file
 new                    # launch the interactive wizard to build and register one
+forget <vault>         # stop tracking a vault; its config file and data are left alone
 ```
 
 ### Moving data
@@ -68,17 +71,46 @@ put <path> [vault] [dest]
 get <path> [vault] [dest]
 ```
 
-`put` uploads something from your local filesystem into a vault. `get` downloads something from a vault into your local filesystem. `vault` defaults to whichever vault is currently selected; `dest` defaults to your current position (in the vault, for `put`; in your local directory, for `get`). Arguments are positional.
+`put` uploads something from your local filesystem into a vault. `get` downloads something from a vault into your local filesystem. `vault` defaults to whichever vault is currently selected. Arguments are positional.
+
+`dest` defaults to your current position in the vault for `put`, and to the **local vault's root** for `get` — not the shell's working directory, which is outside the local root nearly all the time and so would just fail.
 
 ### Operating within a vault
 
 ```
+mkdir <path> [vault]                 # create a directory
+touch <path> [vault]                 # create an empty file
+rename <path> <new-name> [vault]     # rename in place; takes a name, not a path
 cp <path> <destination> [vault]
 mv <path> <destination> [vault]
 delete <path> [vault] [-f | --force]
 ```
 
-`cp`/`mv` copy or move an object within the same vault. `delete` refuses to remove a non-empty directory unless `--force` is given.
+`delete` refuses to remove a non-empty directory unless `--force` is given. `mkdir`/`touch` refuse to clobber anything already at the path — `touch` is therefore *not* the usual "create or bump the timestamp", since an origin's `put` truncates.
+
+`rename` takes a bare name, not a path; use `mv` to relocate. It is implemented as a copy under the new name followed by deleting the original, because no origin has a rename primitive — correct everywhere, but it costs a full data copy, which is worth knowing for a large object on a remote origin.
+
+### Paths
+
+Every path argument above is a **`vault:path` spec**:
+
+| Spec | Means |
+|------|-------|
+| `notes.txt` | relative to the current directory |
+| `/docs/notes.txt` | absolute within the current vault |
+| `backup:/inbox` | the vault named `backup`, from its root |
+
+A `vault:` prefix is what distinguishes a vault from a directory of the same name — `docs` is always a path, `docs:` is always the vault. The prefix is only recognised when it names a registered vault, so an object whose name contains a colon still resolves as a path.
+
+That prefix is also how `cp`/`mv` **cross vaults**, including between different origin types:
+
+```
+nimbus> cp notes.txt backup:/inbox           # into a directory, keeping the name
+nimbus> cp notes.txt backup:/inbox/copy.txt  # under a new name
+nimbus> mv docs archive:/2026                # directories move recursively
+```
+
+The destination may be an existing directory (the object keeps its name) or a path that doesn't exist yet (it lands under that new name). An existing *file* as the destination is refused rather than overwritten.
 
 ### Syncing with a remote origin
 
@@ -99,9 +131,9 @@ exit                   # save session state and quit
 
 ## Writing a custom origin
 
-If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `command` lets you wire up arbitrary shell commands. Each operation gets its own command template with `{id}`, `{name}`, `{size}`, `{content_type}`, `{modified}`, `{destination}` (where applicable) substituted in, plus any custom `extras` you define — see [`crates/vault/README.md`](../vault/README.md) for the full reference:
+If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `command` lets you wire up arbitrary shell commands. Each operation gets its own command template with `{id}`, `{name}`, `{size}`, `{content_type}`, `{modified}`, `{kind}` (`leaf`/`branch`) and `{destination}` (where applicable) substituted in, plus any custom `extras` you define — see [`crates/vault/README.md`](../vault/README.md) for the full reference:
 
-- `list_cmd` / `get_cmd` must print JSON on stdout matching the object schema (`{"type": "leaf"|"branch", "id": "...", "name": "...", ...}`).
+- `list_cmd` / `get_cmd` must print JSON on stdout matching the object schema — serde's externally-tagged enum, i.e. `{"Leaf": {"name": ..., "id": ..., "meta": {...}}}` or `{"Branch": {..., "children": null}}`.
 - `fetch_cmd` streams raw content bytes to stdout.
 - `send_cmd` reads the payload from stdin.
 - `put_cmd`/`delete_cmd` just need to succeed (exit code 0); stderr is captured for error reporting on failure.
@@ -112,3 +144,8 @@ If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `comma
 - Content (file bytes) is streamed, not buffered — large files don't get fully loaded into memory during transfer.
 - `mv` and `push`/`pull`'s local↔remote transfers only proceed with the destructive step (delete, in `mv`'s case) after the copy has succeeded.
 - Tab completion currently covers subcommand names and `cd`'s first argument only; other commands' path arguments aren't completed yet.
+- The REPL reads commands from stdin and ignores `argv`, so `nimbus-cli ls` does nothing — pipe commands in (`printf 'select v\nls\n' | nimbus-cli`) to script it.
+
+## Testing against other origins
+
+[`dev/testenv/`](../../dev/testenv/README.md) builds a throwaway sandbox with one vault per origin type (`fs`, `http`, `command`, and a vault wrapping another vault), including reference `http` and `command` origin implementations. It redirects `XDG_STATE_HOME`/`XDG_CONFIG_HOME` so your real vault registry is never touched.

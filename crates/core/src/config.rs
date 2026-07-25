@@ -15,10 +15,7 @@ fn default_true() -> bool {
 }
 impl CliConfig {
     pub fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".nimbus")
-            .join("cli_config.toml")
+        nimbus_vault::config_home().join("cli_config.toml")
     }
 
     pub fn load() -> Result<Self> {

@@ -182,7 +182,7 @@ impl Hash for Metadata {
 /// assert_eq!(object.get_id().as_str(), "notes.txt");
 /// assert!(object.get_meta().is_some());
 /// ```
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Object {
     /// A file-like node with content but no children.
     Leaf {
@@ -266,6 +266,38 @@ impl Object {
             Object::Root { id, .. } | Object::Leaf { id, .. } | Object::Branch { id, .. } => {
                 *id = obj_id;
             }
+        }
+        self
+    }
+    /// Overwrites this object's display name in place and returns `self` for chaining. A
+    /// no-op for `Object::Root`, which has no name of its own. Since an origin's `put` writes
+    /// an object under `get_name()` in the destination, setting a new name before a `put` is
+    /// what turns a copy into a rename.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nimbus_vault::object::{Metadata, Object, ObjectId};
+    ///
+    /// let mut object = Object::Leaf {
+    ///     name: "notes.txt".to_string(),
+    ///     id: ObjectId::from("notes.txt"),
+    ///     meta: Metadata::new(),
+    /// };
+    /// object.with_name("renamed.txt".to_string());
+    /// assert_eq!(object.get_name(), "renamed.txt");
+    ///
+    /// // the root has no name to set
+    /// let mut root = Object::root();
+    /// root.with_name("ignored".to_string());
+    /// assert_eq!(root.get_name(), nimbus_vault::ROOT_NAME);
+    /// ```
+    pub fn with_name(&mut self, obj_name: String) -> &mut Self {
+        match self {
+            Object::Leaf { name, .. } | Object::Branch { name, .. } => {
+                *name = obj_name;
+            }
+            Object::Root { .. } => {}
         }
         self
     }

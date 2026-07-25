@@ -12,9 +12,10 @@ use crate::{
     event::{AppEvent, Event, EventHandler},
 };
 
-/// The wizard's current step. There is no backward navigation: `Esc` always cancels the whole
-/// wizard rather than stepping back, keeping the state machine linear.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The wizard's current step. Progress is otherwise linear — `Esc` cancels the whole wizard
+/// rather than stepping back — with one exception: a refused save returns from `Confirm` to
+/// `SavePath`, so a bad path can be corrected without losing everything already typed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Step {
     Name,
     RootId,
@@ -77,6 +78,20 @@ impl App {
         }
     }
 
+    /// Whether the wizard is still awaiting input. `false` once it has completed or been
+    /// cancelled — lets a caller drive it via [`Self::handle_key_event`] directly (feeding it
+    /// key events from their own event loop) instead of via [`Self::run`], and know when to
+    /// stop and collect the outcome with [`Self::into_outcome`].
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Consumes the wizard, returning the path a config was written to (`Some`), or `None` if
+    /// it was cancelled. Only meaningful once [`Self::is_running`] is `false`.
+    pub fn into_outcome(self) -> Option<PathBuf> {
+        self.outcome
+    }
+
     /// Runs the wizard's blocking event loop against `terminal`, returning the path a config
     /// was written to (`Some`), or `None` if the user cancelled. The caller owns terminal
     /// init/restore.
@@ -136,7 +151,7 @@ impl App {
                 self.origin_kind = Some(kind);
                 self.fields = kind.fields();
                 self.step = if self.fields.is_empty() {
-                    self.save_path = format!("{}.toml", self.name);
+                    self.save_path = default_save_path(&self.name);
                     self.input = self.save_path.clone();
                     Step::SavePath
                 } else {
@@ -164,6 +179,21 @@ impl App {
                 };
                 let config = VaultConfig::new(self.name.clone(), root_id, origin_config);
                 let path = PathBuf::from(&self.save_path);
+
+                // `save` writes through, so an existing file here would be destroyed — and since
+                // the default path is derived from the vault name, reusing a name is exactly how
+                // you'd land on one. Back to the save-path step so the path can be edited rather
+                // than losing everything typed so far.
+                if path.exists() {
+                    self.error = Some(format!(
+                        "{} already exists — choose another path (or another vault name)",
+                        path.display()
+                    ));
+                    self.input = self.save_path.clone();
+                    self.step = Step::SavePath;
+                    return Ok(());
+                }
+
                 match config.save(&path) {
                     Ok(()) => {
                         self.outcome = Some(path);
@@ -253,7 +283,7 @@ impl App {
                     self.input.clear();
                     self.step = Step::Field(i + 1);
                 } else {
-                    self.save_path = format!("{}.toml", self.name);
+                    self.save_path = default_save_path(&self.name);
                     self.input = self.save_path.clone();
                     self.step = Step::SavePath;
                 }
@@ -266,6 +296,16 @@ impl App {
             Step::SelectOrigin | Step::Confirm => {}
         }
     }
+}
+
+/// Where a newly built vault config is offered to be saved: the conventional vaults directory,
+/// named after the vault.
+///
+/// A full path rather than a bare `<name>.toml`, so the wizard doesn't quietly drop configs into
+/// whatever directory the program happened to be launched from — and so a vault created from the
+/// TUI ends up somewhere it can be found again. Still editable on the save-path step.
+fn default_save_path(name: &str) -> String {
+    VaultConfig::default_path(name).display().to_string()
 }
 
 /// Expands a leading `~` or `~/...` to the user's home directory, so typed paths behave like

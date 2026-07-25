@@ -154,3 +154,74 @@ fn tab_expands_a_leading_tilde_to_the_home_directory() {
         home.display()
     );
 }
+
+/// Drives the wizard as far as the save-path step, building an `fs` vault called `name`.
+fn wizard_to_save_path(name: &str, data_dir: &std::path::Path) -> App {
+    let mut app = App::new();
+    type_str(&mut app, name);
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // name
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // root id: blank
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // origin: Fs (first entry)
+    type_str(&mut app, data_dir.to_str().unwrap());
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // root directory
+    app
+}
+
+fn retype_save_path(app: &mut App, path: &std::path::Path) {
+    for _ in 0..app_input_len(app) {
+        app.handle_key_event(key(KeyCode::Backspace)).unwrap();
+    }
+    type_str(app, path.to_str().unwrap());
+    app.handle_key_event(key(KeyCode::Enter)).unwrap();
+}
+
+#[test]
+fn save_path_defaults_to_the_conventional_vaults_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = wizard_to_save_path("defaulted", dir.path());
+
+    let expected = nimbus_vault::config::VaultConfig::default_path("defaulted");
+    assert_eq!(app.save_path, expected.display().to_string());
+    // Offered in the editable field too, not just recorded.
+    assert_eq!(app.input, app.save_path);
+}
+
+#[test]
+fn saving_over_an_existing_config_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = dir.path().join("taken.toml");
+    std::fs::write(&occupied, "name = \"someone-else\"\n").unwrap();
+
+    let mut app = wizard_to_save_path("newcomer", dir.path());
+    retype_save_path(&mut app, &occupied);
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // confirm
+
+    assert!(app.error.is_some(), "expected a refusal");
+    // The existing config survives untouched...
+    assert_eq!(
+        std::fs::read_to_string(&occupied).unwrap(),
+        "name = \"someone-else\"\n"
+    );
+    // ...and the wizard is still running, back on the save-path step, so nothing typed is lost.
+    assert!(app.is_running());
+    assert_eq!(app.step, crate::app::Step::SavePath);
+}
+
+#[test]
+fn a_refused_save_can_be_retried_at_another_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = dir.path().join("taken.toml");
+    std::fs::write(&occupied, "name = \"someone-else\"\n").unwrap();
+    let free = dir.path().join("free.toml");
+
+    let mut app = wizard_to_save_path("newcomer", dir.path());
+    retype_save_path(&mut app, &occupied);
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // refused
+
+    retype_save_path(&mut app, &free);
+    app.handle_key_event(key(KeyCode::Enter)).unwrap(); // confirm
+
+    assert!(free.is_file());
+    let vault = nimbus_vault::vault::Vault::new(free).unwrap();
+    assert_eq!(vault.get_name(), "newcomer");
+}

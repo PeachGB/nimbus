@@ -39,26 +39,51 @@ enum Commands {
         vault: Option<String>,
         dest: Option<String>,
     },
-    ///gets object inside vault
+    ///gets object inside vault; without a destination it lands in the local vault's root
     Get {
         path: String,
         vault: Option<String>,
         dest: Option<String>,
     },
-    ///deletes an object inside the specified vault
+    ///creates a directory
+    Mkdir {
+        path: String,
+        vault: Option<String>,
+    },
+    ///creates an empty file; refuses to overwrite an existing one
+    Touch {
+        path: String,
+        vault: Option<String>,
+    },
+    ///stops tracking a vault; its config file and data are left alone
+    Forget {
+        vault: String,
+    },
+    ///renames an object in place; takes a name, not a path (use mv to relocate)
+    Rename {
+        path: String,
+        new_name: String,
+        vault: Option<String>,
+    },
+    ///deletes an object; a non-empty directory needs --force. Paths are relative to the cwd,
+    ///or prefix one with `vault:` to address another vault from its root
     Delete {
         path: String,
         vault: Option<String>,
         #[arg(short, long)]
         force: bool,
     },
-    ///copies a object inside the same vault
+    ///copies an object; paths are relative to the cwd, or prefix one with `vault:` to address
+    ///another vault from its root. The destination may be an existing directory, or a new
+    ///path to copy it under that name (e.g. `cp notes.txt backup:/inbox/copy.txt`)
     Cp {
         path: String,
         destination: String,
         vault: Option<String>,
     },
-    ///moves a object inside the same vault
+    ///moves an object; paths are relative to the cwd, or prefix one with `vault:` to address
+    ///another vault from its root. The destination may be an existing directory, or a new
+    ///path to move it under that name (e.g. `mv notes.txt backup:/inbox/copy.txt`)
     Mv {
         path: String,
         destination: String,
@@ -110,6 +135,14 @@ async fn dispatch(app: &mut App, cli: Cli) -> Result<()> {
             destination,
             vault,
         } => app.mv(path, destination, vault).await,
+        Commands::Mkdir { path, vault } => app.mkdir(path, vault).await,
+        Commands::Touch { path, vault } => app.touch(path, vault).await,
+        Commands::Forget { vault } => app.forget_vault(vault),
+        Commands::Rename {
+            path,
+            new_name,
+            vault,
+        } => app.rename(path, new_name, vault).await,
         Commands::Delete { path, vault, force } => app.delete(path, vault, force).await,
         Commands::Push { vault } => app.push(vault).await,
         Commands::Pull { vault } => app.pull(vault).await,

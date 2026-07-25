@@ -1,10 +1,13 @@
 # Nimbus
 
 Nimbus is a generic sync abstraction: a tree of objects (a **vault**) whose actual
-storage lives behind a pluggable **origin** — a local directory, an HTTP API, or an
-arbitrary shell command. Syncing "a folder on disk" and "objects behind a REST API"
-run through the exact same code path, because both are just implementations of one
-`Origin` trait.
+storage lives behind a pluggable **origin** — a local directory, an HTTP API, an
+arbitrary shell command, or another vault. Syncing "a folder on disk" and "objects
+behind a REST API" run through the exact same code path, because both are just
+implementations of one `Origin` trait.
+
+Two frontends drive it: [`nimbus-cli`](crates/cli/README.md), an interactive REPL,
+and [`nimbus-tui`](crates/tui/README.md), a ranger-style file manager.
 
 This repo is a Cargo workspace with six crates:
 
@@ -14,13 +17,15 @@ This repo is a Cargo workspace with six crates:
 | `nimbus-core`    | working | Session/vault-management logic (`App`) shared by nimbus's frontends — see [`crates/core/README.md`](crates/core/README.md). |
 | `nimbus-creator` | working | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend — see [`crates/creator/README.md`](crates/creator/README.md). |
 | `nimbus-cli`     | working | An interactive REPL built on `nimbus-core`/`nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
+| `nimbus-tui`     | working | A ranger-style terminal file manager over vaults — see [`crates/tui/README.md`](crates/tui/README.md). |
 | `nimbus-daemon`  | stub    | Background sync process (not yet implemented) — see [`crates/daemon/README.md`](crates/daemon/README.md). |
-| `nimbus-tui`     | stub    | Terminal UI frontend (not yet implemented) — see [`crates/tui/README.md`](crates/tui/README.md). |
 
 The rest of this document focuses mostly on `nimbus-vault`, since it's the library
 every other crate builds on. See [`crates/cli/README.md`](crates/cli/README.md) for
-`nimbus-cli`'s own commands, configuration, and session-persistence model, and
-[`crates/core/README.md`](crates/core/README.md) for the `App` logic it's built on.
+`nimbus-cli`'s own commands, configuration, and session-persistence model,
+[`crates/tui/README.md`](crates/tui/README.md) for the file manager's keys and
+behaviour, and [`crates/core/README.md`](crates/core/README.md) for the `App` logic
+both frontends are built on.
 
 ## The model
 
@@ -134,15 +139,30 @@ nimbus> vaults                               # list all known vaults
 nimbus> select <VAULT>                       # make <VAULT> the current vault
 nimbus> new <CONFIG_PATH>                    # register a vault from its TOML config file
 nimbus> new                                  # launch an interactive wizard to build and register one
+nimbus> forget <VAULT>                       # stop tracking a vault (its config and data are untouched)
 nimbus> cd <PATH>                            # change directory inside the current vault
 nimbus> put <PATH> [VAULT] [DEST]            # copy a real filesystem path into a vault
-nimbus> get <PATH> [VAULT] [DEST]            # copy an object out to a real filesystem path
-nimbus> cp <PATH> <DESTINATION> [VAULT]      # copy an object within a vault
-nimbus> mv <PATH> <DESTINATION> [VAULT]      # move an object within a vault
+nimbus> get <PATH> [VAULT] [DEST]            # copy an object out to the local vault
+nimbus> mkdir <PATH> [VAULT]                 # create a directory
+nimbus> touch <PATH> [VAULT]                 # create an empty file
+nimbus> rename <PATH> <NEW_NAME> [VAULT]     # rename in place (a name, not a path)
+nimbus> cp <PATH> <DESTINATION> [VAULT]      # copy an object, within or across vaults
+nimbus> mv <PATH> <DESTINATION> [VAULT]      # move an object, within or across vaults
 nimbus> delete <PATH> [VAULT] [--force]      # delete an object
 nimbus> push [VAULT]                         # sync the local vault out to a vault
 nimbus> pull [VAULT]                         # sync a vault into the local vault
 nimbus> exit                                 # save session state and quit
+```
+
+Every path argument is a `vault:path` spec: bare paths are relative to the current
+directory, a leading `/` is absolute within the current vault, and a `vault:` prefix
+addresses another vault from its root. That prefix is what makes `cp`/`mv` cross
+vaults — including between different origin types — and what distinguishes a vault
+from a directory of the same name:
+
+```
+nimbus> cp notes.txt backup:/inbox           # into a directory, keeping the name
+nimbus> cp notes.txt backup:/inbox/copy.txt  # under a new name
 ```
 
 See [`crates/cli/README.md`](crates/cli/README.md) for the full command reference,
@@ -150,7 +170,43 @@ the local-vault security boundary, and session persistence — the REPL logic it
 (the `App` type) lives in [`nimbus-core`](crates/core/README.md), so `nimbus-cli` is
 a fairly thin binary over it. `nimbus new` with no path launches an interactive
 vault-builder wizard from [`nimbus-creator`](crates/creator/README.md).
-`nimbus-daemon` and `nimbus-tui` are still placeholder binaries with no logic yet.
+`nimbus-daemon` is still a placeholder binary with no logic yet.
+
+## TUI
+
+`nimbus-tui` is a ranger-style file manager over the same vaults: a list of
+registered vaults, and inside each one a browsable object tree with size and
+modified-time columns.
+
+```bash
+cargo run -p nimbus-tui
+```
+
+Arrow keys or `hjkl` to navigate, `Space` to mark, `y`/`d`/`p` to copy/cut/paste
+(navigate to another vault before pasting to cross vaults), `a`/`t`/`r`/`x` to
+create a directory, create a file, rename, and delete, `/` to filter, `s`/`S` to
+sort, `n` to run the vault-creation wizard, and `?` for the full help overlay.
+`:` opens a command line accepting the same commands as `nimbus-cli`.
+
+Pressing `Enter` on a file fetches it, opens it with the OS default handler (or
+`$EDITOR`), and writes any edit back to the object's origin on exit. See
+[`crates/tui/README.md`](crates/tui/README.md) for the full key reference and the
+known limits (operations block the event loop; there's no undo or trash).
+
+## Configuration locations
+
+Both frontends share the same layout, all derived from `nimbus_vault::config_home()`
+(`.nimbus` under the platform config dir, so `$XDG_CONFIG_HOME` is respected):
+
+| Path | What |
+|------|------|
+| `<config>/.nimbus/cli_config.toml` | `default_local_vault`, `local_vault_path` |
+| `<config>/.nimbus/vaults/<name>.toml` | where the creator wizard saves new vault configs |
+| `<state>/nimbus/session.toml` | the registry of `name → config path` |
+
+A vault config can live anywhere — `new <path>` registers it from wherever it is.
+The `vaults/` directory is just the wizard's default, so created vaults stay
+together and can be found again.
 
 ## Writing a custom origin: `OriginCommand`
 
@@ -159,9 +215,12 @@ HTTP API: it shells out to a user-configured command per operation. `list`/`get`
 expect the command's stdout to be JSON matching the `Object` schema; `fetch`
 streams stdout as the payload; `send` streams the payload to the command's stdin;
 `put` runs `put_cmd` and then re-`get`s `"{destination}/{name}"` to return the
-stored `Object` (it does not rename the object you passed in). Templates support
-`{id}` plus any `extras` you define — `put` also injects a `{destination}` var
-(unless you've already set one yourself).
+stored `Object` (it does not rename the object you passed in).
+
+Every template gets `{id}` plus any `extras` you define. `put_cmd`/`send_cmd`
+additionally get `{name}`, `{size}`, `{content_type}`, `{modified}`, `{kind}`
+(`leaf` or `branch` — without it a `put_cmd` can't tell whether to create a file or
+a directory), and `{destination}`, the parent id, refreshed on every call.
 
 `extra_vars` lives behind an internal `futures::lock::Mutex` so `put` can record
 `destination` there without needing `&mut self`; it's scoped to just that
@@ -171,16 +230,19 @@ follow-up `get` call (which locks the same mutex).
 ```toml
 # origin.toml — no vault needed, just an origin
 type = "command"
-list_cmd   = "ls {root}"
+list_cmd   = "my-helper list {root} {id}"
 fetch_cmd  = "cat {root}/{id}"
-get_cmd    = "stat {root}/{id}"
-put_cmd    = "touch {root}/{id}"
+get_cmd    = "my-helper get {root} {id}"
+put_cmd    = "my-helper put {root} {destination} {name} {kind}"
 send_cmd   = "tee {root}/{id}"
-delete_cmd = "rm {root}/{id}"
+delete_cmd = "rm -rf {root}/{id}"
 
 [extras]
 root = "/srv/data"
 ```
+
+A working reference implementation of exactly this — plus an HTTP origin — lives in
+[`dev/testenv/`](dev/testenv/README.md).
 
 ```rust
 use nimbus_vault::config::OriginConfig;
@@ -247,6 +309,27 @@ vault.pull(&root_id, remote.as_ref()).await?;
 // push the vault's local subtree out to `remote`
 vault.push(&root_id, remote.as_ref()).await?;
 ```
+
+## Development
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets
+```
+
+[`dev/testenv/`](dev/testenv/README.md) builds a throwaway sandbox with **one vault
+per origin type** — `fs`, `http` (served by a stdlib Python reference origin),
+`command` (a POSIX-sh reference origin), and a vault wrapping another vault — so
+features can be exercised against something other than a plain filesystem:
+
+```bash
+dev/testenv/testenv.sh up      # build the sandbox and start the HTTP origin
+dev/testenv/testenv.sh tui     # run the TUI against it
+dev/testenv/testenv.sh clean   # tear it all down
+```
+
+It redirects `XDG_STATE_HOME`/`XDG_CONFIG_HOME` inside the sandbox, so your real
+vault registry is never read or written and the whole thing can be wiped freely.
 
 ## Design principles
 

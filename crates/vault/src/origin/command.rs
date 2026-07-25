@@ -146,7 +146,13 @@ impl OriginCommand {
 
         cmd
     }
-    fn bootstrap_cmd_object(&self, t: &CmdType, object: &Object) -> VaultResult<String> {
+    /// Builds a `put`/`send` command template, substituting the object's own fields plus the
+    /// configured `extra_vars`.
+    ///
+    /// The extras matter as much here as in [`Self::bootstrap_cmd_id`]: without them a config
+    /// whose `put_cmd`/`send_cmd` reference a `{helper}` or `{root}` placeholder would run with
+    /// the literal braces still in the string.
+    async fn bootstrap_cmd_object(&self, t: &CmdType, object: &Object) -> VaultResult<String> {
         let cmd = match t {
             CmdType::Put | CmdType::Send => {
                 let Some(Metadata {
@@ -169,6 +175,11 @@ impl OriginCommand {
                     None => String::from(""),
                 };
 
+                let kind = match object {
+                    Object::Branch { .. } | Object::Root { .. } => crate::OBJECT_KIND_BRANCH,
+                    Object::Leaf { .. } => crate::OBJECT_KIND_LEAF,
+                };
+
                 let mut command = match t {
                     CmdType::Put => self.put_cmd.clone(),
                     CmdType::Send => self.send_cmd.clone(),
@@ -180,7 +191,11 @@ impl OriginCommand {
                 Self::interpolate_one(c, crate::PLACEHOLDER_SIZE, size);
                 Self::interpolate_one(c, crate::PLACEHOLDER_CONTENT_TYPE, content_type);
                 Self::interpolate_one(c, crate::PLACEHOLDER_MODIFIED, modified);
+                Self::interpolate_one(c, crate::PLACEHOLDER_KIND, kind);
+                // The object's own extras first, so a per-object value beats the config default.
                 Self::interpolate(c, &extra);
+                let vars = self.extra_vars.lock().await;
+                Self::interpolate(c, &vars);
 
                 command
             }
@@ -238,15 +253,16 @@ impl Origin for OriginCommand {
     }
     async fn put(&self, obj: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
         {
+            // Overwritten every call, not inserted once: `extra_vars` outlives the operation, so
+            // keeping the first destination would silently send every later `put` to wherever the
+            // first one happened to go.
             let mut vars = self.extra_vars.lock().await;
-            if !vars.contains_key(crate::PLACEHOLDER_DESTINATION) {
-                vars.insert(
-                    crate::PLACEHOLDER_DESTINATION.into(),
-                    destination.to_string(),
-                );
-            }
+            vars.insert(
+                crate::PLACEHOLDER_DESTINATION.into(),
+                destination.to_string(),
+            );
         }
-        let cmd = self.bootstrap_cmd_object(&CmdType::Put, obj)?;
+        let cmd = self.bootstrap_cmd_object(&CmdType::Put, obj).await?;
         let output = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -265,8 +281,11 @@ impl Origin for OriginCommand {
         self.get(&new_id).await
     }
     async fn send(&self, object: &Object, mut payload: ByteStream) -> VaultResult<()> {
-        let cmd = self.bootstrap_cmd_object(&CmdType::Send, object)?;
+        let cmd = self.bootstrap_cmd_object(&CmdType::Send, object).await?;
         let mut child = Command::new("sh")
+            // `-c` is what makes this a shell string like every other template; without it `sh`
+            // treats the whole thing as a filename to execute.
+            .arg("-c")
             .arg(&cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
