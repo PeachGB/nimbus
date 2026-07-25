@@ -10,6 +10,13 @@ same code path.
 cargo run -p nimbus-tui
 ```
 
+![The vault list: every registered vault, with the root-level keybinding hints along the bottom.](../../docs/screenshots/vault-list.png)
+
+Browsing a vault shows its objects with size and modified-time columns, directories grouped
+first and accented so they read at a glance:
+
+![Browsing a vault: directories first, then files, each with a size and modified time.](../../docs/screenshots/object-browser.png)
+
 ## Keys
 
 ### Navigation
@@ -52,9 +59,12 @@ before pasting is what makes a cross-vault copy or move. Directories are copied 
 | `r` | rename the selected object |
 | `x` / `Del` | delete marked objects, or the cursor — asks first |
 
-`a`, `t` and `r` pre-fill the `:` command line rather than opening a bespoke prompt: the name has
-to be typed either way, and it keeps one input path to maintain (and lets you see and edit the
-command before running it).
+`r` opens a prompt pre-filled with the object's **current** name, so a rename is an edit rather
+than a retype — changing an extension or adding a suffix costs a few keys. `Enter` applies it,
+`Esc` abandons it, and submitting the name unchanged is a silent no-op rather than an error.
+
+`a` and `t` pre-fill the `:` command line instead: a new object's name has to be typed from
+scratch either way, so there'd be nothing for a dedicated prompt to offer.
 
 Deleting a directory takes everything inside it. There is **no trash and no undo** — the `y`/`N`
 confirmation is the only thing between you and a gone directory.

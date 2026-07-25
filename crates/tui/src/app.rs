@@ -59,10 +59,22 @@ pub struct App {
     /// Whether keystrokes are currently going into [`Self::filter`] rather than acting as
     /// bindings; the filter itself stays applied after the user stops typing.
     pub filtering: bool,
+    /// `Some(prompt)` while `r` is asking for a new name for the selected object.
+    pub rename: Option<RenamePrompt>,
     pub sort: SortKey,
     pub sort_reverse: bool,
     /// Whether dot-prefixed names are listed.
     pub show_hidden: bool,
+}
+
+/// An in-progress rename: the object being renamed, and the name being typed for it.
+pub struct RenamePrompt {
+    /// The object's current name, needed to address it when the rename is submitted — the
+    /// cursor may not still be on it by then, and `input` has already been edited away from it.
+    pub original: String,
+    /// The new name, pre-filled with `original` so a small edit (an extension, a suffix) doesn't
+    /// mean retyping the whole thing.
+    pub input: String,
 }
 
 /// An action held back until the user confirms it, so a single keypress can't destroy anything.
@@ -166,6 +178,7 @@ impl Default for App {
             marked: HashSet::new(),
             filter: None,
             filtering: false,
+            rename: None,
             sort: SortKey::default(),
             sort_reverse: false,
             show_hidden: false,
@@ -240,6 +253,11 @@ impl App {
 
         if self.filtering {
             self.handle_key_filter(key_event);
+            return Ok(());
+        }
+
+        if self.rename.is_some() {
+            self.handle_key_rename(key_event).await;
             return Ok(());
         }
 
@@ -327,14 +345,10 @@ impl App {
             KeyCode::Char('y') => self.yank(false),
             KeyCode::Char('d') => self.yank(true),
             KeyCode::Char('p') => self.paste().await,
-            // Both open the command line pre-filled rather than adding a bespoke prompt mode:
-            // the name still has to be typed either way, and this keeps one input path to
-            // maintain (and lets the user see/edit the command they're about to run).
-            KeyCode::Char('r') => {
-                if let Some(name) = self.selected_object_name() {
-                    self.command = Some(format!("rename {name} "));
-                }
-            }
+            // `a`/`t` open the command line pre-filled rather than adding a prompt of their own:
+            // a new object's name has to be typed from scratch either way, so there'd be nothing
+            // for a dedicated prompt to offer. `r` is different — see `begin_rename`.
+            KeyCode::Char('r') => self.begin_rename(),
             KeyCode::Char('a') => self.command = Some("mkdir ".to_string()),
             KeyCode::Char('t') => self.command = Some("touch ".to_string()),
             KeyCode::Char('x') | KeyCode::Delete => self.confirm_delete(),
@@ -408,6 +422,74 @@ impl App {
                     filter.push(c);
                 }
                 self.apply_view();
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the rename prompt for the selected object, pre-filled with its current name.
+    ///
+    /// Unlike `a`/`t`, this gets a prompt of its own rather than pre-filling the `:` line: a
+    /// rename is usually a small edit to a name that already exists, so starting from that name
+    /// with it ready to edit is the whole convenience — typing `rename notes.txt ` and then the
+    /// full new name spells out far more than the change is worth.
+    fn begin_rename(&mut self) {
+        let Some(original) = self.selected_object_name() else {
+            self.status = Some("nothing selected".to_string());
+            return;
+        };
+        self.rename = Some(RenamePrompt {
+            input: original.clone(),
+            original,
+        });
+    }
+
+    /// Types into the rename prompt. Enter submits, Esc abandons it.
+    async fn handle_key_rename(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.rename = None;
+                self.status = None;
+            }
+            KeyCode::Enter => {
+                let Some(prompt) = self.rename.take() else {
+                    return;
+                };
+                let new_name = prompt.input.trim().to_string();
+                // Submitting the name it already had isn't an error, it's a no-op — but core
+                // would reject it as "already exists", which reads like a failure.
+                if new_name.is_empty() || new_name == prompt.original {
+                    self.status = None;
+                    return;
+                }
+                let Some(vault) = self.nimbus.current_vault() else {
+                    return;
+                };
+                // Fully qualified for the same reason a yank is: a name containing a colon
+                // must not be read as a vault prefix.
+                let path = format!(
+                    "{}:{}",
+                    vault,
+                    PathBuf::from(self.nimbus.pwd())
+                        .join(&prompt.original)
+                        .display()
+                );
+                self.apply_app_event(AppEvent::Rename {
+                    path,
+                    new_name,
+                    vault: None,
+                })
+                .await;
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.rename.as_mut() {
+                    prompt.input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(prompt) = self.rename.as_mut() {
+                    prompt.input.push(c);
+                }
             }
             _ => {}
         }

@@ -91,6 +91,21 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ))];
     }
 
+    if let Some(prompt) = &app.rename {
+        // The old name is kept on screen next to the field being edited, so it stays clear
+        // which object is being renamed once the input has been edited away from it.
+        return vec![Line::from(vec![
+            Span::styled(
+                format!("rename {} to: ", prompt.original),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{}_", prompt.input),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])];
+    }
+
     // What's on the clipboard outranks the keybinding hints — it's transient state the user
     // needs to see to know a `p` is pending, and it survives navigating between vaults.
     let pending = app
@@ -108,7 +123,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let hints = match &app.mode {
         AppMode::Root => "↑/↓ move  →/enter open  n new vault  x forget  : command  ? help  q quit",
         AppMode::Vault(_) => {
-            "↑/↓ move  →/enter open  ←/esc back  space mark  y copy  d cut  p paste  x delete  / filter  ? help"
+            "↑/↓ move  →/enter open  ←/esc back  space mark  y copy  d cut  p paste  r rename  x delete  / filter  ? help"
         }
         _ => "",
     };
@@ -240,12 +255,15 @@ fn render_help(area: Rect, scroll: u16, buf: &mut Buffer) {
     lines.extend([
         entry("a", "add a directory here"),
         entry("t", "add an empty file here"),
-        entry("r", "rename the selected object"),
+        entry("r", "rename the selected object, in place"),
         entry(
             "x  or  del",
             "delete marked objects, or the cursor — asks first",
         ),
     ]);
+    lines.extend(note(
+        "`r` opens a prompt pre-filled with the current name, so you edit it rather than retype it. Enter renames, esc abandons.",
+    ));
     lines.extend(note(
         "Deleting a directory takes everything inside it, and nothing here is undoable — there is no trash.",
     ));

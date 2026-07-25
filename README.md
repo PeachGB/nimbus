@@ -182,10 +182,15 @@ modified-time columns.
 cargo run -p nimbus-tui
 ```
 
+![The vault list: every registered vault, with the root-level keybinding hints along the bottom.](docs/screenshots/vault-list.png)
+
+![Browsing a vault: directories first, then files, each with a size and modified time.](docs/screenshots/object-browser.png)
+
 Arrow keys or `hjkl` to navigate, `Space` to mark, `y`/`d`/`p` to copy/cut/paste
 (navigate to another vault before pasting to cross vaults), `a`/`t`/`r`/`x` to
 create a directory, create a file, rename, and delete, `/` to filter, `s`/`S` to
-sort, `n` to run the vault-creation wizard, and `?` for the full help overlay.
+sort, `n` to run the vault-creation wizard, and `?` for the full help overlay
+(`r` prompts with the current name pre-filled, so renaming is an edit not a retype).
 `:` opens a command line accepting the same commands as `nimbus-cli`.
 
 Pressing `Enter` on a file fetches it, opens it with the OS default handler (or
