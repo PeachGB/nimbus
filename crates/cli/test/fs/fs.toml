@@ -2,4 +2,4 @@ name = "fs-vault"
 
 [origin_config]
 type = "fs"
-root = "/home/arian/Projects/lambda/nimbus/nimbus/crates/cli/test/fs/data"
+root = "/home/arian/projects/rust/nimbus/crates/cli/test/fs/data"

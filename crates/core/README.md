@@ -29,8 +29,12 @@ terminal/UI code of its own.
 
 `ls`, `vaults`, `select`, `new_vault`, `forget_vault`, `cd` (plus `cd_completions`, used by
 `nimbus-cli`'s tab completion), `put`, `get`, `mkdir`, `touch`, `rename`, `cp`, `mv`, `delete`,
-`push`, `pull`. See [`crates/cli/README.md`](../cli/README.md) for the user-facing command
-reference these map to.
+`push`, `pull`, `exit`. See [`crates/cli/README.md`](../cli/README.md) for the user-facing
+command reference these map to.
+
+`exit` is the odd one out: it `save()`s and then calls `std::process::exit(0)` itself, rather
+than reporting back that the frontend should shut down. `nimbus-tui` therefore never routes its
+own quit through it — it has an event loop and a terminal to restore first.
 
 Alongside those are data-returning methods, for frontends that render rather than print:
 `vault_names()`, `list_cwd()`, `fetch_object_bytes(id)` and `write_object_bytes(id, bytes)`. The

@@ -59,12 +59,54 @@ pub struct App {
     /// Whether keystrokes are currently going into [`Self::filter`] rather than acting as
     /// bindings; the filter itself stays applied after the user stops typing.
     pub filtering: bool,
-    /// `Some(prompt)` while `r` is asking for a new name for the selected object.
+    /// `Some(prompt)` while `c` is asking for a new name for the selected object.
     pub rename: Option<RenamePrompt>,
     pub sort: SortKey,
     pub sort_reverse: bool,
     /// Whether dot-prefixed names are listed.
     pub show_hidden: bool,
+}
+
+/// What a keypress on a file should do with the temp copy it fetches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenWith {
+    /// The OS's file-association handler, falling back to a text editor when there's none
+    /// (enter/`l`/`→`) — the guess that's right for most files.
+    Handler,
+    /// A text editor, skipping the association entirely (`e`). The way to read or edit something
+    /// the OS would rather hand to a GUI app, or has no answer for at all.
+    Editor,
+    /// The file itself, as a program (`r`).
+    Run,
+}
+
+/// How the launched program left things, which decides what the status bar can honestly claim.
+enum Launch {
+    /// We waited for it and it exited, so the temp copy is final and can be written back. Any
+    /// note is what the exit itself is worth mentioning (a non-zero status, a fatal signal) — the
+    /// edits on disk are just as real either way, so it never stands in the way of saving them.
+    Waited(Option<String>),
+    /// The OS opener returned immediately, having handed off to something that may still be
+    /// running — anything written after this point is out of our reach.
+    HandedOff,
+    /// A program ran to completion. Carries its own status message; there's nothing to write back.
+    Ran(String),
+    /// Nothing was launched. Carries the reason.
+    Failed(String),
+}
+
+/// Opens `path` in `$EDITOR` (or the platform default) and waits for it to exit.
+///
+/// How it exited is a note, not a failure. Editors exit non-zero for reasons that have nothing to
+/// do with whether the file was written — vim's `:cq`, a shell wrapper passing something else's
+/// status through, a signal from being suspended and killed — and the only thing that decides
+/// what goes back to the vault is what's on disk. The one real failure is not starting at all.
+fn launch_editor(path: &std::path::Path) -> Launch {
+    match crate::opener::editor_command().arg(path).status() {
+        Ok(status) if status.success() => Launch::Waited(None),
+        Ok(status) => Launch::Waited(Some(format!("editor exited with {status}"))),
+        Err(e) => Launch::Failed(format!("couldn't start the editor: {e}")),
+    }
 }
 
 /// An in-progress rename: the object being renamed, and the name being typed for it.
@@ -222,6 +264,13 @@ impl App {
                 _ => {}
             },
             Event::App(app_event) => self.apply_app_event(app_event).await,
+            // Being stopped (ctrl-z) doesn't ask first, so the shell that took over left raw mode
+            // and the alt screen behind. Claim the terminal again and repaint over whatever it
+            // wrote there; the next loop iteration draws.
+            Event::Resumed => {
+                *terminal = ratatui::init();
+                terminal.clear()?;
+            }
         }
         Ok(())
     }
@@ -331,11 +380,19 @@ impl App {
                 if let Some(object) = self.selected_object().cloned() {
                     match object {
                         Object::Branch { name, .. } => self.descend(name).await,
-                        Object::Leaf { name, id, .. } => self.open_object(name, id, terminal).await,
+                        Object::Leaf { name, id, .. } => {
+                            self.open_object(name, id, terminal, OpenWith::Handler)
+                                .await;
+                        }
                         Object::Root { .. } => {}
                     }
                 }
             }
+            // `e` and `r` are the two ways to say what enter only guesses at: a file the OS would
+            // hand to something else (or nothing at all) still opens in `$EDITOR` on demand, and
+            // a program is run rather than looked at.
+            KeyCode::Char('e') => self.open_selected(terminal, OpenWith::Editor).await,
+            KeyCode::Char('r') => self.open_selected(terminal, OpenWith::Run).await,
             // Esc does double duty: an active filter is the more recent, more surprising state
             // to be in, so clear that first and only navigate once the full listing is back.
             KeyCode::Esc if self.filter.is_some() => self.clear_filter(),
@@ -347,8 +404,8 @@ impl App {
             KeyCode::Char('p') => self.paste().await,
             // `a`/`t` open the command line pre-filled rather than adding a prompt of their own:
             // a new object's name has to be typed from scratch either way, so there'd be nothing
-            // for a dedicated prompt to offer. `r` is different — see `begin_rename`.
-            KeyCode::Char('r') => self.begin_rename(),
+            // for a dedicated prompt to offer. `c` is different — see `begin_rename`.
+            KeyCode::Char('c') | KeyCode::F(2) => self.begin_rename(),
             KeyCode::Char('a') => self.command = Some("mkdir ".to_string()),
             KeyCode::Char('t') => self.command = Some("touch ".to_string()),
             KeyCode::Char('x') | KeyCode::Delete => self.confirm_delete(),
@@ -896,11 +953,30 @@ impl App {
         self.filtering = false;
     }
 
-    /// Fetches a `Leaf`'s bytes into a temp file and opens it: first with the OS's default
-    /// file-association opener (`open`/`xdg-open`/`start`), falling back to `$EDITOR` (or a
-    /// platform-sensible default) if there's no working association for the file type. Once the
-    /// program exits, any edit it made to the temp copy is written back to the object's origin.
-    async fn open_object(&mut self, name: String, id: ObjectId, terminal: &mut DefaultTerminal) {
+    /// Runs [`Self::open_object`] on whatever the cursor is on, for the keys (`e`, `r`) that only
+    /// mean anything for a file. A directory says so rather than doing nothing, since a key that
+    /// silently ignores you is indistinguishable from a broken one.
+    async fn open_selected(&mut self, terminal: &mut DefaultTerminal, with: OpenWith) {
+        match self.selected_object().cloned() {
+            Some(Object::Leaf { name, id, .. }) => self.open_object(name, id, terminal, with).await,
+            Some(Object::Branch { name, .. }) => {
+                self.status = Some(format!("{name} is a directory"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetches a `Leaf`'s bytes into a temp file and hands it to whatever `with` asks for: the
+    /// OS's file-association opener, a text editor, or the file itself as a program. Once
+    /// whatever it launched exits, any edit made to the temp copy is written back to the object's
+    /// origin — except for [`OpenWith::Run`], where there was never an edit to capture.
+    async fn open_object(
+        &mut self,
+        name: String,
+        id: ObjectId,
+        terminal: &mut DefaultTerminal,
+        with: OpenWith,
+    ) {
         let bytes = match self.nimbus.fetch_object_bytes(id.clone()).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -916,34 +992,63 @@ impl App {
             return;
         }
 
-        // Neither branch below is guaranteed to detach from the terminal: a desktop entry can
-        // have `Terminal=true` (common for CLI tools — nvim's own .desktop ships with it) and
+        // Checked before the terminal is handed over, so a document hit with `r` by mistake gets
+        // a message that says what's wrong instead of a bare `Exec format error` from the kernel.
+        if with == OpenWith::Run && !crate::opener::is_executable(&bytes, &path) {
+            self.status = Some(format!(
+                "{name} isn't a program — no shebang line or native binary header"
+            ));
+            return;
+        }
+
+        // None of the branches below is guaranteed to detach from the terminal: a desktop entry
+        // can have `Terminal=true` (common for CLI tools — nvim's own .desktop ships with it) and
         // without a terminal-emulator wrapper available, `xdg-open` et al. fall back to execing
-        // it attached straight to our controlling tty, same as `$EDITOR` always does. So both
-        // attempts get the same treatment: suspend our own input thread and release raw
-        // mode/alt screen first, and only reclaim them once whichever process has exited.
+        // it attached straight to our controlling tty, same as `$EDITOR` and a run program always
+        // do. So they all get the same treatment: suspend our own input thread and release raw
+        // mode/alt screen first, and only reclaim them once the child has exited.
         self.events.suspend();
         ratatui::restore();
 
-        let opened = crate::opener::try_os_open(&path);
-        let failure = if opened {
-            None
-        } else {
-            match crate::opener::editor_command().arg(&path).status() {
-                Ok(status) if status.success() => None,
-                Ok(status) => Some(format!("editor exited with {status}")),
-                Err(e) => Some(e.to_string()),
+        let launch = match with {
+            OpenWith::Run => match crate::opener::run_executable(&path) {
+                Ok(status) => {
+                    crate::opener::wait_for_key();
+                    Launch::Ran(if status.success() {
+                        format!("ran {name}")
+                    } else {
+                        format!("{name} exited with {status}")
+                    })
+                }
+                Err(e) => Launch::Failed(format!("couldn't run {name}: {e}")),
+            },
+            OpenWith::Handler => {
+                if crate::opener::try_os_open(&path) {
+                    Launch::HandedOff
+                } else {
+                    launch_editor(&path)
+                }
             }
+            OpenWith::Editor => launch_editor(&path),
         };
 
         *terminal = ratatui::init();
         self.events.resume();
 
-        if let Some(failure) = failure {
-            self.status = Some(failure);
-            return;
-        }
-        self.status = self.write_back(&name, id, &path, &bytes, opened).await;
+        // Running a program isn't editing it: the bytes on disk are the ones we fetched, and
+        // anything it produced went wherever it wrote it. There's nothing to save back.
+        self.status = match launch {
+            Launch::Ran(outcome) => Some(outcome),
+            Launch::Failed(failure) => Some(failure),
+            Launch::Waited(note) => {
+                let saved = self.write_back(&name, id, &path, &bytes, false).await;
+                match (saved, note) {
+                    (Some(saved), Some(note)) => Some(format!("{saved} ({note})")),
+                    (saved, note) => saved.or(note),
+                }
+            }
+            Launch::HandedOff => self.write_back(&name, id, &path, &bytes, true).await,
+        };
     }
 
     /// Saves the temp copy at `path` back to the object it came from, if whatever opened it

@@ -123,7 +123,7 @@ fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let hints = match &app.mode {
         AppMode::Root => "↑/↓ move  →/enter open  n new vault  x forget  : command  ? help  q quit",
         AppMode::Vault(_) => {
-            "↑/↓ move  →/enter open  ←/esc back  space mark  y copy  d cut  p paste  r rename  x delete  / filter  ? help"
+            "↑/↓ move  →/enter open  e edit  r run  ←/esc back  space mark  y copy  d cut  p paste  c rename  x delete  / filter  ? help"
         }
         _ => "",
     };
@@ -218,6 +218,20 @@ fn render_help(area: Rect, scroll: u16, buf: &mut Buffer) {
     ]);
 
     lines.push(Line::default());
+    lines.push(heading("OPENING FILES"));
+    lines.extend([
+        entry("→/enter  or  l", "open with the OS's default application"),
+        entry("e", "open in $EDITOR, whatever the OS would have picked"),
+        entry("r", "run the file as a program"),
+    ]);
+    lines.extend(note(
+        "Enter and `e` save your edits back to the vault when the program you edited in exits.",
+    ));
+    lines.extend(note(
+        "`r` runs a shebang script or a binary this machine can execute, holding its output on screen until you press a key. Running a program changes nothing in the vault.",
+    ));
+
+    lines.push(Line::default());
     lines.push(heading("SELECTING"));
     lines.extend([
         entry("space", "mark/unmark, and step down"),
@@ -255,14 +269,14 @@ fn render_help(area: Rect, scroll: u16, buf: &mut Buffer) {
     lines.extend([
         entry("a", "add a directory here"),
         entry("t", "add an empty file here"),
-        entry("r", "rename the selected object, in place"),
+        entry("c  /  F2", "rename the selected object, in place"),
         entry(
             "x  or  del",
             "delete marked objects, or the cursor — asks first",
         ),
     ]);
     lines.extend(note(
-        "`r` opens a prompt pre-filled with the current name, so you edit it rather than retype it. Enter renames, esc abandons.",
+        "`c` opens a prompt pre-filled with the current name, so you edit it rather than retype it. Enter renames, esc abandons.",
     ));
     lines.extend(note(
         "Deleting a directory takes everything inside it, and nothing here is undoable — there is no trash.",

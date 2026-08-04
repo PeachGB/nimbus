@@ -2,9 +2,10 @@
 name = "nimbus-cli"
 version = "0.1.0"
 edition = "2024"
-about = """A CLI tool for managing and syncing Objects in vaults. A vault is a tree like structure like a filesystem 
-Vaults store metadata and a way to get the object.
-You can make vaults out of APIs, your own filesystem, etc"""
+# `about` is not a manifest key — cargo ignored it, so this crate had no description at all.
+description = """An interactive REPL for managing and syncing objects in vaults. A vault is a \
+filesystem-like tree that stores metadata plus a way to reach the object, so one can be backed \
+by an API, your own filesystem, a shell command, or another vault."""
 
 [dependencies]
 clap = {version="4.6.1",features=["derive"]}

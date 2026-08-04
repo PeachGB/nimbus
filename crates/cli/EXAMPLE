@@ -1,18 +1,29 @@
-nimbus new vault.toml
+nimbus-cli is a REPL: start it once, then type subcommands at its prompt. It reads
+stdin and ignores argv, so `nimbus-cli ls` does nothing — pipe commands in to script
+it (printf 'select my-vault\nls\n' | nimbus-cli).
+
+$ cargo run -p nimbus-cli
+
+nimbus />> new vault.toml
 (registers a vault from vault.toml; see README.md for the config format)
 
-nimbus vaults
+nimbus />> vaults
 (prints registered vault names)
 
-nimbus select my-vault
-nimbus ls
+nimbus />> select my-vault
+nimbus my-vault/>> ls
 (lists my-vault's current directory)
 
-nimbus cd docs
-nimbus put ./notes.txt
-(copies ./notes.txt from the local vault into my-vault:/docs)
+nimbus my-vault/>> cd docs
+nimbus my-vault/docs>> put notes.txt
+(copies notes.txt out of the local vault into my-vault:/docs)
 
-nimbus get notes.txt ./downloads
-(copies my-vault:/docs/notes.txt out to ./downloads)
+nimbus my-vault/docs>> get notes.txt my-vault downloads
+(copies my-vault:/docs/notes.txt into the local vault's downloads/ — the arguments
+ are positional, so naming the source vault is what lets you name a destination;
+ with neither, `get notes.txt` lands it in the local vault's root)
+
+nimbus my-vault/docs>> exit
+(saves the session and quits; Ctrl-C/Ctrl-D do the same)
 
 See README.md for the full command reference.

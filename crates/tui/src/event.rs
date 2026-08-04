@@ -30,6 +30,12 @@ pub enum Event {
     ///
     /// Use this event to emit custom events that are specific to your application.
     App(AppEvent),
+    /// The process was continued after being stopped — ctrl-z then `fg`, or any other SIGCONT.
+    ///
+    /// Stopping doesn't ask us first, so the terminal is left however it was: raw mode off, alt
+    /// screen abandoned to the shell that took over. Coming back means claiming it again from
+    /// scratch, which is the app's job rather than this handler's.
+    Resumed,
 }
 
 /// Application events.
@@ -126,6 +132,8 @@ impl EventHandler {
         let suspended = Arc::new(AtomicBool::new(false));
         let actor = EventThread::new(sender.clone(), suspended.clone());
         thread::spawn(|| actor.run());
+        #[cfg(unix)]
+        watch_terminal_signals(sender.clone(), suspended.clone());
         Self {
             sender,
             receiver,
@@ -167,6 +175,64 @@ impl EventHandler {
         // reference to it
         let _ = self.sender.send(Event::App(app_event));
     }
+}
+
+/// Watches the signals a terminal sends to a whole process group, so keys pressed at a child are
+/// never answered by the app dying behind it.
+///
+/// Everything the TUI runs — `$EDITOR`, the OS opener, a program launched with `r` — is in this
+/// process's group, so Ctrl-C and Ctrl-\ at an editor's prompt are delivered to us as well as to
+/// it, and the default action for both is to terminate. That is the whole reason the app used to
+/// vanish when an editor was interrupted rather than closed. Handled here, they're dropped while
+/// a child holds the terminal ([`EventHandler::suspend`]) and turned into a normal quit
+/// otherwise, which is what an outside `kill -INT` deserves. The TUI's own Ctrl-C doesn't come
+/// through here at all: raw mode delivers it as a key event, not a signal.
+///
+/// SIGCONT (`fg` after a Ctrl-z) means the terminal has to be claimed again — stopping doesn't
+/// ask first, so raw mode and the alt screen were left to whatever took over. It's likewise the
+/// child's business while one is running: `fg` continues the whole group, and re-entering raw
+/// mode here would yank the terminal out from under an editor about to carry on drawing to it.
+///
+/// SIGTSTP is deliberately *not* caught. Stopping is exactly what should happen on Ctrl-z — it's
+/// what hands the shell back its prompt — and intercepting it would keep this process running
+/// with the job half-stopped, leaving the terminal owned by something that isn't listening.
+#[cfg(unix)]
+fn watch_terminal_signals(sender: mpsc::Sender<Event>, suspended: Arc<AtomicBool>) {
+    // Silently does nothing outside a tokio runtime — the app always builds one, and a caller
+    // that doesn't (a test constructing an `EventHandler`) just goes without signal handling.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // Tokio has no named constructor for SIGCONT, and its number isn't the same everywhere
+        // (18 on most Linux, 19 on the BSDs and macOS, 25 on MIPS), so take it from libc.
+        let (Ok(mut cont), Ok(mut interrupt), Ok(mut quit)) = (
+            signal(SignalKind::from_raw(libc::SIGCONT)),
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::quit()),
+        ) else {
+            return;
+        };
+
+        loop {
+            let event = tokio::select! {
+                Some(()) = cont.recv() => Event::Resumed,
+                Some(()) = interrupt.recv() => Event::App(AppEvent::Quit),
+                Some(()) = quit.recv() => Event::App(AppEvent::Quit),
+                else => return,
+            };
+            // A child on the terminal is the one being talked to; whatever it does about the
+            // signal, it isn't ours to act on.
+            if suspended.load(Ordering::SeqCst) {
+                continue;
+            }
+            if sender.send(event).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 /// A thread that handles reading crossterm events and emitting tick events on a regular schedule.
@@ -216,3 +282,7 @@ impl EventThread {
         let _ = self.sender.send(event);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/event.rs"]
+mod tests;

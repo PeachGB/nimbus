@@ -10,12 +10,9 @@ same code path.
 cargo run -p nimbus-tui
 ```
 
-![The vault list: every registered vault, with the root-level keybinding hints along the bottom.](../../docs/screenshots/vault-list.png)
-
-Browsing a vault shows its objects with size and modified-time columns, directories grouped
-first and accented so they read at a glance:
-
-![Browsing a vault: directories first, then files, each with a size and modified time.](../../docs/screenshots/object-browser.png)
+The vault list comes up first: every registered vault, with the root-level keybinding hints along
+the bottom. Entering one shows its objects with size and modified-time columns, directories
+grouped first and accented so they read at a glance.
 
 ## Keys
 
@@ -27,6 +24,16 @@ first and accented so they read at a glance:
 | `→`/`Enter` or `l` | enter a vault or directory, or open a file |
 | `←`/`Esc` or `h` | go up a directory, or back to the vault list |
 | `q` / `Ctrl-C` | quit |
+
+### Opening files
+
+| Key | Does |
+|-----|------|
+| `→`/`Enter` or `l` | open with the OS's default application |
+| `e` | open in `$EDITOR`, whatever the OS would have picked |
+| `r` | run the file as a program |
+
+See [Opening files](#opening-files-1) for what each one does with the temp copy.
 
 ### Selecting
 
@@ -56,10 +63,10 @@ before pasting is what makes a cross-vault copy or move. Directories are copied 
 |-----|------|
 | `a` | add a directory here |
 | `t` | add an empty file here |
-| `r` | rename the selected object |
+| `c` / `F2` | rename the selected object |
 | `x` / `Del` | delete marked objects, or the cursor — asks first |
 
-`r` opens a prompt pre-filled with the object's **current** name, so a rename is an edit rather
+`c` opens a prompt pre-filled with the object's **current** name, so a rename is an edit rather
 than a retype — changing an extension or adding a suffix costs a few keys. `Enter` applies it,
 `Esc` abandons it, and submitting the name unchanged is a silent no-op rather than an error.
 
@@ -128,15 +135,33 @@ than overwritten.
 
 ## Opening files
 
-`Enter` on a file fetches it to a temp copy and opens it with the OS default handler
-(`xdg-open`/`open`/`start`), falling back to `$EDITOR` (then `$VISUAL`, then `vi`/`notepad`) when
-there's no working association. On exit, any edit is **written back** to the object's origin.
+All three keys fetch the file to a temp copy first; they differ in what they hand it to.
 
-Neither path is guaranteed to detach from the terminal — a `.desktop` entry can carry
+`Enter` uses the OS default handler (`xdg-open`/`open`/`start`), falling back to `$EDITOR` (then
+`$VISUAL`, then `vi`/`notepad`) when there's no working association. `e` skips the association and
+goes straight to that same editor — the answer for a file the OS would rather give to a GUI app,
+or has no answer for at all. On exit, any edit from either is **written back** to the object's
+origin.
+
+`r` runs the file itself. The temp copy is chmod'd `+x` first (a vault stores bytes and names, not
+permission bits, so it never arrives executable), and the program inherits the terminal and the
+TUI's working directory — so whatever it writes relative to the cwd lands where you started
+nimbus, not buried beside the temp copy. When it exits, its output is held on screen until you
+press a key; reclaiming the alt screen would otherwise wipe it. Running a program is not editing
+it, so nothing is written back — the status line reports `ran X` or `X exited with <status>`.
+
+Before handing over the terminal, `r` checks that the bytes are something this machine can
+actually execute: a `#!` shebang line, or a native binary for *this* platform (ELF on Linux,
+Mach-O on macOS, `.exe`/`.com` with an `MZ` header plus `.bat`/`.cmd` on Windows). A document, or
+a binary built for another OS, gets `X isn't a program` instead of a bare `Exec format error` from
+the kernel — and isn't made executable on the way.
+
+None of the three is guaranteed to detach from the terminal — a `.desktop` entry can carry
 `Terminal=true` (nvim's ships with it), and without a terminal-emulator wrapper `xdg-open` execs
-it straight onto the controlling tty. So both get the same treatment: the event thread is
-suspended and raw mode/alt screen released before spawning, then reclaimed once the child exits.
-Without that, the TUI and the editor fight over the same stdin and the terminal appears to hang.
+it straight onto the controlling tty, exactly as `$EDITOR` and a run program always do. So they
+all get the same treatment: the event thread is suspended and raw mode/alt screen released before
+spawning, then reclaimed once the child exits. Without that, the TUI and the child fight over the
+same stdin and the terminal appears to hang.
 
 Write-back compares content rather than uploading unconditionally, because a plain "look at this
 file" would otherwise rewrite it with a new modification time — enough to make the next
@@ -147,6 +172,29 @@ file" would otherwise rewrite it with a new modification time — enough to make
 - `opened X — edits made after this won't be saved back` — the OS opener handed off to a GUI app
   and returned immediately, so there is genuinely nothing left to capture.
 
+How the editor exited is a **note, not a failure** — `saved X (editor exited with exit status: 1)`.
+Editors exit non-zero for reasons that say nothing about whether the file was written (vim's
+`:cq`, a wrapper script passing something else's status through, a signal), and what goes back to
+the vault is decided by what's on disk. The one real failure is an editor that never started.
+
+`r` is outside all of that: it reports `ran X`/`X exited with <status>` and never writes back.
+
+## Job control
+
+Everything the TUI launches is in this process's group, so the terminal's signals arrive here too
+— and the default action for most of them is to die quietly behind the editor you were typing at.
+`event.rs` watches for that:
+
+- **Ctrl-C / Ctrl-\\ at a child** (SIGINT/SIGQUIT) are dropped while a child holds the terminal.
+  With no child up they're an outside `kill -INT`, and quit properly. The TUI's own Ctrl-C never
+  gets here: raw mode delivers it as a key event, not a signal.
+- **Ctrl-z then `fg`** (SIGCONT) means claiming the terminal again — being stopped doesn't ask
+  first, so raw mode and the alt screen were left to whatever took over. While a child is up,
+  `fg` continues it too, and reclaiming here would take the terminal out from under it.
+- **SIGTSTP is deliberately not caught.** Stopping is what should happen on Ctrl-z — it's what
+  hands the shell back its prompt. Intercepting it would leave the job half-stopped, with the
+  terminal owned by something that isn't listening.
+
 ## What's here
 
 - **`app.rs`** — `App`: the state machine. Holds the `nimbus-core::App`, the vault/object
@@ -155,7 +203,8 @@ file" would otherwise rewrite it with a new modification time — enough to make
   filter and sort work without disturbing what the vault actually reported; anything reading the
   selection must go through `selected_object()`.
 - **`event.rs`** — `AppEvent` (the command grammar, see above) and `EventHandler`: the
-  tick + crossterm event thread, with `suspend`/`resume` for handing the terminal to a child.
+  tick + crossterm event thread, with `suspend`/`resume` for handing the terminal to a child, and
+  the signal watcher behind [Job control](#job-control).
 - **`command.rs`** — parses a typed `:` line into an `AppEvent` via clap, and generates the help
   overlay's command list from the same definitions.
 - **`ui.rs`** — header, footer and help overlay. The footer is built by `footer_lines()` and the
@@ -163,7 +212,8 @@ file" would otherwise rewrite it with a new modification time — enough to make
   being truncated at the terminal edge.
 - **`ui/widgets/`** — the vault and object lists, including the size/modified columns, mark
   indicators, and middle-eliding name truncation (which keeps a file's extension visible).
-- **`opener.rs`** — the OS-default opener and `$EDITOR` fallback.
+- **`opener.rs`** — executable sniffing and launching, the OS-default opener, and the `$EDITOR`
+  fallback.
 
 The vault creation wizard ([`nimbus-creator`](../creator)) is driven from this crate's own event
 loop rather than its blocking `run()` entry point, so the two never compete for terminal input.
@@ -180,8 +230,8 @@ would quietly rejoin the next bulk operation.
 - **Every operation blocks the event loop.** Transfers are awaited inline, so the UI freezes for
   the duration with no progress and no cancel. Imperceptible against a local directory; against a
   slow HTTP origin a large transfer looks like a hang.
-- `fetch_object_bytes` buffers a whole object in memory rather than using `Origin::fetch`'s
-  stream, so opening a large file is proportionally expensive.
+- `fetch_object_bytes` collects `Origin::fetch`'s stream into one `Vec<u8>` rather than
+  streaming it to the temp copy, so opening a large file costs its full size in memory.
 - No undo and no trash.
 
 ## Commands
@@ -194,8 +244,9 @@ cargo fmt -p nimbus-tui
 ```
 
 To drive it against origins other than a plain filesystem, see
-[`dev/testenv/`](../../dev/testenv/README.md), which builds a sandbox with one vault per origin
-type.
+[`crates/cli/test/`](../cli/test/README.md), which holds a vault config per origin type (`fs`,
+`http`, `command`, and a vault wrapping another vault) along with reference `http`/`command`
+origin implementations.
 
 ## License
 

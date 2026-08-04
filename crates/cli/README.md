@@ -6,7 +6,7 @@ A vault is a logical tree of objects (folders and files, conceptually) backed by
 
 ## How it works
 
-`nimbus` starts a `rustyline`-backed REPL (tab completion for subcommand names and `cd`'s argument) rather than being invoked once per command. There's always a special **local vault** (named `LOCAL`) representing your own filesystem — every `put`/`get` moves data between that local vault and whichever remote vault you're working with. You never touch the OS filesystem directly; `put`/`get`'s local-side paths are checked to stay under the configured local root.
+`nimbus-cli` starts a `rustyline`-backed REPL (tab completion for subcommand names and `cd`'s argument) rather than being invoked once per command. The prompt carries your position — `nimbus />>` at the root, `nimbus my-vault/docs>>` inside a vault; the examples below write it as `nimbus>` for brevity. There's always a special **local vault** (named `LOCAL`) representing your own filesystem — every `put`/`get` moves data between that local vault and whichever remote vault you're working with. You never touch the OS filesystem directly; `put`/`get`'s local-side paths are checked to stay under the configured local root.
 
 ## Installation
 
@@ -39,7 +39,7 @@ Registering a name that's already taken by a *different* config is refused, sinc
 
 ## Session model
 
-`nimbus` runs as a REPL: one process, and `select`/`cd`/etc. mutate in-memory state directly rather than re-parsing between invocations. Registered vaults (name → config path) are persisted to `~/.local/state/nimbus/session.toml` on `new` and on `exit`, so vaults registered in a previous session are still there next time `nimbus` launches.
+`nimbus` runs as a REPL: one process, and `select`/`cd`/etc. mutate in-memory state directly rather than re-parsing between invocations. Registered vaults (name → config path) are persisted to `~/.local/state/nimbus/session.toml` on `new`, on `forget`, and on the way out (whether you typed `exit` or hit `Ctrl-C`/`Ctrl-D`), so vaults registered in a previous session are still there next time it launches.
 
 ## Commands
 
@@ -62,6 +62,7 @@ cd                     # (no argument) return to the root — deselects the curr
 new <config.toml>      # register a new vault from its config file
 new                    # launch the interactive wizard to build and register one
 forget <vault>         # stop tracking a vault; its config file and data are left alone
+                       # (`LOCAL` can't be forgotten — turn off default_local_vault instead)
 ```
 
 ### Moving data
@@ -148,4 +149,4 @@ If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `comma
 
 ## Testing against other origins
 
-[`dev/testenv/`](../../dev/testenv/README.md) builds a throwaway sandbox with one vault per origin type (`fs`, `http`, `command`, and a vault wrapping another vault), including reference `http` and `command` origin implementations. It redirects `XDG_STATE_HOME`/`XDG_CONFIG_HOME` so your real vault registry is never touched.
+[`test/`](test/README.md) holds a vault config per origin type (`fs`, `http`, `command`, and a vault wrapping another vault), including reference `http` and `command` origin implementations to run them against. Export a scratch `XDG_STATE_HOME` before you start and your real vault registry is left untouched — see that README for the per-origin walkthrough.

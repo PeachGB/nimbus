@@ -554,19 +554,19 @@ impl App {
     }
 
     /// Copies the object at `name` to `destination`. Both are `vault:path` specs (see
-    /// [`Self::resolve_spec`]): unqualified they resolve inside `vault` — or the current vault
+    /// `resolve_spec`): unqualified they resolve inside `vault` — or the current vault
     /// when that's omitted — relative to `cwd_path`, while a `vault:` prefix addresses another
     /// vault from its root, which is how a copy crosses vaults.
     ///
     /// The destination may be either an existing directory (the object lands inside it, keeping
     /// its name) or a path that doesn't exist yet (the object lands in its parent under that new
     /// name) — so `cp notes.txt backup:/inbox` and `cp notes.txt backup:/inbox/copy.txt` both
-    /// work. See [`Self::resolve_destination`].
+    /// work. See `resolve_destination`.
     ///
     /// The two sides may be backed by different origin types (e.g. an `fs` vault and one backed
     /// by another vault via `OriginVault`), since every step below (`find`/`get`/`put`/`fetch`/
     /// `send`) goes through the `Vault`/`Origin` trait rather than anything origin-specific. A
-    /// directory is copied recursively via [`Self::deep_copy`], which writes each descendant
+    /// directory is copied recursively via `deep_copy`, which writes each descendant
     /// straight to the destination's origin as it goes — there is no separate "sync" step, since
     /// `Vault::put` and `send` already write through to `Origin::put`/`send`.
     pub async fn cp(
@@ -686,7 +686,7 @@ impl App {
         }
     }
 
-    /// Creates a directory at `path` (a `vault:path` spec, see [`Self::resolve_spec`]),
+    /// Creates a directory at `path` (a `vault:path` spec, see `resolve_spec`),
     /// failing rather than clobbering anything already there.
     pub async fn mkdir(&mut self, path: String, vault: Option<String>) -> Result<()> {
         self.create(path, vault, |name| Object::Branch {
@@ -834,7 +834,7 @@ impl App {
 
         Ok(placed)
     }
-    /// Deletes the object at `path` (a `vault:path` spec, see [`Self::resolve_spec`]).
+    /// Deletes the object at `path` (a `vault:path` spec, see `resolve_spec`).
     ///
     /// Without `force`, a directory with anything in it is refused, so a mistyped path can't
     /// take a subtree down with it. That check only applies to directories: asking an origin to

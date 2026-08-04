@@ -131,7 +131,8 @@ crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
 
 `nimbus-cli` starts an interactive REPL that manages a set of named vaults plus a
 special local vault (your own filesystem, named `LOCAL`), and moves objects
-between them:
+between them. Its real prompt carries your position (`nimbus />>`,
+`nimbus my-vault/docs>>`); it's written `nimbus>` below for brevity:
 
 ```
 nimbus> ls                                   # list the current vault's cwd, or all known vaults if none selected
@@ -182,19 +183,17 @@ modified-time columns.
 cargo run -p nimbus-tui
 ```
 
-![The vault list: every registered vault, with the root-level keybinding hints along the bottom.](docs/screenshots/vault-list.png)
-
-![Browsing a vault: directories first, then files, each with a size and modified time.](docs/screenshots/object-browser.png)
-
 Arrow keys or `hjkl` to navigate, `Space` to mark, `y`/`d`/`p` to copy/cut/paste
-(navigate to another vault before pasting to cross vaults), `a`/`t`/`r`/`x` to
+(navigate to another vault before pasting to cross vaults), `a`/`t`/`c`/`x` to
 create a directory, create a file, rename, and delete, `/` to filter, `s`/`S` to
 sort, `n` to run the vault-creation wizard, and `?` for the full help overlay
-(`r` prompts with the current name pre-filled, so renaming is an edit not a retype).
+(`c` prompts with the current name pre-filled, so renaming is an edit not a retype).
 `:` opens a command line accepting the same commands as `nimbus-cli`.
 
 Pressing `Enter` on a file fetches it, opens it with the OS default handler (or
-`$EDITOR`), and writes any edit back to the object's origin on exit. See
+`$EDITOR`), and writes any edit back to the object's origin on exit. `e` opens it
+in `$EDITOR` regardless of what the OS would have picked, and `r` runs it as a
+program in the terminal. See
 [`crates/tui/README.md`](crates/tui/README.md) for the full key reference and the
 known limits (operations block the event loop; there's no undo or trash).
 
@@ -246,8 +245,10 @@ delete_cmd = "rm -rf {root}/{id}"
 root = "/srv/data"
 ```
 
-A working reference implementation of exactly this — plus an HTTP origin — lives in
-[`dev/testenv/`](dev/testenv/README.md).
+Working reference implementations of exactly this — plus an HTTP origin — live in
+[`crates/cli/test/`](crates/cli/test/README.md): `command/cmd-vault.sh` turns a real
+directory into a `command` origin, and `http/server.py` serves one over HTTP using
+nothing but the Python standard library.
 
 ```rust
 use nimbus_vault::config::OriginConfig;
@@ -322,19 +323,21 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
-[`dev/testenv/`](dev/testenv/README.md) builds a throwaway sandbox with **one vault
-per origin type** — `fs`, `http` (served by a stdlib Python reference origin),
-`command` (a POSIX-sh reference origin), and a vault wrapping another vault — so
-features can be exercised against something other than a plain filesystem:
+[`crates/cli/test/`](crates/cli/test/README.md) holds a hand-run vault config **per
+origin type** — `fs`, `http` (served by a stdlib Python reference origin), `command`
+(a POSIX-sh reference origin), and a vault wrapping another vault — so features can
+be exercised against something other than a plain filesystem. Point
+`XDG_STATE_HOME` at a scratch directory first and your real vault registry is left
+alone:
 
 ```bash
-dev/testenv/testenv.sh up      # build the sandbox and start the HTTP origin
-dev/testenv/testenv.sh tui     # run the TUI against it
-dev/testenv/testenv.sh clean   # tear it all down
+export XDG_STATE_HOME=$(mktemp -d)
+cargo run -p nimbus-cli
+nimbus />> new crates/cli/test/fs/fs.toml
 ```
 
-It redirects `XDG_STATE_HOME`/`XDG_CONFIG_HOME` inside the sandbox, so your real
-vault registry is never read or written and the whole thing can be wiped freely.
+The configs carry **absolute** paths, so they need updating if the repo moves — see
+that README for the per-origin walkthrough.
 
 ## Design principles
 
@@ -349,7 +352,8 @@ vault registry is never read or written and the whole thing can be wiped freely.
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+[MIT license](LICENSE-MIT) at your option — except `nimbus-tui`, which ships only
+the [MIT license](crates/tui/LICENSE) (`license = "MIT"` in its `Cargo.toml`).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the Apache-2.0 license,
