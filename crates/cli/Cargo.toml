@@ -1,17 +1,25 @@
 [package]
 name = "nimbus-cli"
-version = "0.1.0"
-edition = "2024"
-# `about` is not a manifest key — cargo ignored it, so this crate had no description at all.
-description = """An interactive REPL for managing and syncing objects in vaults. A vault is a \
-filesystem-like tree that stores metadata plus a way to reach the object, so one can be backed \
-by an API, your own filesystem, a shell command, or another vault."""
+description = """Run one command or open an interactive REPL to manage and sync objects in vaults. \
+A vault is a filesystem-like tree that stores metadata plus a way to reach the object, so one can \
+be backed by an API, your own filesystem, a shell command, or another vault."""
+readme = "README.md"
+documentation = "https://docs.rs/nimbus-cli"
+keywords = ["nimbus", "sync", "vault", "cli", "repl"]
+categories = ["command-line-utilities", "filesystem"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-clap = {version="4.6.1",features=["derive"]}
+clap.workspace = true
 tokio.workspace = true
-nimbus-core = {path="../core/"}
-nimbus-creator = {path="../creator/"}
+nimbus-core = { version = "0.2.0", path = "../core/" }
+nimbus-creator = { version = "0.2.0", path = "../creator/" }
 ratatui.workspace = true
-anyhow = "1.0.103"
+anyhow.workspace = true
 rustyline = "18.0.1"

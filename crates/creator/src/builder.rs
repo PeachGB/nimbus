@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use nimbus_vault::config::OriginConfig;
+use nimbus_vault::{config::OriginConfig, origin::http::HttpAuth};
 
 /// A single field the wizard needs to collect for the currently selected [`OriginKind`].
 #[derive(Clone, Copy)]
@@ -77,6 +77,14 @@ impl OriginKind {
                 field("put_url", "put url ({id}-templated)", false),
                 field("send_url", "send url ({id}-templated)", false),
                 field("delete_url", "delete url ({id}-templated)", false),
+                // The wizard only offers the env-var form, which is the one that keeps the
+                // secret out of a config file people copy around. `token`/`token_file` are
+                // there for hand-edited configs — see `HttpAuth`.
+                field(
+                    "auth_token_env",
+                    "bearer token env var, e.g. NIMBUS_TOKEN (optional)",
+                    true,
+                ),
             ],
             OriginKind::Command => vec![
                 field("list_cmd", "list command", false),
@@ -116,6 +124,7 @@ impl OriginKind {
             },
             OriginKind::Http => {
                 let base_url = get("base_url");
+                let token_env = get("auth_token_env");
                 OriginConfig::Http {
                     base_url: if base_url.is_empty() {
                         None
@@ -128,6 +137,15 @@ impl OriginKind {
                     put_url: get("put_url"),
                     send_url: get("send_url"),
                     delete_url: get("delete_url"),
+                    auth: if token_env.is_empty() {
+                        HttpAuth::None
+                    } else {
+                        HttpAuth::Bearer {
+                            token: None,
+                            token_env: Some(token_env),
+                            token_file: None,
+                        }
+                    },
                 }
             }
             OriginKind::Command => {

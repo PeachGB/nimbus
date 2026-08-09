@@ -1,16 +1,22 @@
-# vault
+# nimbus-vault
 
 Library crate for the Nimbus CLI/TUI. Abstracts a remote or local "origin" — a filesystem, a shell command, an HTTP API — behind a single tree-like `Vault` structure, similar to a filesystem, regardless of where the underlying objects actually live.
+
+```bash
+cargo add nimbus-vault
+```
+
+It's usable on its own: nothing here depends on the frontends, and a `Vault` can be opened from a `vault.toml` (or an `Origin` built without a vault at all, see [Building an origin without a vault](#building-an-origin-without-a-vault)) in a few lines.
 
 ## What's here
 
 - **`vault.rs`** — `Vault`: holds a name, an `Arc<dyn Origin>`, a local `Object` cache (`Mutex<HashMap<ObjectId, Object>>`), and a single root `ObjectId`. `Vault::new(path)` reads a `VaultConfig` from a TOML file at `path` and bootstraps the origin and root id from it. `find(path)` walks a filesystem-style `PathBuf` component by component, calling `list` at each level and matching child names, to resolve it to an `ObjectId` starting from the root. `get` serves from the cache when present, falling back to the origin and caching the result; `list` always hits the origin but caches every child it returns (and updates the parent's cached child-id list, if the parent is itself cached as a `Branch`/`Root`); `delete` evicts an id from the cache. `fetch`/`send` stream payloads straight through the origin and are never cached. `put(object, destination)` writes `object` under `destination` and caches (and returns) the `Object` the origin reports back — not the input — since an origin isn't required to rename `object` in place (see [The `put` contract](#the-put-contract)); on failure, nothing is cached. `pull(id, remote)`/`push(id, remote)` recursively sync `id`'s subtree between this vault's origin and an arbitrary `&dyn Origin`, threading `put`'s returned `Object` through to the following `send` — see [Syncing between origins](#syncing-between-origins) below.
-- **`config.rs`** — `VaultConfig`: the on-disk shape of a vault (`name`, an optional `root_id` defaulting to `"/"`, plus an `origin_config`), and `OriginConfig`, a tagged enum (`type = "fs" | "command" | "http" | "vault"`) describing how to build the origin declaratively. `VaultConfig::build(path)` reads and parses the TOML file and returns the vault's name, root id, and the matching `Box<dyn Origin>`. `OriginConfig::from_file(path)` builds just the `Box<dyn Origin>` from a TOML file containing only the `origin_config` shape (no `name`/`root_id`), for callers that want to talk to an origin directly without opening a `Vault` — see [Building an origin without a vault](#building-an-origin-without-a-vault). `OriginConfig::build(self)` takes `self` by value rather than `&self`, so it moves each variant's fields straight into the `Origin` it constructs instead of cloning them. `VaultConfig::save(path)` writes the config out, creating the parent directory if needed; `VaultConfig::default_dir()`/`default_path(name)` give the conventional location for a new vault's config (see [Where configs live](#where-configs-live)).
+- **`config.rs`** — `VaultConfig`: the on-disk shape of a vault (`name`, an optional `root_id` defaulting to `"/"`, plus an `origin_config`), and `OriginConfig`, a tagged enum (`type = "fs" | "command" | "http" | "vault"`) describing how to build the origin declaratively — the `http` variant also carries an optional `auth` table (`HttpAuth`), which is why it's the variant's last field: it's the only one that serializes as a TOML table, and a table has to come after every plain value in the same struct or `VaultConfig::save` fails on a config it just built. `VaultConfig::build(path)` reads and parses the TOML file and returns the vault's name, root id, and the matching `Box<dyn Origin>`. `OriginConfig::from_file(path)` builds just the `Box<dyn Origin>` from a TOML file containing only the `origin_config` shape (no `name`/`root_id`), for callers that want to talk to an origin directly without opening a `Vault` — see [Building an origin without a vault](#building-an-origin-without-a-vault). `OriginConfig::build(self)` takes `self` by value rather than `&self`, so it moves each variant's fields straight into the `Origin` it constructs instead of cloning them. `VaultConfig::save(path)` writes the config out, creating the parent directory if needed; `VaultConfig::default_dir()`/`default_path(name)` give the conventional location for a new vault's config (see [Where configs live](#where-configs-live)).
 - **`object.rs`** — `Object` (`Leaf` / `Branch` / `Root` variants), `ObjectId` (newtype around `String`, defaults to `ROOT_ID` (`"/"`), with `is_root()`), `Metadata` (size, content type, modified time, free-form `extra` map, plus `hash_value()` for a stable content hash). `Object::push` appends a child id onto a `Branch`/`Root`; `Object::with_id` overwrites an object's id in place (used by origins that rename an object on `put`, e.g. `OriginFileSystem`); `Object::with_name` does the same for the name, which is what turns a copy into a rename — `Origin::put` writes an object under its own `get_name()`, so setting the name before `put` is the only rename primitive there is (both are no-ops for `Root`). `Object::get_name()` returns `ROOT_NAME` (`"##ROOT##"`) for `Root`, which has no real name. `Object::changed(remote)` compares `hash_value()` on both sides' metadata to detect drift between a local and remote copy of the same object, returning `false` if either side has no metadata (e.g. `Root`).
 - **`origin/mod.rs`** — the `Origin` trait (`fetch`, `list`, `get`, `put`, `send`, `delete`, plus `Send + Sync`) that every backend implements.
 - **`origin/fs.rs`** — `OriginFileSystem`: origin backed by a directory on disk. `ObjectId`s are relative paths under `root`. `put` resolves the object's path as `{destination}/{name}`, renames the object in place (via `Object::with_id`) to that path, and creates the file/directory (truncating, for a `Leaf` — `put` creates, `send` fills in). `send` explicitly `flush`es before returning: `tokio::fs::File` buffers, and its `Drop` only starts a best-effort background flush, so without it the bytes weren't guaranteed on disk when `send` returned and a read straight afterwards could come back short or empty.
 - **`origin/command.rs`** — `OriginCommand`: origin backed by shell commands, one per operation (`fetch_cmd`, `list_cmd`, `get_cmd`, `put_cmd`, `send_cmd`, `delete_cmd`). Every command runs under `sh -c` and is `{placeholder}`-templated with the object id, name, metadata and kind, plus arbitrary `extra_vars` (guarded by an internal `futures::lock::Mutex`, since `put` needs to set a `destination` var without requiring `&mut self`); `list`/`get` expect the command's stdout to be JSON matching `Object`. `put` runs `put_cmd`, then re-`get`s `"{destination}/{name}"` to return the stored `Object` — it does **not** rename the input object in place, unlike `OriginFileSystem`. See [Command templating](#command-templating) for which placeholders reach which template.
-- **`origin/http.rs`** — `OriginHTTP`: origin backed by a REST-ish HTTP API. `base_url` plus a `{id}`-templated path per operation (`fetch_url`, `list_url`, `get_url`, `put_url`, `send_url`, `delete_url`). Every URL is `base_url` (trailing `/` trimmed) followed by that operation's template with `{id}` substituted. `get`/`list` are `GET`s deserialized as JSON; `fetch` streams the response body; `put` `PUT`s the `Object` as JSON to `put_url` — with `{id}` filled in from the **destination**, not the object — then re-`get`s `"{destination}/{name}"` to return the stored `Object` (again, without mutating the input); `send` `PUT`s the payload stream as the request body of `send_url` (templated with the object's own id); `delete` is a `DELETE`. Any non-2xx response becomes a `VaultError`, with 404 mapped to `NotFound`.
+- **`origin/http.rs`** — `OriginHTTP`: origin backed by a REST-ish HTTP API. `base_url` plus a `{id}`-templated path per operation (`fetch_url`, `list_url`, `get_url`, `put_url`, `send_url`, `delete_url`). Every URL is `base_url` (trailing `/` trimmed) followed by that operation's template with `{id}` substituted. `get`/`list` are `GET`s deserialized as JSON; `fetch` streams the response body; `put` `PUT`s the `Object` as JSON to `put_url` — with `{id}` filled in from the **destination**, not the object — then re-`get`s `"{destination}/{name}"` to return the stored `Object` (again, without mutating the input); `send` `PUT`s the payload stream as the request body of `send_url` (templated with the object's own id); `delete` is a `DELETE`. Any non-2xx response becomes a `VaultError`, with 404 mapped to `NotFound` and 401/403 to an error naming `[origin_config.auth]`, since that's where the cause is. Credentials come from `HttpAuth` (`with_auth`, or an `[auth]` table inside `[origin_config]`) and are attached in the one place every request passes through, so an operation added later can't forget to authenticate — see [Authenticating an HTTP origin](#authenticating-an-http-origin).
 - **`origin/vault.rs`** — `OriginVault`: origin backed by another `Vault` (held as `Arc<Vault>`). Every trait method just forwards to the wrapped vault's method of the same name — see [Using a vault as an origin](#using-a-vault-as-an-origin).
 - **`error.rs`** — `VaultError` (`thiserror`-based) / `VaultResult<T>`, the error type used across the crate. `NotFound` carries the id/url/name that wasn't found; `Io`, `Json`, `Toml`, and `HTTP` wrap the corresponding std/serde/toml/reqwest errors via `#[from]`.
 
@@ -89,7 +95,7 @@ beats a config default.
 `config_home()` returns `.nimbus` under the platform config directory (`$XDG_CONFIG_HOME` on
 Linux), falling back to the temp directory. It's defined here rather than in each binary so the
 CLI's own config and the vault configs written by the creator wizard can't drift apart —
-[`nimbus-core`](../core)'s `CliConfig::path()` calls it too.
+[`nimbus-core`](https://github.com/PeachGB/nimbus/tree/main/crates/core)'s `CliConfig::path()` calls it too.
 
 - `VaultConfig::default_dir()` — `<config_home>/vaults`, where new vault configs go.
 - `VaultConfig::default_path(name)` — `<config_home>/vaults/<name>.toml`.
@@ -115,6 +121,40 @@ let origin: Box<dyn Origin> = OriginConfig::from_file("origin.toml".into())?;
 ```
 
 This is useful for tooling that talks to an origin directly (e.g. syncing two origins with `push`/`pull` without needing a `Vault` on either side) or for building an `Origin` to pass as the `remote` argument to `Vault::pull`/`Vault::push`.
+
+## Authenticating an HTTP origin
+
+An `http` origin sends no credentials unless it's given some. `HttpAuth` is a tagged enum, so a
+new scheme is an added variant rather than a breaking change to existing configs; today it's
+`none` (the default) or `bearer`:
+
+```toml
+[origin_config]
+type = "http"
+base_url = "http://server:8080/v/photos"
+# … the six url templates …
+
+[origin_config.auth]
+type = "bearer"
+token_env = "NIMBUS_TOKEN"
+```
+
+The secret comes from exactly one of `token` (written in the config), `token_env` (an
+environment variable) or `token_file` (a file, whose trailing newline isn't part of the token).
+Two at once is an error rather than a precedence rule — silently preferring one would let a
+stale `token` override the `token_env` someone added to replace it.
+
+Reach for `token_env`. A vault config is a file people copy between machines and commit, which
+is no place for a password; `~/.config/.nimbus/vaults/` is not a secret store. The wizard in
+[`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator) only offers that form for the same reason.
+
+The secret is resolved when the origin is built, not per request, so a missing variable or an
+unreadable file surfaces as the vault is opened rather than as a 401 halfway through a sync.
+A vault that fails to open this way stays *registered* — an unset variable in one shell doesn't
+unregister it (see [`nimbus-core`](https://github.com/PeachGB/nimbus/tree/main/crates/core)).
+
+There is no TLS here beyond whatever `base_url` names: a bearer token on plaintext `http://` is
+readable by anything on the path.
 
 ## Using a vault as an origin
 
@@ -163,7 +203,7 @@ cargo fmt -p nimbus-vault
 
 ## Status
 
-119 unit tests (plus 38 doctests) covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
+135 unit tests (plus 40 doctests) covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths, plus authentication: every operation carrying the header — one mock per operation, so one that forgot would fail rather than pass unnoticed — no header at all when no credentials are configured, the 401 message, and each way a token can be resolved or refused), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
 
 Regression tests worth knowing about, all in `origin::command`: configured `extras` reaching `put_cmd`/`send_cmd`, `{kind}` distinguishing a leaf from a branch, per-object `meta.extra` beating a config default, and `{destination}` being refreshed rather than cached across two `put`s to different parents.
 
@@ -175,4 +215,4 @@ Regression tests worth knowing about, all in `origin::command`: configured `extr
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/PeachGB/nimbus/blob/main/crates/vault/LICENSE-APACHE) or [MIT license](https://github.com/PeachGB/nimbus/blob/main/crates/vault/LICENSE-MIT) at your option.

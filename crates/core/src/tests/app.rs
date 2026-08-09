@@ -18,6 +18,7 @@ fn make_app(vaults: HashMap<String, Vault>) -> App {
         // Never the real session file: anything calling `save()` (new_vault, forget_vault)
         // would otherwise rewrite the developer's own vault registry from a test run.
         state_path: scratch_state_path(),
+        saved_session: None,
     }
 }
 
@@ -254,6 +255,128 @@ async fn cd_at_root_level_with_unknown_vault_errors() {
     let mut app = make_app(HashMap::new());
     let result = app.cd(Some("missing".to_string())).await;
     assert!(result.is_err());
+}
+
+// --- session persistence ---
+
+#[tokio::test]
+async fn restore_session_returns_to_the_saved_vault_and_directory() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("docs/2024")).unwrap();
+    let mut vaults = HashMap::new();
+    vaults.insert("v1".to_string(), fs_vault("v1", root.path().to_path_buf()));
+    let mut app = make_app(vaults);
+    app.saved_session = Some(("v1".to_string(), PathBuf::from("/docs/2024")));
+
+    app.restore_session().await.unwrap();
+
+    assert_eq!(app.current_vault.as_deref(), Some("v1"));
+    assert_eq!(app.cwd_path, PathBuf::from("/docs/2024"));
+}
+
+#[tokio::test]
+async fn restore_session_falls_back_to_the_vault_root_when_the_directory_is_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let mut vaults = HashMap::new();
+    vaults.insert("v1".to_string(), fs_vault("v1", root.path().to_path_buf()));
+    let mut app = make_app(vaults);
+    app.saved_session = Some(("v1".to_string(), PathBuf::from("/gone")));
+
+    app.restore_session().await.unwrap();
+
+    assert_eq!(app.current_vault.as_deref(), Some("v1"));
+    assert_eq!(app.cwd_path, PathBuf::from("/"));
+}
+
+#[tokio::test]
+async fn restore_session_falls_back_to_the_app_root_when_the_vault_is_gone() {
+    let mut app = make_app(HashMap::new());
+    app.saved_session = Some(("forgotten".to_string(), PathBuf::from("/docs")));
+
+    app.restore_session().await.unwrap();
+
+    assert_eq!(app.current_vault, None);
+    assert_eq!(app.cwd_path, PathBuf::from("/"));
+}
+
+/// A vault that's registered but didn't open this run (its `token_env` isn't exported, say) is
+/// a *temporary* failure, so the saved position has to survive it — otherwise the next `save()`
+/// resets you to the root and where you were is gone for good.
+#[tokio::test]
+async fn restore_session_keeps_the_position_of_a_registered_vault_that_didnt_open() {
+    let mut app = make_app(HashMap::new());
+    app.vault_configs
+        .insert("v1".to_string(), PathBuf::from("/does/not/build.toml"));
+    app.saved_session = Some(("v1".to_string(), PathBuf::from("/docs")));
+
+    app.restore_session().await.unwrap();
+
+    // Not restored — the vault isn't open — but not forgotten either.
+    assert_eq!(app.current_vault, None);
+    assert_eq!(
+        app.saved_session,
+        Some(("v1".to_string(), PathBuf::from("/docs")))
+    );
+
+    app.save().unwrap();
+    let raw = std::fs::read_to_string(&app.state_path).unwrap();
+    let saved: SavedState = toml::from_str(&raw).unwrap();
+    assert_eq!(saved.current_vault.as_deref(), Some("v1"));
+    assert_eq!(saved.cwd_path, Some(PathBuf::from("/docs")));
+}
+
+/// The other half of the rule above: a vault that isn't in the registry at all is really gone,
+/// so its position goes too rather than warning on every run forever.
+#[tokio::test]
+async fn restore_session_drops_the_position_of_an_unregistered_vault() {
+    let mut app = make_app(HashMap::new());
+    app.saved_session = Some(("forgotten".to_string(), PathBuf::from("/docs")));
+
+    app.restore_session().await.unwrap();
+
+    assert_eq!(app.saved_session, None);
+
+    app.save().unwrap();
+    let raw = std::fs::read_to_string(&app.state_path).unwrap();
+    let saved: SavedState = toml::from_str(&raw).unwrap();
+    assert_eq!(saved.current_vault, None);
+}
+
+#[tokio::test]
+async fn save_then_init_round_trips_the_current_vault_and_directory() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("docs")).unwrap();
+    let mut vaults = HashMap::new();
+    vaults.insert("v1".to_string(), fs_vault("v1", root.path().to_path_buf()));
+    let mut app = make_app(vaults);
+    app.select("v1".to_string()).unwrap();
+    app.cd(Some("docs".to_string())).await.unwrap();
+    app.save().unwrap();
+
+    let raw = std::fs::read_to_string(&app.state_path).unwrap();
+    let saved: SavedState = toml::from_str(&raw).unwrap();
+    assert_eq!(saved.current_vault.as_deref(), Some("v1"));
+    assert_eq!(saved.cwd_path, Some(PathBuf::from("/docs")));
+}
+
+#[test]
+fn save_keeps_a_session_that_was_never_restored() {
+    let mut app = make_app(HashMap::new());
+    app.saved_session = Some(("v1".to_string(), PathBuf::from("/docs")));
+
+    app.save().unwrap();
+
+    let raw = std::fs::read_to_string(&app.state_path).unwrap();
+    let saved: SavedState = toml::from_str(&raw).unwrap();
+    assert_eq!(saved.current_vault.as_deref(), Some("v1"));
+    assert_eq!(saved.cwd_path, Some(PathBuf::from("/docs")));
+}
+
+#[test]
+fn a_state_file_without_session_keys_still_loads() {
+    let saved: SavedState = toml::from_str("[vault_configs]\n").unwrap();
+    assert_eq!(saved.current_vault, None);
+    assert_eq!(saved.cwd_path, None);
 }
 
 // --- ls ---
@@ -1154,6 +1277,63 @@ fn forget_vault_refuses_the_local_vault_and_unknown_names() {
     assert!(app.forget_vault(LOCAL_VAULT_NAME.to_string()).is_err());
     assert!(app.vaults.contains_key(LOCAL_VAULT_NAME));
     assert!(app.forget_vault("nope".to_string()).is_err());
+}
+
+#[test]
+fn forget_vault_works_on_one_that_is_registered_but_could_not_be_opened() {
+    // How you get rid of a vault whose config no longer builds — it never made it into
+    // `vaults`, only into the registry.
+    let mut app = make_app(HashMap::new());
+    app.vault_configs
+        .insert("broken".to_string(), PathBuf::from("/nonexistent/v.toml"));
+
+    app.forget_vault("broken".to_string()).unwrap();
+
+    assert!(!app.vault_configs.contains_key("broken"));
+}
+
+// --- opening the registry ---
+
+#[test]
+fn a_vault_whose_config_does_not_build_is_skipped_but_stays_registered() {
+    // Its config may only be unbuildable *right now* — an `[origin_config.auth] token_env`
+    // that isn't exported in this shell. Dropping the registry entry would have the next
+    // `save` unregister the vault for good over that.
+    let dir = tempfile::tempdir().unwrap();
+    let good_config = dir.path().join("good.toml");
+    std::fs::write(
+        &good_config,
+        format!(
+            "name = \"good\"\n\n[origin_config]\ntype = \"fs\"\nroot = \"{}\"\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let registry = HashMap::from([
+        ("good".to_string(), good_config),
+        ("broken".to_string(), dir.path().join("missing.toml")),
+    ]);
+
+    let vaults = App::open_vaults(&registry);
+
+    assert!(vaults.contains_key("good"));
+    assert!(!vaults.contains_key("broken"));
+    // The registry is borrowed, so what `save` writes still has both.
+    assert!(registry.contains_key("broken"));
+}
+
+#[test]
+fn save_keeps_a_registered_vault_that_could_not_be_opened() {
+    let mut app = make_app(HashMap::new());
+    app.vault_configs
+        .insert("broken".to_string(), PathBuf::from("/nonexistent/v.toml"));
+
+    app.save().unwrap();
+
+    let written: SavedState =
+        toml::from_str(&std::fs::read_to_string(&app.state_path).unwrap()).unwrap();
+    assert!(written.vault_configs.contains_key("broken"));
 }
 
 // --- delete ---

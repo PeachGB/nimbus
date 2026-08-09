@@ -95,9 +95,13 @@ impl CmdType {
             CmdType::Delete => crate::DELETE_CMD_FIELD,
         }
     }
-    /// Owned version of [`CmdType::as_str`].
-    pub fn to_string(&self) -> String {
-        self.as_str().to_string()
+}
+
+/// Formats as the config field name, so `to_string()` (via the blanket [`ToString`]) and `{}`
+/// both give what [`CmdType::as_str`] returns.
+impl std::fmt::Display for CmdType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 impl OriginCommand {
@@ -217,7 +221,7 @@ impl OriginCommand {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(VaultError::Generic(format!(
                 "{} failed for {}: {}",
-                t.to_string(),
+                t,
                 id.as_str(),
                 stderr.trim()
             )));

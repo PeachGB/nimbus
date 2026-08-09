@@ -1,29 +1,29 @@
 [package]
 name = "nimbus-tui"
-version = "0.1.0"
-description = "a TUI for nimbus, an object sync abstraction tool with customizable origin"
-authors = ["PeachGB <arianmateos@gmail.com>"]
-license = "MIT"
-edition = "2024"
+description = "A ranger-style terminal file manager over nimbus vaults, an object sync abstraction with customizable origins."
+readme = "README.md"
+documentation = "https://docs.rs/nimbus-tui"
+keywords = ["nimbus", "tui", "ratatui", "file-manager", "sync"]
+categories = ["command-line-utilities", "filesystem"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-anyhow = "1.0.103"
-clap = { version = "4.6.1", features = ["derive"] }
+anyhow.workspace = true
+clap.workspace = true
 color-eyre.workspace = true
 crossterm.workspace = true
-nimbus-core = { version = "0.1.0", path = "../core" }
-nimbus-creator = { path = "../creator" }
-nimbus-vault = { version = "0.1.1", path = "../vault" }
+nimbus-core = { version = "0.2.0", path = "../core" }
+nimbus-creator = { version = "0.2.0", path = "../creator" }
+nimbus-vault = { version = "0.2.0", path = "../vault" }
 ratatui.workspace = true
 chrono.workspace = true
 tokio.workspace = true
-
-# Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"

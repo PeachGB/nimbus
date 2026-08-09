@@ -1,11 +1,17 @@
-nimbus-cli is a REPL: start it once, then type subcommands at its prompt. It reads
-stdin and ignores argv, so `nimbus-cli ls` does nothing — pipe commands in to script
-it (printf 'select my-vault\nls\n' | nimbus-cli).
+nimbus-cli works either way round. Give it a subcommand and it runs that one command
+and exits; give it nothing and it opens a REPL. Both drive the same session file, so
+the vault you selected and the directory you were in survive between invocations.
 
-$ cargo run -p nimbus-cli
-
-nimbus />> new vault.toml
+# one command per invocation
+$ nimbus-cli new vault.toml
 (registers a vault from vault.toml; see README.md for the config format)
+
+$ nimbus-cli cd my-vault/docs
+$ nimbus-cli ls
+(lists my-vault:/docs — the previous `cd` is what put us there)
+
+# or the REPL, for a bare invocation
+$ cargo run -p nimbus-cli
 
 nimbus />> vaults
 (prints registered vault names)
@@ -25,5 +31,8 @@ nimbus my-vault/docs>> get notes.txt my-vault downloads
 
 nimbus my-vault/docs>> exit
 (saves the session and quits; Ctrl-C/Ctrl-D do the same)
+
+To run several commands in one process, pipe them into the REPL:
+printf 'select my-vault\nls\n' | nimbus-cli
 
 See README.md for the full command reference.

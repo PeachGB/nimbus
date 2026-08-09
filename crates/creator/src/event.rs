@@ -35,6 +35,9 @@ pub struct EventHandler {
 }
 
 impl EventHandler {
+    // No `Default`: constructing one spawns an event-reading thread, which is not something a
+    // `Default::default()` should do behind the caller's back.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         let actor = EventThread::new(sender.clone());

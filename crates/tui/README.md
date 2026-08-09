@@ -1,13 +1,14 @@
 # nimbus-tui
 
 A ranger-style terminal file manager over nimbus vaults: a list of registered vaults, and inside
-each one a browsable object tree, backed by any [`nimbus-vault`](../vault) origin — a local
+each one a browsable object tree, backed by any [`nimbus-vault`](https://github.com/PeachGB/nimbus/tree/main/crates/vault) origin — a local
 directory, an HTTP API, a shell command, or another vault. Every operation goes through
-[`nimbus-core`](../core)'s `App`, so the TUI and [`nimbus-cli`](../cli) do the same things by the
+[`nimbus-core`](https://github.com/PeachGB/nimbus/tree/main/crates/core)'s `App`, so the TUI and [`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli) do the same things by the
 same code path.
 
 ```sh
-cargo run -p nimbus-tui
+cargo install nimbus-tui   # then: nimbus-tui
+cargo run -p nimbus-tui    # or, from a checkout of the workspace
 ```
 
 The vault list comes up first: every registered vault, with the root-level keybinding hints along
@@ -199,6 +200,9 @@ Everything the TUI launches is in this process's group, so the terminal's signal
 
 - **`app.rs`** — `App`: the state machine. Holds the `nimbus-core::App`, the vault/object
   listings, the clipboard, marks, filter, sort, and any pending confirmation or embedded wizard.
+  It opens on its own vault picker, so it deliberately doesn't call `restore_session()` — and
+  `nimbus-core`'s `save()` leaves an unrestored session untouched, so browsing here doesn't wipe
+  where [`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli) was standing.
   `visible: Vec<usize>` indexes into `objects` and is what the list selects against, so the
   filter and sort work without disturbing what the vault actually reported; anything reading the
   selection must go through `selected_object()`.
@@ -215,7 +219,7 @@ Everything the TUI launches is in this process's group, so the terminal's signal
 - **`opener.rs`** — executable sniffing and launching, the OS-default opener, and the `$EDITOR`
   fallback.
 
-The vault creation wizard ([`nimbus-creator`](../creator)) is driven from this crate's own event
+The vault creation wizard ([`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator)) is driven from this crate's own event
 loop rather than its blocking `run()` entry point, so the two never compete for terminal input.
 
 ## Marks are names, not indices
@@ -244,14 +248,11 @@ cargo fmt -p nimbus-tui
 ```
 
 To drive it against origins other than a plain filesystem, see
-[`crates/cli/test/`](../cli/test/README.md), which holds a vault config per origin type (`fs`,
+[`crates/cli/test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md), which holds a vault config per origin type (`fs`,
 `http`, `command`, and a vault wrapping another vault) along with reference `http`/`command`
 origin implementations.
 
 ## License
 
-Copyright (c) PeachGB <arianmateos@gmail.com>
-
-This project is licensed under the MIT license ([LICENSE] or <http://opensource.org/licenses/MIT>)
-
-[LICENSE]: ./LICENSE
+Licensed under either of [Apache License, Version 2.0](https://github.com/PeachGB/nimbus/blob/main/crates/tui/LICENSE-APACHE) or
+[MIT license](https://github.com/PeachGB/nimbus/blob/main/crates/tui/LICENSE-MIT) at your option — the same terms as the rest of the workspace.

@@ -1,14 +1,21 @@
 [package]
 name = "nimbus-vault"
-version = "0.1.1"
-edition = "2024"
 description = "A generic sync abstraction: a tree of objects (a vault) whose actual storage lives behind a pluggable origin."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/PeachGB/nimbus/tree/main/crates/vault"
+readme = "README.md"
+documentation = "https://docs.rs/nimbus-vault"
+keywords = ["sync", "vault", "storage", "filesystem", "origin"]
+categories = ["filesystem", "network-programming", "asynchronous"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-bytes = "1.12.0"
+bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -18,9 +25,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 reqwest.workspace = true
 toml.workspace = true
-dirs = "6.0.0"
+dirs.workspace = true
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 httpmock = "0.7"

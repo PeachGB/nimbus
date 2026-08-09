@@ -152,8 +152,27 @@ async fn dispatch(app: &mut App, cli: Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let app = Rc::new(RefCell::new(App::init()?));
+    // Restored before the `RefCell`, so the borrow isn't held across the await.
+    let mut app = App::init()?;
+    app.restore_session().await?;
+    let app = Rc::new(RefCell::new(app));
 
+    // Anything after the program name is a one-shot invocation (`nimbus ls`, `nimbus put a.txt`):
+    // run it and exit. The REPL is only for a bare `nimbus`.
+    if std::env::args_os().nth(1).is_some() {
+        let cli = Cli::parse();
+        let result = run_dispatch(&app, cli).await;
+        app.borrow().save()?;
+        return result;
+    }
+
+    repl(&app).await?;
+
+    app.borrow().save()?;
+    Ok(())
+}
+
+async fn repl(app: &Rc<RefCell<App>>) -> Result<()> {
     let mut rl: rustyline::Editor<NimbusHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::new()?;
     rl.set_helper(Some(NimbusHelper::new(app.clone())));
@@ -172,7 +191,7 @@ async fn main() -> Result<()> {
                     .chain(line.split_whitespace().map(String::from));
                 match Cli::try_parse_from(tokens) {
                     Ok(cli) => {
-                        if let Err(e) = run_dispatch(&app, cli).await {
+                        if let Err(e) = run_dispatch(app, cli).await {
                             eprintln!("Error {e}");
                         }
                     }

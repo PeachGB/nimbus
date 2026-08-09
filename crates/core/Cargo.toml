@@ -1,17 +1,29 @@
 [package]
 name = "nimbus-core"
-version = "0.1.0"
-edition = "2024"
+description = """Session and vault-management logic shared by nimbus's frontends: the registry of \
+named vaults, the current vault/directory, and the local staging vault, with no terminal code of \
+its own."""
+readme = "README.md"
+documentation = "https://docs.rs/nimbus-core"
+keywords = ["nimbus", "sync", "vault", "session"]
+categories = ["filesystem", "command-line-interface"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-nimbus-vault = { path = "../vault/" }
-anyhow = "1.0.103"
-bytes = "1.12.0"
+nimbus-vault = { version = "0.2.0", path = "../vault/" }
+anyhow.workspace = true
+bytes.workspace = true
 futures.workspace = true
 serde.workspace = true
 toml.workspace = true
-dirs = "6.0.0"
+dirs.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-tempfile = "3.27.0"
+tempfile.workspace = true

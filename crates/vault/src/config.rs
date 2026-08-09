@@ -7,7 +7,11 @@ use crate::{
     VaultResult,
     object::ObjectId,
     origin::{
-        Origin, command::OriginCommand, fs::OriginFileSystem, http::OriginHTTP, vault::OriginVault,
+        Origin,
+        command::OriginCommand,
+        fs::OriginFileSystem,
+        http::{HttpAuth, OriginHTTP},
+        vault::OriginVault,
     },
     vault::Vault,
 };
@@ -167,6 +171,11 @@ mod tests;
 /// put_url    = "/put/{id}"
 /// send_url   = "/send/{id}"
 /// delete_url = "/delete/{id}"
+///
+/// # optional; see `HttpAuth`
+/// [auth]
+/// type = "bearer"
+/// token_env = "NIMBUS_TOKEN"
 /// ```
 ///
 /// Another vault, opened from its own config file:
@@ -223,6 +232,11 @@ pub enum OriginConfig {
 
         /// `{id}`-templated path to delete an object.
         delete_url: String,
+        /// Credentials to present on every request; defaults to sending none. Last of the
+        /// variant's fields because it's the only one that serializes as a TOML table, and a
+        /// table has to come after every plain value in the same struct.
+        #[serde(default)]
+        auth: HttpAuth,
     },
     /// Builds an [`crate::origin::vault::OriginVault`]: an origin backed by another `Vault`,
     /// opened from its own config file.
@@ -290,11 +304,15 @@ impl OriginConfig {
                 put_url,
                 send_url,
                 delete_url,
+                auth,
             } => {
                 let base_url = base_url.unwrap_or_default();
-                Ok(Box::new(OriginHTTP::new(
-                    base_url, fetch_url, list_url, get_url, put_url, send_url, delete_url,
-                )))
+                Ok(Box::new(
+                    OriginHTTP::new(
+                        base_url, fetch_url, list_url, get_url, put_url, send_url, delete_url,
+                    )
+                    .with_auth(&auth)?,
+                ))
             }
             OriginConfig::Vault { path } => {
                 let vault = Vault::new(path)?;

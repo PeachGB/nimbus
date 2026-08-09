@@ -20,6 +20,13 @@ const LOCAL_VAULT_NAME: &str = "LOCAL";
 #[derive(Serialize, Deserialize, Default)]
 struct SavedState {
     vault_configs: HashMap<String, PathBuf>,
+    /// The vault and directory the last session ended in, so a one-shot `nimbus ls` picks up
+    /// where the previous `nimbus cd docs` left off. Defaulted so state files written before
+    /// these existed still load.
+    #[serde(default)]
+    current_vault: Option<String>,
+    #[serde(default)]
+    cwd_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -34,6 +41,9 @@ pub struct App {
     /// Where [`Self::save`] persists the vault registry. A field rather than a constant so
     /// tests can point it at a scratch file instead of clobbering the real session state.
     state_path: PathBuf,
+    /// The vault and directory read back from the state file, waiting for
+    /// [`Self::restore_session`] to await its way there. Taken once it has been applied.
+    saved_session: Option<(String, PathBuf)>,
 }
 
 /// Where a resolved `cp`/`mv` destination points.
@@ -55,6 +65,7 @@ impl Default for App {
             local_root: None,
             local_root_canonical: None,
             state_path: Self::default_state_path(),
+            saved_session: None,
         }
     }
 }
@@ -93,20 +104,12 @@ impl App {
             SavedState::default()
         };
 
-        let mut vaults = HashMap::new();
-        let mut vault_configs = HashMap::new();
-        for (name, cfg_path) in saved.vault_configs {
-            match Vault::new(cfg_path.clone()) {
-                Ok(vault) => {
-                    vaults.insert(name.clone(), vault);
-                    vault_configs.insert(name, cfg_path);
-                }
-                Err(e) => eprintln!(
-                    "WARNING: skipping vault '{name}' ({}): {e}",
-                    cfg_path.display()
-                ),
-            }
-        }
+        let saved_session = saved
+            .current_vault
+            .map(|vault| (vault, saved.cwd_path.unwrap_or_else(|| PathBuf::from("/"))));
+
+        let vault_configs = saved.vault_configs;
+        let vaults = Self::open_vaults(&vault_configs);
 
         let mut app = App {
             vaults,
@@ -117,6 +120,7 @@ impl App {
             local_root,
             local_root_canonical,
             state_path,
+            saved_session,
         };
 
         if cli_config.default_local_vault && !app.vaults.contains_key(LOCAL_VAULT_NAME) {
@@ -136,15 +140,80 @@ impl App {
 
         Ok(app)
     }
+    /// Opens every vault in the registry, warning about — and skipping — the ones whose config
+    /// doesn't build right now.
+    ///
+    /// The registry itself is left alone (it's borrowed, not consumed) on purpose: a config
+    /// can be unbuildable *temporarily*, e.g. an `[origin_config.auth]` whose `token_env`
+    /// isn't exported in this shell. Dropping the entry would have the next [`Self::save`]
+    /// unregister the vault for good over that.
+    fn open_vaults(registry: &HashMap<String, PathBuf>) -> HashMap<String, Vault> {
+        let mut vaults = HashMap::new();
+        for (name, cfg_path) in registry {
+            match Vault::new(cfg_path.clone()) {
+                Ok(vault) => {
+                    vaults.insert(name.clone(), vault);
+                }
+                Err(e) => eprintln!(
+                    "WARNING: vault '{name}' ({}) can't be opened, so it won't be usable this \
+                     session: {e}",
+                    cfg_path.display()
+                ),
+            }
+        }
+        vaults
+    }
+
     pub fn save(&self) -> Result<()> {
+        // A session that was read back but never restored (an embedder that skips
+        // `restore_session` and starts at the root) is written out unchanged rather than
+        // overwritten with that root.
+        let (current_vault, cwd_path) = match &self.saved_session {
+            Some((vault, path)) => (Some(vault.clone()), path.clone()),
+            None => (self.current_vault.clone(), self.cwd_path.clone()),
+        };
         let state = SavedState {
             vault_configs: self.vault_configs.clone(),
+            current_vault,
+            cwd_path: Some(cwd_path),
         };
         let path = &self.state_path;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, toml::to_string_pretty(&state)?)?;
+        Ok(())
+    }
+
+    /// Re-enters the vault and directory the previous session ended in.
+    ///
+    /// Separate from [`Self::init`] because resolving a directory has to reach the origin,
+    /// which a sync constructor can't await. A vault or path that no longer resolves isn't an
+    /// error — the session just starts at the vault's root, or at the app root.
+    pub async fn restore_session(&mut self) -> Result<()> {
+        let Some((vault_name, path)) = self.saved_session.clone() else {
+            return Ok(());
+        };
+        if let Err(e) = self.select(vault_name.clone()) {
+            eprintln!("WARNING: couldn't restore the previous session: {e}");
+            // A vault that's still *registered* keeps its saved position: `select` only sees
+            // the vaults that opened, so this is also what a config that failed to build this
+            // run looks like (a `token_env` that isn't exported in this shell). Clearing it
+            // would have `save` reset you to the root over a failure that's temporary — the
+            // same reason `open_vaults` leaves the registry alone. A vault that isn't
+            // registered at all really is gone, so let the position go with it rather than
+            // warn about it on every run.
+            if !self.vault_configs.contains_key(&vault_name) {
+                self.saved_session = None;
+            }
+            return Ok(());
+        }
+        self.saved_session = None;
+        // `select` already put us at the vault's root, so a directory that has since been
+        // moved or deleted leaves us somewhere valid.
+        if let Err(e) = self.cd(Some(path.to_string_lossy().into_owned())).await {
+            eprintln!("WARNING: couldn't return to '{}': {e}", path.display());
+        }
         Ok(())
     }
 
@@ -417,7 +486,9 @@ impl App {
                 "'{LOCAL_VAULT_NAME}' IS MANAGED BY cli_config — SET default_local_vault = false TO DROP IT"
             ));
         }
-        if !self.vaults.contains_key(&name) {
+        // Against the registry, not the opened vaults: a vault whose config currently fails to
+        // build is still registered, and forgetting it is exactly how you'd get rid of it.
+        if !self.vaults.contains_key(&name) && !self.vault_configs.contains_key(&name) {
             return Err(anyhow!("VAULT '{}' DOESN'T EXITS", name));
         }
         self.vaults.remove(&name);

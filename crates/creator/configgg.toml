@@ -1,6 +1,0 @@
-name = "configgg"
-root_id = "/"
-
-[origin_config]
-type = "fs"
-root = "/home/arian/.config/"

@@ -6,8 +6,11 @@ arbitrary shell command, or another vault. Syncing "a folder on disk" and "objec
 behind a REST API" run through the exact same code path, because both are just
 implementations of one `Origin` trait.
 
-Two frontends drive it: [`nimbus-cli`](crates/cli/README.md), an interactive REPL,
-and [`nimbus-tui`](crates/tui/README.md), a ranger-style file manager.
+Two frontends drive it: [`nimbus-cli`](crates/cli/README.md), which runs a single
+command or opens an interactive REPL, and [`nimbus-tui`](crates/tui/README.md), a
+ranger-style file manager. [`nimbus-daemon`](crates/daemon/README.md) is the other
+end of the wire: it serves a directory of vaults over HTTP, so one machine can hold
+the data and the rest mount it through the `http` origin.
 
 This repo is a Cargo workspace with six crates:
 
@@ -16,9 +19,9 @@ This repo is a Cargo workspace with six crates:
 | `nimbus-vault`   | working | The core library: `Object`, `Vault`, `Origin` and its four implementations. |
 | `nimbus-core`    | working | Session/vault-management logic (`App`) shared by nimbus's frontends — see [`crates/core/README.md`](crates/core/README.md). |
 | `nimbus-creator` | working | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend — see [`crates/creator/README.md`](crates/creator/README.md). |
-| `nimbus-cli`     | working | An interactive REPL built on `nimbus-core`/`nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
+| `nimbus-cli`     | working | One command per invocation, or an interactive REPL, built on `nimbus-core`/`nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
 | `nimbus-tui`     | working | A ranger-style terminal file manager over vaults — see [`crates/tui/README.md`](crates/tui/README.md). |
-| `nimbus-daemon`  | stub    | Background sync process (not yet implemented) — see [`crates/daemon/README.md`](crates/daemon/README.md). |
+| `nimbus-daemon`  | working | Serves a directory of vaults over HTTP, for the `http` origin to mount — see [`crates/daemon/README.md`](crates/daemon/README.md). |
 
 The rest of this document focuses mostly on `nimbus-vault`, since it's the library
 every other crate builds on. See [`crates/cli/README.md`](crates/cli/README.md) for
@@ -102,6 +105,26 @@ delete_cmd = "rm {id}"
 ```
 
 ```toml
+# vault.toml — backed by an HTTP API (e.g. a nimbus-daemon)
+name = "remote-vault"
+
+[origin_config]
+type = "http"
+base_url   = "http://server:8080/v/photos"
+list_url   = "/list/{id}"
+fetch_url  = "/fetch/{id}"
+get_url    = "/get/{id}"
+put_url    = "/put/{id}"
+send_url   = "/send/{id}"
+delete_url = "/delete/{id}"
+
+# optional; omit it and the origin sends no credentials
+[origin_config.auth]
+type = "bearer"
+token_env = "NIMBUS_TOKEN"
+```
+
+```toml
 # vault.toml — backed by another vault
 name = "outer-vault"
 
@@ -120,19 +143,48 @@ let children = vault.list(root).await?;
 
 ## Installation
 
+The three binaries are published on crates.io and install independently — you only
+need the ones you'll use:
+
+```bash
+cargo install nimbus-cli       # the REPL / one-shot command
+cargo install nimbus-tui       # the file manager
+cargo install nimbus-daemon    # the HTTP server
+```
+
+To use the library from your own crate:
+
+```bash
+cargo add nimbus-vault
+```
+
+Or build the whole workspace from a checkout — it's plain Cargo, no extra tooling:
+
 ```bash
 cargo build --release
 ```
 
-This is a plain Cargo workspace — no extra tooling is required. Build a single
-crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
+Build a single crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
+Everything here needs **Rust 1.88** or newer (`rust-version` in the workspace
+manifest); that floor comes from the dependencies, not from the code.
 
 ## CLI
 
-`nimbus-cli` starts an interactive REPL that manages a set of named vaults plus a
-special local vault (your own filesystem, named `LOCAL`), and moves objects
-between them. Its real prompt carries your position (`nimbus />>`,
-`nimbus my-vault/docs>>`); it's written `nimbus>` below for brevity:
+`nimbus-cli` manages a set of named vaults plus a special local vault (your own
+filesystem, named `LOCAL`), and moves objects between them. Give it a command and it
+runs that one command and exits; give it nothing and it opens an interactive REPL:
+
+```bash
+nimbus-cli ls          # runs one command, exits with its status
+nimbus-cli             # opens the REPL
+```
+
+Either way the session — the registry of vaults, the selected vault, and the
+directory you were in — is saved on the way out and restored on the next run, so a
+`nimbus-cli cd docs` followed by a `nimbus-cli ls` behaves like a shell.
+
+The REPL's prompt carries your position (`nimbus />>`, `nimbus my-vault/docs>>`);
+it's written `nimbus>` below for brevity:
 
 ```
 nimbus> ls                                   # list the current vault's cwd, or all known vaults if none selected
@@ -171,7 +223,6 @@ the local-vault security boundary, and session persistence — the REPL logic it
 (the `App` type) lives in [`nimbus-core`](crates/core/README.md), so `nimbus-cli` is
 a fairly thin binary over it. `nimbus new` with no path launches an interactive
 vault-builder wizard from [`nimbus-creator`](crates/creator/README.md).
-`nimbus-daemon` is still a placeholder binary with no logic yet.
 
 ## TUI
 
@@ -197,16 +248,51 @@ program in the terminal. See
 [`crates/tui/README.md`](crates/tui/README.md) for the full key reference and the
 known limits (operations block the event loop; there's no undo or trash).
 
+## Serving vaults over HTTP
+
+`nimbus-daemon` serves a directory of vault configs over HTTP, which is what the
+`http` origin was waiting for: one machine holds the data, the rest mount it as a
+vault and use the same `ls`/`get`/`put`/`push`/`pull` they'd use on a local folder.
+
+```bash
+nimbus-daemon --vaults ./vaults --bind 127.0.0.1:8080
+```
+
+Settings come from flags, then `~/.config/.nimbus/daemon_config.toml`, then the
+defaults, in that order. The first run writes that file with the defaults in it, so
+there's something to edit rather than a page of docs to consult:
+
+```toml
+vaults_path = "/srv/nimbus/vaults"   # required (or --vaults)
+bind = "127.0.0.1:8080"              # default: loopback, never 0.0.0.0
+read_only = false                    # refuse every write
+
+[auth]                               # default: no authentication
+type = "bearer"
+token = "s3cr3t"
+```
+
+Every `*.toml` under `vaults_path` is opened as a vault and addressed by the `name`
+inside it, at `/v/<name>/…`. The six routes mirror the URL templates `OriginHTTP`
+uses, so a client only points `base_url` at `http://host:8080/v/<name>` and fills in
+the default paths — the `http` example above is a complete client config for one.
+
+It's a server, not a scheduler: it doesn't sync anything on its own. There's no TLS
+either, so anything leaving the host wants a reverse proxy or a tunnel in front. See
+[`crates/daemon/README.md`](crates/daemon/README.md) for the full API, the
+authentication model, and how ids are validated at the boundary.
+
 ## Configuration locations
 
-Both frontends share the same layout, all derived from `nimbus_vault::config_home()`
+Every binary shares the same layout, all derived from `nimbus_vault::config_home()`
 (`.nimbus` under the platform config dir, so `$XDG_CONFIG_HOME` is respected):
 
 | Path | What |
 |------|------|
 | `<config>/.nimbus/cli_config.toml` | `default_local_vault`, `local_vault_path` |
+| `<config>/.nimbus/daemon_config.toml` | `vaults_path`, `bind`, `read_only`, `[auth]` |
 | `<config>/.nimbus/vaults/<name>.toml` | where the creator wizard saves new vault configs |
-| `<state>/nimbus/session.toml` | the registry of `name → config path` |
+| `<state>/nimbus/session.toml` | the registry of `name → config path`, plus the vault and directory the last session ended in |
 
 A vault config can live anywhere — `new <path>` registers it from wherever it is.
 The `vaults/` directory is just the wizard's default, so created vaults stay
@@ -339,6 +425,36 @@ nimbus />> new crates/cli/test/fs/fs.toml
 The configs carry **absolute** paths, so they need updating if the repo moves — see
 that README for the per-origin walkthrough.
 
+## Releasing
+
+All six crates share one version, set once in `[workspace.package]` at the root and
+inherited with `version.workspace = true`; the same goes for `edition`,
+`rust-version`, `authors`, `license`, `repository`, and `homepage`. Each crate sets
+its own `description`, `keywords`, `categories`, and `readme` — `readme` in
+particular *cannot* be inherited, since an inherited one resolves against the
+workspace root and every crate would ship the root README instead of its own.
+
+Bumping a release means editing the one `version` at the root and the `version =`
+on each inter-crate dependency (they're pinned exactly, e.g.
+`nimbus-vault = { version = "0.2.0", path = "../vault" }` — the `path` is what a
+workspace build uses, the `version` is what a crates.io consumer gets).
+
+Publishing order is forced by the dependency graph, and each crate has to be live on
+crates.io before the next one can be verified against it:
+
+```bash
+cargo publish -p nimbus-vault      # depends on nothing in-tree
+cargo publish -p nimbus-core       # → vault
+cargo publish -p nimbus-creator    # → vault
+cargo publish -p nimbus-cli        # → core, creator
+cargo publish -p nimbus-tui        # → core, creator, vault
+cargo publish -p nimbus-daemon     # → vault
+```
+
+`cargo package --list -p <crate>` shows exactly what would be uploaded, which is
+worth a look before the first publish of any crate — Cargo includes every tracked
+file next to the manifest, not just `src/`.
+
 ## Design principles
 
 - **Lazy loading** — `Object` only ever holds metadata; content is fetched on
@@ -352,8 +468,9 @@ that README for the per-origin walkthrough.
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option — except `nimbus-tui`, which ships only
-the [MIT license](crates/tui/LICENSE) (`license = "MIT"` in its `Cargo.toml`).
+[MIT license](LICENSE-MIT) at your option. All six crates declare the same
+`MIT OR Apache-2.0`, and each carries its own copy of both texts so a crate stays
+correctly licensed once it's unpacked from crates.io on its own.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the Apache-2.0 license,

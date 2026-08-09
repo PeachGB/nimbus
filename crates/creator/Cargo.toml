@@ -1,15 +1,24 @@
 [package]
 name = "nimbus-creator"
-version = "0.1.0"
-edition = "2024"
 description = "An interactive TUI wizard that builds a nimbus-vault vault.toml; embeddable from nimbus-cli or nimbus-tui, or run standalone."
+readme = "README.md"
+documentation = "https://docs.rs/nimbus-creator"
+keywords = ["nimbus", "vault", "wizard", "ratatui", "tui"]
+categories = ["command-line-interface", "config"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 color-eyre.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
-nimbus-vault = { path = "../vault" }
-dirs = "6.0.0"
+nimbus-vault = { version = "0.2.0", path = "../vault" }
+dirs.workspace = true
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile.workspace = true

@@ -90,6 +90,25 @@ ls
 que sirve para probar el ciclo entero `put`/`get`/`delete` sin tocar el vault
 `LOCAL`.
 
+### contra `nimbus-daemon`
+
+`server.py` sigue siendo útil porque es un origin HTTP ajeno (implementa el
+contrato sin compartir código con nimbus), pero ahora el repo trae un server de
+verdad. Para probar el mismo origin contra
+[`nimbus-daemon`](https://github.com/PeachGB/nimbus/blob/main/crates/daemon/README.md):
+
+```sh
+mkdir -p /tmp/nimbus-vaults && cp crates/cli/test/fs/fs.toml /tmp/nimbus-vaults/
+cargo run -p nimbus-daemon -- --vaults /tmp/nimbus-vaults --bind 127.0.0.1:8788
+```
+
+Eso sirve `fs-vault` (el `name` de dentro de `fs.toml`, no el nombre del archivo)
+en `http://127.0.0.1:8788/v/fs-vault`. El vault cliente apunta ahí con las seis
+plantillas por defecto (`/list/{id}` y compañía). Agregale `--token s3cr3t` al
+daemon y `[origin_config.auth]` con `token_env` al vault para probar el camino
+autenticado — ver
+[`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md#authenticating-an-http-origin).
+
 ## vault-of-vault/ — `type = "vault"`
 
 Envuelve `fs/fs.toml` como origin de otro vault (`OriginVault`), para probar

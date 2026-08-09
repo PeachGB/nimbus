@@ -116,6 +116,70 @@ fn build_constructs_http_origin_with_default_base_url() {
     assert_eq!(name, "http-vault-no-base");
 }
 
+#[test]
+fn build_constructs_http_origin_with_auth() {
+    let name = "NIMBUS_TEST_CONFIG_TOKEN";
+    // The environment is process-wide, so this uses a name no other test touches.
+    unsafe { std::env::set_var(name, "s3cr3t") };
+    let (_dir, path) = write_config(
+        r#"
+        name = "http-vault-auth"
+
+        [origin_config]
+        type = "http"
+        base_url = "https://example.com"
+        list_url = "/list/{id}"
+        fetch_url = "/fetch/{id}"
+        get_url = "/get/{id}"
+        put_url = "/put/{id}"
+        send_url = "/send/{id}"
+        delete_url = "/delete/{id}"
+
+        [origin_config.auth]
+        type = "bearer"
+        token_env = "NIMBUS_TEST_CONFIG_TOKEN"
+        "#,
+    );
+
+    let (name_out, _root_id, _origin) = VaultConfig::build(path).unwrap();
+
+    assert_eq!(name_out, "http-vault-auth");
+    unsafe { std::env::remove_var(name) };
+}
+
+#[test]
+fn an_unresolvable_token_fails_when_the_vault_is_opened() {
+    // Better here, while the config is being read, than as a 401 halfway through a sync.
+    let (_dir, path) = write_config(
+        r#"
+        name = "http-vault-bad-auth"
+
+        [origin_config]
+        type = "http"
+        list_url = "/list/{id}"
+        fetch_url = "/fetch/{id}"
+        get_url = "/get/{id}"
+        put_url = "/put/{id}"
+        send_url = "/send/{id}"
+        delete_url = "/delete/{id}"
+
+        [origin_config.auth]
+        type = "bearer"
+        token_env = "NIMBUS_TEST_CONFIG_TOKEN_NEVER_SET"
+        "#,
+    );
+
+    let Err(error) = VaultConfig::build(path) else {
+        panic!("expected an error, the token can't be resolved");
+    };
+
+    let error = error.to_string();
+    assert!(
+        error.contains("NIMBUS_TEST_CONFIG_TOKEN_NEVER_SET"),
+        "{error}"
+    );
+}
+
 fn write_origin_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("origin.toml");
@@ -253,6 +317,51 @@ fn default_path_is_a_named_file_in_the_default_dir() {
 #[test]
 fn default_dir_lives_under_the_nimbus_config_home() {
     assert!(VaultConfig::default_dir().starts_with(crate::config_home()));
+}
+
+#[test]
+fn a_saved_http_config_with_auth_can_be_read_back() {
+    // TOML can't emit a plain value after a table, so `auth` being the variant's last field
+    // isn't cosmetic — writing it anywhere else makes `save` fail on a config the wizard just
+    // built.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("remote.toml");
+    let config = VaultConfig::new(
+        "remote".to_string(),
+        ObjectId::default(),
+        OriginConfig::Http {
+            base_url: Some("https://example.com".to_string()),
+            list_url: "/list/{id}".to_string(),
+            fetch_url: "/fetch/{id}".to_string(),
+            get_url: "/get/{id}".to_string(),
+            put_url: "/put/{id}".to_string(),
+            send_url: "/send/{id}".to_string(),
+            delete_url: "/delete/{id}".to_string(),
+            auth: crate::origin::http::HttpAuth::Bearer {
+                token: None,
+                token_env: Some("NIMBUS_TEST_ROUNDTRIP_TOKEN".to_string()),
+                token_file: None,
+            },
+        },
+    );
+
+    config.save(&path).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    let read_back: VaultConfig = toml::from_str(&written).unwrap();
+    match read_back.origin_config {
+        OriginConfig::Http { auth, .. } => assert_eq!(
+            auth,
+            crate::origin::http::HttpAuth::Bearer {
+                token: None,
+                token_env: Some("NIMBUS_TEST_ROUNDTRIP_TOKEN".to_string()),
+                token_file: None,
+            }
+        ),
+        _ => panic!("expected an http origin"),
+    }
+    // The unset fields don't clutter the file.
+    assert!(!written.contains("token_file"), "{written}");
 }
 
 #[test]

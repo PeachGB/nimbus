@@ -127,6 +127,9 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Constructs a new instance of [`EventHandler`] and spawns a new thread to handle events.
+    // No `Default`: constructing one spawns an event-reading thread (and, on unix, a signal
+    // watcher), which is not something a `Default::default()` should do behind the caller's back.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         let suspended = Arc::new(AtomicBool::new(false));

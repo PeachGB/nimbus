@@ -1,7 +1,7 @@
 # nimbus-core
 
-Session/vault-management logic shared by nimbus's frontends ([`nimbus-cli`](../cli) and
-[`nimbus-tui`](../tui)). Owns the `App` — registered vaults, the current vault/working directory,
+Session/vault-management logic shared by nimbus's frontends ([`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli) and
+[`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui)). Owns the `App` — registered vaults, the current vault/working directory,
 and the local staging vault — plus the on-disk config `App` is built from. Frontends drive it
 through `App`'s methods and are responsible for their own input/output loop; `nimbus-core` has no
 terminal/UI code of its own.
@@ -11,26 +11,55 @@ terminal/UI code of its own.
 - **`config.rs`** — `CliConfig`: the on-disk shape read from `<config>/.nimbus/cli_config.toml`
   (`default_local_vault`, defaulting to `true`; `local_vault_path`, defaulting to `$HOME`). The
   directory comes from `nimbus_vault::config_home()` rather than being rebuilt here, so the CLI
-  config and the vault configs written by [`nimbus-creator`](../creator) can't drift apart.
+  config and the vault configs written by [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator) can't drift apart.
   `CliConfig::load()` returns the default config if the file doesn't exist yet, rather than
   erroring.
 - **`app.rs`** — `App`: holds every registered `Vault` (by name), the special `LOCAL` vault (the
   user's own filesystem, when `default_local_vault` is enabled), the current vault/cwd, and
   vault-config paths so they can be re-registered on the next run. `App::init()` loads
-  `CliConfig`, restores previously-registered vaults from `<state>/nimbus/session.toml`, and
-  (re-)registers `LOCAL` if configured. `App::save()` writes the registered vault-config paths
-  back to that session file.
+  `CliConfig`, opens the vaults registered in `<state>/nimbus/session.toml`, and (re-)registers
+  `LOCAL` if configured. `App::save()` writes that session file back.
 
   The session path is a **field** (`state_path`), not a constant, so tests can point it at a
   scratch file. That isn't stylistic: `save()` used to write the real session file
   unconditionally, so `cargo test` rewrote the developer's own vault registry.
 
+## The session file
+
+`SavedState` holds three things: `vault_configs` (the `name → config path` registry),
+`current_vault`, and `cwd_path`. The last two are what let a one-shot `nimbus-cli ls` pick up
+where the previous `nimbus-cli cd docs` left off. Both are `#[serde(default)]`, so session files
+written before they existed still load.
+
+Restoring the directory can't happen in `init()`: turning a path back into an `ObjectId` means
+walking it with one `Vault::find` per component, which is `async` and reaches the origin, and
+`init()` is a sync constructor. So `init()` parks what it read in a private field and
+**`App::restore_session()`** (async) applies it. Frontends that want the behaviour call it right
+after `init()`; ones that don't (the TUI opens on its own vault picker) simply don't.
+
+Two rules protect the session from being destroyed by a transient failure:
+
+- A vault whose config **doesn't build right now** is warned about and skipped for the session,
+  but stays in the registry. Config building can fail for reasons that aren't permanent — an
+  `[origin_config.auth]` whose `token_env` isn't exported in this shell — and dropping the entry
+  would have the next `save()` unregister the vault for good. `open_vaults` therefore borrows
+  the registry instead of consuming it, and `forget_vault` checks the *registry*, so a vault that
+  can't be opened can still be unregistered.
+- `save()` leaves a session that was read but never restored (a frontend that skips
+  `restore_session`) exactly as it found it, rather than overwriting it with the root. Otherwise
+  opening the TUI would wipe the CLI's position.
+
+`restore_session` degrades rather than failing: a vault that's gone leaves you at the app root, a
+directory that's gone leaves you at that vault's root (`select` has already put you there), each
+with a warning on stderr.
+
 ## Commands exposed by `App`
 
 `ls`, `vaults`, `select`, `new_vault`, `forget_vault`, `cd` (plus `cd_completions`, used by
 `nimbus-cli`'s tab completion), `put`, `get`, `mkdir`, `touch`, `rename`, `cp`, `mv`, `delete`,
-`push`, `pull`, `exit`. See [`crates/cli/README.md`](../cli/README.md) for the user-facing
-command reference these map to.
+`push`, `pull`, `exit`. See [`crates/cli/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/README.md) for the user-facing
+command reference these map to. `restore_session` sits alongside them but isn't a user command —
+it's the async half of `init`, described above.
 
 `exit` is the odd one out: it `save()`s and then calls `std::process::exit(0)` itself, rather
 than reporting back that the frontend should shut down. `nimbus-tui` therefore never routes its
@@ -44,7 +73,7 @@ last two are what let the TUI open a file in an editor and save the result back.
   `Vault::find`, `get` its `Object`, `put` it under the resolved destination, and — for `Leaf`s
   only — `fetch` the payload from the source and `send` it to whatever `Object` `put` returned
   (not the pre-`put` object; see
-  [`crates/vault/README.md`](../vault/README.md#the-put-contract)).
+  [`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md#the-put-contract)).
 - `put`/`get` additionally resolve local-filesystem paths through `resolve_local_path`, which
   canonicalizes the input and rejects anything outside the configured local root — this is the
   boundary that keeps `LOCAL` from touching files outside `local_vault_path`. `get` with **no**
@@ -93,8 +122,8 @@ standing in.
 - **`new_vault`** refuses a name already registered to a *different* config path — silently
   replacing the entry would leave the original vault unreachable, with nothing pointing at its
   data. Re-registering the **same** path is allowed, and is how an edit to a config file gets
-  picked up. `forget_vault` frees a name; it is registry bookkeeping only and never touches the
-  vault's config file or the data in its origin.
+  picked up (including fixing one that failed to open). `forget_vault` frees a name; it is
+  registry bookkeeping only and never touches the vault's config file or the data in its origin.
 
 ## Commands
 
@@ -104,3 +133,8 @@ cargo test -p nimbus-core
 cargo clippy -p nimbus-core -- -D warnings
 cargo fmt -p nimbus-core
 ```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](https://github.com/PeachGB/nimbus/blob/main/crates/core/LICENSE-APACHE) or
+[MIT license](https://github.com/PeachGB/nimbus/blob/main/crates/core/LICENSE-MIT) at your option — the same terms as the rest of the workspace.
