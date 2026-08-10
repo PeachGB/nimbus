@@ -18,8 +18,8 @@ homepage.workspace = true
 [dependencies]
 clap.workspace = true
 tokio.workspace = true
-nimbus-core = { version = "0.2.0", path = "../core/" }
-nimbus-creator = { version = "0.2.0", path = "../creator/" }
+nimbus-core = { version = "0.2.1", path = "../core/" }
+nimbus-creator = { version = "0.2.1", path = "../creator/" }
 ratatui.workspace = true
 anyhow.workspace = true
 rustyline = "18.0.1"

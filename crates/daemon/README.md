@@ -4,6 +4,8 @@ Serves a directory of vault configs over HTTP, so another nimbus can mount them 
 
 It is a *server*, not a scheduler — it doesn't sync anything on its own. Periodic background `pull`/`push` (the original sketch for this crate) remains unimplemented.
 
+A daemon on its own has no client. [`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui) (`cargo install nimbus-tui`) is the quickest one to point at it: an `http` vault config aimed at `http://host:8080/v/<name>` and the served vault browses like a local directory.
+
 ## Running it
 
 ```bash

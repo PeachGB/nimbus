@@ -6,29 +6,121 @@ arbitrary shell command, or another vault. Syncing "a folder on disk" and "objec
 behind a REST API" run through the exact same code path, because both are just
 implementations of one `Origin` trait.
 
-Two frontends drive it: [`nimbus-cli`](crates/cli/README.md), which runs a single
-command or opens an interactive REPL, and [`nimbus-tui`](crates/tui/README.md), a
-ranger-style file manager. [`nimbus-daemon`](crates/daemon/README.md) is the other
-end of the wire: it serves a directory of vaults over HTTP, so one machine can hold
-the data and the rest mount it through the `http` origin.
+The quickest way to see what that means is the file manager:
+
+```bash
+cargo install nimbus-tui && nimbus-tui
+```
+
+![nimbus-tui's vault list](https://raw.githubusercontent.com/PeachGB/nimbus/main/pictures/nimbus-tui-vaults.png)
+
+Every vault in that list is a different backend — a local directory, a
+[`nimbus-daemon`](crates/daemon/README.md) over HTTP, a shell script, a vault
+wrapping another vault. Open one and the backend stops being visible:
+
+![browsing cmd-vault, a vault backed by shell commands](https://raw.githubusercontent.com/PeachGB/nimbus/main/pictures/nimbus-tui-cmd-vault.png)
+
+That's `cmd-vault`, whose every operation is a shell command named in a TOML file —
+a POSIX script for `list`/`get`, a plain `cat` to read an object, an `rm` to delete
+one. It still browses as a tree with sizes and modified times, and the same keys
+move things around inside it.
+
+![browsing LOCAL, with README.txt on the clipboard](https://raw.githubusercontent.com/PeachGB/nimbus/main/pictures/nimbus-tui-local.png)
+
+And that's `LOCAL` — your own filesystem, registered by default and rooted at
+`$HOME`, so a fresh install is already a working terminal file manager with no
+vaults configured at all. The `[copy: README.txt]` in the corner is the clipboard:
+yank in one vault, walk to another, paste, and the transfer between two unrelated
+origins is the same three keys it would be inside one directory.
+
+## Install
+
+All six crates are published on [crates.io](https://crates.io/search?q=nimbus) and
+install independently — you only need the ones you'll use:
+
+```bash
+cargo install nimbus-tui       # the file manager — start here
+cargo install nimbus-cli       # the REPL / one-shot command
+cargo install nimbus-daemon    # the HTTP server
+cargo install nimbus-creator   # the vault wizard on its own
+```
+
+To use the libraries from your own crate:
+
+```bash
+cargo add nimbus-vault         # the foundation: the vault/origin model
+cargo add nimbus-core          # the app layer on it: registry, session, commands
+```
+
+Or build the whole workspace from a checkout — it's plain Cargo, no extra tooling:
+
+```bash
+cargo build --release
+```
+
+Build a single crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
+Everything here needs **Rust 1.88** or newer (`rust-version` in the workspace
+manifest); that floor comes from the dependencies, not from the code.
+
+## The crates
 
 This repo is a Cargo workspace with six crates:
 
-| Crate            | Status  | What it is                                              |
-|------------------|---------|----------------------------------------------------------|
-| `nimbus-vault`   | working | The core library: `Object`, `Vault`, `Origin` and its four implementations. |
-| `nimbus-core`    | working | Session/vault-management logic (`App`) shared by nimbus's frontends — see [`crates/core/README.md`](crates/core/README.md). |
-| `nimbus-creator` | working | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend — see [`crates/creator/README.md`](crates/creator/README.md). |
-| `nimbus-cli`     | working | One command per invocation, or an interactive REPL, built on `nimbus-core`/`nimbus-vault` — see [`crates/cli/README.md`](crates/cli/README.md). |
-| `nimbus-tui`     | working | A ranger-style terminal file manager over vaults — see [`crates/tui/README.md`](crates/tui/README.md). |
-| `nimbus-daemon`  | working | Serves a directory of vaults over HTTP, for the `http` origin to mount — see [`crates/daemon/README.md`](crates/daemon/README.md). |
+| Crate | Install | What it is |
+|-------|---------|------------|
+| [`nimbus-tui`](crates/tui/README.md) | `cargo install nimbus-tui` | A ranger-style terminal file manager over vaults, and a usable one over plain `$HOME` with no vaults at all. |
+| [`nimbus-cli`](crates/cli/README.md) | `cargo install nimbus-cli` | One command per invocation, or an interactive REPL. |
+| [`nimbus-daemon`](crates/daemon/README.md) | `cargo install nimbus-daemon` | Serves a directory of vaults over HTTP, for the `http` origin to mount. |
+| [`nimbus-creator`](crates/creator/README.md) | `cargo install nimbus-creator` | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend. |
+| [`nimbus-vault`](crates/vault/README.md) | `cargo add nimbus-vault` | The library everything else is built on: `Object`, `Vault`, `Origin` and its four implementations. |
+| [`nimbus-core`](crates/core/README.md) | `cargo add nimbus-core` | The shared core of the frontends above: `App`, holding the vault registry, current vault/cwd, local staging vault, and session persistence. |
 
-The rest of this document focuses mostly on `nimbus-vault`, since it's the library
-every other crate builds on. See [`crates/cli/README.md`](crates/cli/README.md) for
-`nimbus-cli`'s own commands, configuration, and session-persistence model,
-[`crates/tui/README.md`](crates/tui/README.md) for the file manager's keys and
-behaviour, and [`crates/core/README.md`](crates/core/README.md) for the `App` logic
-both frontends are built on.
+The two libraries are two layers, and which one you want depends on how far up you
+start. `nimbus-vault` is the foundation: the vault/origin model itself, the only
+code that touches a backend, and what every other crate here is built on. A program
+that just needs to read and write objects somewhere depends on it and nothing else.
+
+`nimbus-core` is the reusable core of the *applications* built on that model —
+everything a nimbus frontend does that isn't drawing to a screen. A registry of
+named vaults, which one is selected and where you are inside it, the `vault:path`
+spec, one implementation of each command (`cd`, `cp`, `mv`, `push`, `pull`, ...),
+and the session that carries all of it between runs. `nimbus-cli` and `nimbus-tui`
+are both shells around it, which is why a `cp` means the same thing in each.
+
+Which is also an invitation: if you want a nimbus frontend that doesn't exist yet —
+a GUI, a web UI, an editor plugin — `nimbus-core` is there to be built on, and that
+separation is why it's a published crate rather than an internal module. It owes you
+every operation and none of the interface; you owe it an input loop and something
+that draws a `Vec<Object>`. See [`crates/core/README.md`](crates/core/README.md).
+
+Both frontends embed the creator wizard already (`n` in the TUI, `new` with no path
+in the CLI), so installing `nimbus-creator` separately is only useful for building a
+`vault.toml` without them.
+
+## TUI
+
+`nimbus-tui` is a ranger-style file manager over the same vaults: a list of
+registered vaults, and inside each one a browsable object tree with size and
+modified-time columns.
+
+```bash
+cargo install nimbus-tui   # then: nimbus-tui
+cargo run -p nimbus-tui    # or, from a checkout of the workspace
+```
+
+Arrow keys or `hjkl` to navigate, `Space` to mark, `y`/`d`/`p` to copy/cut/paste
+(navigate to another vault before pasting to cross vaults), `a`/`t`/`c`/`x` to
+create a directory, create a file, rename, and delete, `/` to filter, `s`/`S` to
+sort, `n` to run the vault-creation wizard, and `?` for the full help overlay
+(`c` prompts with the current name pre-filled, so renaming is an edit not a retype).
+`:` opens a command line accepting the same commands as `nimbus-cli`.
+
+Pressing `Enter` on a file fetches it, opens it with the OS default handler (or
+`$EDITOR`), and writes any edit back to the object's origin on exit. `e` opens it
+in `$EDITOR` regardless of what the OS would have picked, and `r` runs it as a
+program in the terminal. See
+[`crates/tui/README.md`](crates/tui/README.md) for the full key reference and the
+known limits (operations block the event loop; there's no undo or trash).
 
 ## The model
 
@@ -141,33 +233,6 @@ let root = vault.find("/".into()).await?;
 let children = vault.list(root).await?;
 ```
 
-## Installation
-
-The three binaries are published on crates.io and install independently — you only
-need the ones you'll use:
-
-```bash
-cargo install nimbus-cli       # the REPL / one-shot command
-cargo install nimbus-tui       # the file manager
-cargo install nimbus-daemon    # the HTTP server
-```
-
-To use the library from your own crate:
-
-```bash
-cargo add nimbus-vault
-```
-
-Or build the whole workspace from a checkout — it's plain Cargo, no extra tooling:
-
-```bash
-cargo build --release
-```
-
-Build a single crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
-Everything here needs **Rust 1.88** or newer (`rust-version` in the workspace
-manifest); that floor comes from the dependencies, not from the code.
-
 ## CLI
 
 `nimbus-cli` manages a set of named vaults plus a special local vault (your own
@@ -175,8 +240,9 @@ filesystem, named `LOCAL`), and moves objects between them. Give it a command an
 runs that one command and exits; give it nothing and it opens an interactive REPL:
 
 ```bash
-nimbus-cli ls          # runs one command, exits with its status
-nimbus-cli             # opens the REPL
+cargo install nimbus-cli   # then:
+nimbus-cli ls              # runs one command, exits with its status
+nimbus-cli                 # opens the REPL
 ```
 
 Either way the session — the registry of vaults, the selected vault, and the
@@ -224,30 +290,6 @@ the local-vault security boundary, and session persistence — the REPL logic it
 a fairly thin binary over it. `nimbus new` with no path launches an interactive
 vault-builder wizard from [`nimbus-creator`](crates/creator/README.md).
 
-## TUI
-
-`nimbus-tui` is a ranger-style file manager over the same vaults: a list of
-registered vaults, and inside each one a browsable object tree with size and
-modified-time columns.
-
-```bash
-cargo run -p nimbus-tui
-```
-
-Arrow keys or `hjkl` to navigate, `Space` to mark, `y`/`d`/`p` to copy/cut/paste
-(navigate to another vault before pasting to cross vaults), `a`/`t`/`c`/`x` to
-create a directory, create a file, rename, and delete, `/` to filter, `s`/`S` to
-sort, `n` to run the vault-creation wizard, and `?` for the full help overlay
-(`c` prompts with the current name pre-filled, so renaming is an edit not a retype).
-`:` opens a command line accepting the same commands as `nimbus-cli`.
-
-Pressing `Enter` on a file fetches it, opens it with the OS default handler (or
-`$EDITOR`), and writes any edit back to the object's origin on exit. `e` opens it
-in `$EDITOR` regardless of what the OS would have picked, and `r` runs it as a
-program in the terminal. See
-[`crates/tui/README.md`](crates/tui/README.md) for the full key reference and the
-known limits (operations block the event loop; there's no undo or trash).
-
 ## Serving vaults over HTTP
 
 `nimbus-daemon` serves a directory of vault configs over HTTP, which is what the
@@ -255,6 +297,7 @@ known limits (operations block the event loop; there's no undo or trash).
 vault and use the same `ls`/`get`/`put`/`push`/`pull` they'd use on a local folder.
 
 ```bash
+cargo install nimbus-daemon   # then:
 nimbus-daemon --vaults ./vaults --bind 127.0.0.1:8080
 ```
 
@@ -436,7 +479,7 @@ workspace root and every crate would ship the root README instead of its own.
 
 Bumping a release means editing the one `version` at the root and the `version =`
 on each inter-crate dependency (they're pinned exactly, e.g.
-`nimbus-vault = { version = "0.2.0", path = "../vault" }` — the `path` is what a
+`nimbus-vault = { version = "0.2.1", path = "../vault" }` — the `path` is what a
 workspace build uses, the `version` is what a crates.io consumer gets).
 
 Publishing order is forced by the dependency graph, and each crate has to be live on
@@ -454,6 +497,12 @@ cargo publish -p nimbus-daemon     # → vault
 `cargo package --list -p <crate>` shows exactly what would be uploaded, which is
 worth a look before the first publish of any crate — Cargo includes every tracked
 file next to the manifest, not just `src/`.
+
+Images in a README need absolute `raw.githubusercontent.com` URLs. `pictures/` is at
+the workspace root, so it's in no crate's package, and crates.io renders a README
+with no repo around it regardless — a relative path would work on GitHub and break
+on the published crate. Those URLs resolve against `main`, so a new screenshot is
+only live once pushed.
 
 ## Design principles
 

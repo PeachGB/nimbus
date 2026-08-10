@@ -6,6 +6,47 @@ and the local staging vault — plus the on-disk config `App` is built from. Fro
 through `App`'s methods and are responsible for their own input/output loop; `nimbus-core` has no
 terminal/UI code of its own.
 
+```bash
+cargo add nimbus-core
+```
+
+## Where this sits
+
+[`nimbus-vault`](https://github.com/PeachGB/nimbus/tree/main/crates/vault) is the foundation — the vault/origin model, the only code that reaches a
+backend, and what everything else in the workspace is built on. This crate is the layer above
+it: the reusable core of the *applications* built on that model, meaning everything a nimbus
+frontend does that isn't drawing to a screen.
+
+Concretely, that's a registry of named vaults, which one is selected and where you are inside
+it, the `vault:path` spec that addresses any object in any of them, one implementation of each
+command (`cd`, `ls`, `cp`, `mv`, `put`, `get`, `mkdir`, `rename`, `delete`, `push`, `pull`), and
+the session file carrying all of it between runs.
+
+[`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli) and [`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui) are both shells around this, which is why a `cp` means
+the same thing in each — there's one implementation, not two that drifted. `App` accommodates
+both by exposing two overlapping surfaces: the command methods above, mirroring what a user
+types, and data-returning ones (`vault_names`, `list_cwd`, `fetch_object_bytes`,
+`write_object_bytes`) for a frontend that renders rather than prints. A third frontend — a GUI,
+a web UI, an editor plugin — starts here for the same reason.
+
+## Build a frontend on it
+
+If that's what you're here for: please do, it's the reason this crate is split out at all.
+
+A frontend owes `App` two things — an input loop, and something that displays a `Vec<Object>`.
+Everything under that line already exists and is shared: resolving a `vault:path` to an object,
+streaming bytes between two unrelated origins, the local-vault boundary, the vault registry,
+session persistence. Nothing here assumes a terminal or pulls in one, so a GUI or an HTTP
+service is as ordinary a consumer as another TUI is.
+
+[`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli) is the smaller of the two existing frontends and the better one to read first —
+it's close to a direct mapping from a parsed command to an `App` method. [`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui) shows
+the rendering side, including how to drive an embedded [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator) wizard from your
+own event loop.
+
+Issues and pull requests are welcome, and an `App` method that's awkward to drive from outside
+a terminal is a bug worth reporting — the whole point of the split is that it shouldn't be.
+
 ## What's here
 
 - **`config.rs`** — `CliConfig`: the on-disk shape read from `<config>/.nimbus/cli_config.toml`

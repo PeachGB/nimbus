@@ -7,13 +7,35 @@ directory, an HTTP API, a shell command, or another vault. Every operation goes 
 same code path.
 
 ```sh
-cargo install nimbus-tui   # then: nimbus-tui
+cargo install nimbus-tui   # from crates.io — then: nimbus-tui
 cargo run -p nimbus-tui    # or, from a checkout of the workspace
 ```
+
+![nimbus-tui's vault list](https://raw.githubusercontent.com/PeachGB/nimbus/main/pictures/nimbus-tui-vaults.png)
 
 The vault list comes up first: every registered vault, with the root-level keybinding hints along
 the bottom. Entering one shows its objects with size and modified-time columns, directories
 grouped first and accented so they read at a glance.
+
+![browsing cmd-vault, a vault backed by shell commands](https://raw.githubusercontent.com/PeachGB/nimbus/main/pictures/nimbus-tui-cmd-vault.png)
+
+Which backend a vault happens to use stops mattering at that point. The one above is a
+`command` origin — a POSIX script answers `list` and `get`, a `cat` reads an object, an `rm`
+deletes one — and it browses exactly like the local directory below it.
+
+## Just a file manager
+
+![browsing LOCAL, with README.txt on the clipboard](https://raw.githubusercontent.com/PeachGB/nimbus/main/pictures/nimbus-tui-local.png)
+
+Nothing has to be configured first. `LOCAL` is your own filesystem, registered automatically and
+rooted at `$HOME` (`default_local_vault` and `local_vault_path` in `nimbus-core`'s
+`cli_config.toml` change both), so a fresh install is already a working terminal file manager:
+navigate, mark, copy, move, rename, create, delete, sort, filter, open files in `$EDITOR`, run
+them. Every key below works inside `LOCAL` with no vault registered at all.
+
+Registering vaults is what turns it into a sync tool, and it's opt-in — add one when there's
+somewhere else the files should go. `default_local_vault = false` goes the other way and keeps it
+off your filesystem entirely.
 
 ## Keys
 
@@ -57,6 +79,10 @@ when nothing is marked. Marks and filters are dropped when you leave the directo
 
 The clipboard holds fully-qualified `vault:/path` specs, so navigating to a **different vault**
 before pasting is what makes a cross-vault copy or move. Directories are copied recursively.
+
+While something is held, the footer leads with `[copy: <what>]` or `[cut: <what>]` — the pending
+`p` is the one piece of state you can't see anywhere else in the list, and it survives walking
+out of the vault you yanked from, which is exactly when you need reminding of it.
 
 ### Create, rename & delete
 

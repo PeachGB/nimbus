@@ -16,7 +16,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-nimbus-vault = { version = "0.2.0", path = "../vault/" }
+nimbus-vault = { version = "0.2.1", path = "../vault/" }
 anyhow.workspace = true
 bytes.workspace = true
 futures.workspace = true

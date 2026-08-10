@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/cli", "crates/core", "crates/daemon", "crates/tui", "crates/vault","crates/creator"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 authors = ["PeachGB <arianmateos@gmail.com>"]

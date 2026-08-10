@@ -4,6 +4,8 @@ An interactive shell for managing **vaults** — commands to navigate, transfer,
 
 A vault is a logical tree of objects (folders and files, conceptually) backed by a pluggable **origin** — the actual backend the data lives in. This CLI is a thin frontend over [`nimbus-core`](https://github.com/PeachGB/nimbus/tree/main/crates/core) (which owns the `App`/session state) and [`nimbus-vault`](https://github.com/PeachGB/nimbus/tree/main/crates/vault) (which implements the vault/origin model and does the actual work).
 
+[`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui) (`cargo install nimbus-tui`) is the other frontend over the same `App`: a ranger-style file manager, which shows a whole vault at once where this shows one command's worth. It's the easier one to start from; this one is where scripting and one-shot commands live.
+
 ## How it works
 
 `nimbus-cli` runs either way round: pass a command and it runs that one command and exits, pass nothing and it opens a `rustyline`-backed REPL (tab completion for subcommand names and `cd`'s argument).

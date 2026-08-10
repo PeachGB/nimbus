@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "nimbus-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "nimbus-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "nimbus-creator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "color-eyre",
  "crossterm",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "nimbus-daemon"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "nimbus-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "nimbus-vault"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",

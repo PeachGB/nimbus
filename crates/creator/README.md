@@ -1,6 +1,18 @@
 # nimbus-creator
 
-An interactive Ratatui wizard that builds a [`nimbus-vault`](https://github.com/PeachGB/nimbus/tree/main/crates/vault) `vault.toml`. Embeddable from another app that's already driving its own terminal ([`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli)'s `new` with no path and [`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui)'s `n` key both run it in-process), or runnable standalone via `nimbus-creator`'s own binary.
+An interactive Ratatui wizard that builds a [`nimbus-vault`](https://github.com/PeachGB/nimbus/tree/main/crates/vault) `vault.toml`. Embeddable from another app that's already driving its own terminal ([`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli)'s `new` with no path and [`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui)'s `n` key both run it in-process), or runnable standalone via its own binary.
+
+Reaching for it directly is the unusual case: [`nimbus-tui`](https://github.com/PeachGB/nimbus/tree/main/crates/tui)'s `n` key runs this wizard and registers what it writes, which is the whole job in one step.
+
+## Installing it standalone
+
+```bash
+cargo install nimbus-creator          # from crates.io
+cargo install --path crates/creator   # or from a checkout of the workspace
+cargo add nimbus-creator              # or embed it in your own Ratatui app
+```
+
+Standalone, the binary writes a `vault.toml` and stops there — registering it is a frontend's job (`new <path>` in [`nimbus-cli`](https://github.com/PeachGB/nimbus/tree/main/crates/cli)).
 
 ## How it works
 
