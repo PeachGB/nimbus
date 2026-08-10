@@ -264,14 +264,7 @@ would quietly rejoin the next bulk operation.
   streaming it to the temp copy, so opening a large file costs its full size in memory.
 - No undo and no trash.
 
-## Commands
-
-```bash
-cargo check -p nimbus-tui
-cargo test -p nimbus-tui
-cargo clippy -p nimbus-tui -- -D warnings
-cargo fmt -p nimbus-tui
-```
+## Testing against other origins
 
 To drive it against origins other than a plain filesystem, see
 [`crates/cli/test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md), which holds a vault config per origin type (`fs`,

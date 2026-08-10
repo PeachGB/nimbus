@@ -45,16 +45,6 @@ Note that the file is written *before* the caller registers it, so a name that c
 - `command` — `list_cmd`, `fetch_cmd`, `get_cmd`, `put_cmd`, `send_cmd`, `delete_cmd`, `extras` (optional, `k=v,k2=v2` syntax).
 - `vault` — `path` (inner vault config path).
 
-## Commands
-
-```bash
-cargo check -p nimbus-creator
-cargo test -p nimbus-creator
-cargo clippy -p nimbus-creator -- -D warnings
-cargo fmt -p nimbus-creator
-cargo run -p nimbus-creator --bin creator   # run the wizard standalone
-```
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://github.com/PeachGB/nimbus/blob/main/crates/creator/LICENSE-APACHE) or

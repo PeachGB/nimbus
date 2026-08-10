@@ -468,42 +468,6 @@ nimbus />> new crates/cli/test/fs/fs.toml
 The configs carry **absolute** paths, so they need updating if the repo moves — see
 that README for the per-origin walkthrough.
 
-## Releasing
-
-All six crates share one version, set once in `[workspace.package]` at the root and
-inherited with `version.workspace = true`; the same goes for `edition`,
-`rust-version`, `authors`, `license`, `repository`, and `homepage`. Each crate sets
-its own `description`, `keywords`, `categories`, and `readme` — `readme` in
-particular *cannot* be inherited, since an inherited one resolves against the
-workspace root and every crate would ship the root README instead of its own.
-
-Bumping a release means editing the one `version` at the root and the `version =`
-on each inter-crate dependency (they're pinned exactly, e.g.
-`nimbus-vault = { version = "0.2.1", path = "../vault" }` — the `path` is what a
-workspace build uses, the `version` is what a crates.io consumer gets).
-
-Publishing order is forced by the dependency graph, and each crate has to be live on
-crates.io before the next one can be verified against it:
-
-```bash
-cargo publish -p nimbus-vault      # depends on nothing in-tree
-cargo publish -p nimbus-core       # → vault
-cargo publish -p nimbus-creator    # → vault
-cargo publish -p nimbus-cli        # → core, creator
-cargo publish -p nimbus-tui        # → core, creator, vault
-cargo publish -p nimbus-daemon     # → vault
-```
-
-`cargo package --list -p <crate>` shows exactly what would be uploaded, which is
-worth a look before the first publish of any crate — Cargo includes every tracked
-file next to the manifest, not just `src/`.
-
-Images in a README need absolute `raw.githubusercontent.com` URLs. `pictures/` is at
-the workspace root, so it's in no crate's package, and crates.io renders a README
-with no repo around it regardless — a relative path would work on GitHub and break
-on the published crate. Those URLs resolve against `main`, so a new screenshot is
-only live once pushed.
-
 ## Design principles
 
 - **Lazy loading** — `Object` only ever holds metadata; content is fetched on

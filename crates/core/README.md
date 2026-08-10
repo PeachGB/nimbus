@@ -166,15 +166,6 @@ standing in.
   picked up (including fixing one that failed to open). `forget_vault` frees a name; it is
   registry bookkeeping only and never touches the vault's config file or the data in its origin.
 
-## Commands
-
-```bash
-cargo check -p nimbus-core
-cargo test -p nimbus-core
-cargo clippy -p nimbus-core -- -D warnings
-cargo fmt -p nimbus-core
-```
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://github.com/PeachGB/nimbus/blob/main/crates/core/LICENSE-APACHE) or

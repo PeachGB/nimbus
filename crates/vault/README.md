@@ -194,15 +194,6 @@ path = "inner.toml"
 
 These are `pub`, so external code (e.g. a custom `Origin`) can reuse the same keys instead of re-hardcoding them.
 
-## Commands
-
-```bash
-cargo check -p nimbus-vault
-cargo test -p nimbus-vault
-cargo clippy -p nimbus-vault -- -D warnings
-cargo fmt -p nimbus-vault
-```
-
 ## Status
 
 135 unit tests (plus 40 doctests) covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths, plus authentication: every operation carrying the header — one mock per operation, so one that forgot would fail rather than pass unnoticed — no header at all when no credentials are configured, the 401 message, and each way a token can be resolved or refused), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
