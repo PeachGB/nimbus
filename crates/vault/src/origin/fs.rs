@@ -199,9 +199,18 @@ impl Origin for OriginFileSystem {
                 })?;
             }
             Object::Leaf { .. } => {
-                fs::File::create(&path).await.map_err(|e| {
-                    VaultError::OriginError(format!("Failed to create file: {}", e))
-                })?;
+                // Create the file if missing, but never truncate an existing one: contents are
+                // replaced atomically by `send`, so an overwrite must keep serving the old
+                // bytes until the new ones are renamed into place.
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+                    .await
+                    .map_err(|e| {
+                        VaultError::OriginError(format!("Failed to create file: {}", e))
+                    })?;
             }
             Object::Root { .. } => Err(VaultError::OriginError(
                 "Cannot put root object".to_string(),

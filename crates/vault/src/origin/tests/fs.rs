@@ -294,3 +294,22 @@ async fn list_hides_in_flight_temp_files() {
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].get_name(), "a.txt");
 }
+
+#[tokio::test]
+async fn put_does_not_truncate_existing_file() {
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("file.txt"), b"keep me")
+        .await
+        .unwrap();
+    let origin = origin_at(dir.path().to_path_buf());
+    let mut object = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("file.txt"),
+        meta: Metadata::new(),
+    };
+
+    origin.put(&mut object, &ObjectId::from("")).await.unwrap();
+
+    let contents = tokio::fs::read(dir.path().join("file.txt")).await.unwrap();
+    assert_eq!(contents, b"keep me");
+}
