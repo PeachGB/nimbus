@@ -224,3 +224,73 @@ async fn delete_returns_not_found_for_missing_path() {
     let result = origin.delete(&ObjectId::from("missing")).await;
     assert!(matches!(result, Err(VaultError::NotFound(_))));
 }
+
+#[tokio::test]
+async fn send_failure_leaves_existing_file_untouched() {
+    use futures::stream;
+
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("file.txt"), b"original")
+        .await
+        .unwrap();
+    let origin = origin_at(dir.path().to_path_buf());
+    let object = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("file.txt"),
+        meta: Metadata::new(),
+    };
+    let payload: ByteStream = Box::pin(stream::iter(vec![
+        Ok(bytes::Bytes::from_static(b"partial ")),
+        Err(VaultError::OriginError("boom".to_string())),
+    ]));
+
+    assert!(origin.send(&object, payload).await.is_err());
+
+    let contents = tokio::fs::read(dir.path().join("file.txt")).await.unwrap();
+    assert_eq!(contents, b"original");
+    // No temp file left behind.
+    let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+    let mut names = Vec::new();
+    while let Some(e) = entries.next_entry().await.unwrap() {
+        names.push(e.file_name().to_string_lossy().into_owned());
+    }
+    assert_eq!(names, vec!["file.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn send_overwrites_existing_file() {
+    use futures::stream;
+
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("file.txt"), b"a much longer original")
+        .await
+        .unwrap();
+    let origin = origin_at(dir.path().to_path_buf());
+    let object = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("file.txt"),
+        meta: Metadata::new(),
+    };
+    let payload: ByteStream = Box::pin(stream::iter(vec![Ok(bytes::Bytes::from_static(b"new"))]));
+
+    origin.send(&object, payload).await.unwrap();
+
+    let contents = tokio::fs::read(dir.path().join("file.txt")).await.unwrap();
+    assert_eq!(contents, b"new");
+}
+
+#[tokio::test]
+async fn list_hides_in_flight_temp_files() {
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("a.txt"), b"x")
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join(format!("{TEMP_PREFIX}a.txt.1-0")), b"y")
+        .await
+        .unwrap();
+    let origin = origin_at(dir.path().to_path_buf());
+
+    let objects = origin.list(&ObjectId::from("")).await.unwrap();
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].get_name(), "a.txt");
+}
