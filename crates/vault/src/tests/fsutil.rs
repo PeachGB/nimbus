@@ -82,3 +82,59 @@ fn temp_sibling_is_hidden_unique_and_in_the_same_directory() {
             .starts_with(TEMP_PREFIX)
     );
 }
+
+#[test]
+fn read_secret_drops_trailing_newlines_only() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("token");
+    for (written, read) in [
+        ("s3cr3t\r\n", "s3cr3t"),
+        ("s3cr3t\n\n", "s3cr3t"),
+        ("  s3 cr3t\n", "  s3 cr3t"),
+    ] {
+        std::fs::write(&path, written).unwrap();
+        assert_eq!(read_secret(&path).unwrap(), read, "{written:?}");
+    }
+}
+
+#[test]
+fn read_secret_refuses_an_empty_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("token");
+    for written in ["", "\n"] {
+        std::fs::write(&path, written).unwrap();
+        let error = read_secret(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{written:?}");
+    }
+}
+
+#[test]
+fn read_secret_reports_a_missing_file() {
+    let dir = tempdir().unwrap();
+    let error = read_secret(&dir.path().join("missing")).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn resolve_against_leaves_an_absolute_path_untouched() {
+    let resolved = resolve_against(Path::new("/etc/nimbus"), PathBuf::from("/srv/data"));
+    assert_eq!(resolved, PathBuf::from("/srv/data"));
+}
+
+#[test]
+fn resolve_against_joins_a_relative_path_onto_the_dir() {
+    let resolved = resolve_against(Path::new("/etc/nimbus"), PathBuf::from("../data"));
+    assert_eq!(resolved, PathBuf::from("/etc/nimbus/../data"));
+}
+
+#[test]
+fn config_dir_of_a_bare_file_name_is_the_cwd() {
+    let dir = config_dir(Path::new("x.toml")).unwrap();
+    assert_eq!(dir, std::env::current_dir().unwrap());
+}
+
+#[test]
+fn config_dir_of_an_absolute_path_is_its_parent() {
+    let dir = config_dir(Path::new("/etc/nimbus/x.toml")).unwrap();
+    assert_eq!(dir, PathBuf::from("/etc/nimbus"));
+}

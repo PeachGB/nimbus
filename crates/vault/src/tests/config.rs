@@ -338,6 +338,7 @@ fn a_saved_http_config_with_auth_can_be_read_back() {
             send_url: "/send/{id}".to_string(),
             delete_url: "/delete/{id}".to_string(),
             rename_url: None,
+            tls: None,
             auth: crate::origin::http::HttpAuth::Bearer {
                 token: None,
                 token_env: Some("NIMBUS_TEST_ROUNDTRIP_TOKEN".to_string()),
@@ -351,13 +352,16 @@ fn a_saved_http_config_with_auth_can_be_read_back() {
     let written = std::fs::read_to_string(&path).unwrap();
     let read_back: VaultConfig = toml::from_str(&written).unwrap();
     match read_back.origin_config {
-        OriginConfig::Http { auth, .. } => assert_eq!(
-            auth,
-            crate::origin::http::HttpAuth::Bearer {
-                token: None,
-                token_env: Some("NIMBUS_TEST_ROUNDTRIP_TOKEN".to_string()),
-                token_file: None,
-            }
+        OriginConfig::Http { auth, .. } => assert!(
+            matches!(
+                &auth,
+                crate::origin::http::HttpAuth::Bearer {
+                    token: None,
+                    token_env: Some(name),
+                    token_file: None,
+                } if name == "NIMBUS_TEST_ROUNDTRIP_TOKEN"
+            ),
+            "{auth:?}"
         ),
         _ => panic!("expected an http origin"),
     }
@@ -421,6 +425,7 @@ fn save_makes_a_config_holding_a_literal_token_private() {
         send_url: "/send/{id}".to_string(),
         delete_url: "/delete/{id}".to_string(),
         rename_url: None,
+        tls: None,
         auth,
     };
 
@@ -429,7 +434,7 @@ fn save_makes_a_config_holding_a_literal_token_private() {
         "s".to_string(),
         ObjectId::default(),
         http(crate::origin::http::HttpAuth::Bearer {
-            token: Some("hunter2".to_string()),
+            token: Some("hunter2".into()),
             token_env: None,
             token_file: None,
         }),
@@ -474,4 +479,405 @@ fn save_replaces_an_existing_config_without_leaving_temp_files() {
             .contains("name = \"v\"")
     );
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+// --- [origin_config.tls] ---
+
+/// An http vault config for `base_url`, followed by `tls_table` verbatim.
+fn http_config_with_tls(base_url: &str, tls_table: &str) -> String {
+    format!(
+        r#"
+        name = "tls-vault"
+
+        [origin_config]
+        type = "http"
+        base_url = "{base_url}"
+        list_url = "/list/{{id}}"
+        fetch_url = "/fetch/{{id}}"
+        get_url = "/get/{{id}}"
+        put_url = "/put/{{id}}"
+        send_url = "/send/{{id}}"
+        delete_url = "/delete/{{id}}"
+
+        {tls_table}
+        "#
+    )
+}
+
+#[test]
+fn build_constructs_http_origin_with_a_pinned_certificate() {
+    let (_dir, path) = write_config(&http_config_with_tls(
+        "https://example.com",
+        &format!("[origin_config.tls]\npin_sha256 = \"{}\"", "ab".repeat(32)),
+    ));
+    assert!(VaultConfig::build(path).is_ok());
+}
+
+#[test]
+fn build_refuses_a_bad_tls_table_when_the_vault_opens() {
+    // Like auth: a broken tls table fails when the vault opens, not on its first request.
+    for (base_url, table) in [
+        (
+            "http://example.com",
+            format!("[origin_config.tls]\npin_sha256 = \"{}\"", "ab".repeat(32)),
+        ),
+        (
+            "https://example.com",
+            "[origin_config.tls]\npin_sha256 = \"abcd\"".to_string(),
+        ),
+        (
+            "https://example.com",
+            "[origin_config.tls]\nca_file = \"/nonexistent/ca.pem\"".to_string(),
+        ),
+        ("https://example.com", "[origin_config.tls]".to_string()),
+    ] {
+        let (_dir, path) = write_config(&http_config_with_tls(base_url, &table));
+        assert!(
+            matches!(VaultConfig::build(path), Err(VaultError::Generic(m)) if m.starts_with("tls:")),
+            "{base_url} {table}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_key_in_the_tls_table_is_an_error() {
+    let (_dir, path) = write_config(&http_config_with_tls(
+        "https://example.com",
+        "[origin_config.tls]\nskip_verify = true",
+    ));
+    assert!(matches!(VaultConfig::build(path), Err(VaultError::Toml(_))));
+}
+
+/// An http origin config with `tls` and nothing else optional.
+fn http_origin_with(tls: Option<HttpTls>) -> OriginConfig {
+    OriginConfig::Http {
+        base_url: Some("https://example.com".to_string()),
+        list_url: "/list/{id}".to_string(),
+        fetch_url: "/fetch/{id}".to_string(),
+        get_url: "/get/{id}".to_string(),
+        put_url: "/put/{id}".to_string(),
+        send_url: "/send/{id}".to_string(),
+        delete_url: "/delete/{id}".to_string(),
+        rename_url: None,
+        auth: crate::origin::http::HttpAuth::None,
+        tls,
+    }
+}
+
+#[test]
+fn the_tls_table_round_trips_and_is_omitted_when_unset() {
+    let tls = HttpTls {
+        ca_file: Some("/etc/nimbus/ca.pem".into()),
+        pin_sha256: None,
+    };
+    let written = toml::to_string_pretty(&http_origin_with(Some(tls.clone()))).unwrap();
+    assert!(
+        written.contains("[tls]") && written.contains("ca_file"),
+        "{written}"
+    );
+    assert!(!written.contains("pin_sha256"), "{written}");
+    match toml::from_str::<OriginConfig>(&written).unwrap() {
+        OriginConfig::Http { tls: read_back, .. } => assert_eq!(read_back, Some(tls)),
+        _ => panic!("expected an http origin"),
+    }
+
+    let without = toml::to_string_pretty(&http_origin_with(None)).unwrap();
+    assert!(!without.contains("tls"), "{without}");
+}
+
+// --- relative paths resolve against the config file's directory ---
+
+/// `path` (absolute) spelled relative to the current directory: one `..` per component of the
+/// cwd, back up to `/`, then `path` itself.
+fn relative_from_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let ups = cwd.components().count() - 1;
+    let mut relative: PathBuf = std::iter::repeat_n("..", ups).collect();
+    relative.push(path.strip_prefix("/").unwrap());
+    relative
+}
+
+/// Writes `dir/vault.toml` as an fs vault named `name` with `root = "<root>"`, and a file in
+/// `dir/<root>` so a listing shows whether the root resolved where it should.
+fn write_fs_vault(dir: &Path, name: &str, root: &str) -> PathBuf {
+    std::fs::create_dir_all(dir.join(root)).unwrap();
+    std::fs::write(dir.join(root).join("hello.txt"), b"hi").unwrap();
+    let path = dir.join("vault.toml");
+    std::fs::write(
+        &path,
+        format!("name = \"{name}\"\n\n[origin_config]\ntype = \"fs\"\nroot = \"{root}\"\n"),
+    )
+    .unwrap();
+    path
+}
+
+async fn names_listed(origin: &dyn Origin) -> Vec<String> {
+    let mut names: Vec<String> = origin
+        .list(&ObjectId::from(""))
+        .await
+        .unwrap()
+        .iter()
+        .map(|o| o.get_name())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_config_loaded_from_another_cwd_builds_the_same() {
+    // No `set_current_dir`: the cwd is process-wide and tests run in parallel. Instead the
+    // same file is opened by its absolute path and by a path relative to the test's cwd (the
+    // crate directory, which has no `data/`); a root resolved against the cwd would find
+    // nothing either way.
+    let dir = tempdir().unwrap();
+    let config = write_fs_vault(dir.path(), "v", "data");
+
+    let (_, _, by_absolute) = VaultConfig::build(config.clone()).unwrap();
+    let (_, _, by_relative) = VaultConfig::build(relative_from_cwd(&config)).unwrap();
+
+    assert_eq!(names_listed(by_absolute.as_ref()).await, vec!["hello.txt"]);
+    assert_eq!(names_listed(by_relative.as_ref()).await, vec!["hello.txt"]);
+}
+
+/// An http config with `token_file` and `ca_file` set to `path`.
+fn http_with_paths(path: &str) -> OriginConfig {
+    OriginConfig::Http {
+        base_url: Some("https://example.com".to_string()),
+        list_url: "/list/{id}".to_string(),
+        fetch_url: "/fetch/{id}".to_string(),
+        get_url: "/get/{id}".to_string(),
+        put_url: "/put/{id}".to_string(),
+        send_url: "/send/{id}".to_string(),
+        delete_url: "/delete/{id}".to_string(),
+        rename_url: None,
+        auth: HttpAuth::Bearer {
+            token: None,
+            token_env: None,
+            token_file: Some(path.into()),
+        },
+        tls: Some(HttpTls {
+            ca_file: Some(path.into()),
+            pin_sha256: None,
+        }),
+    }
+}
+
+/// Every path field of `config` after `relative_to(dir)`: fs root, vault path, or the http
+/// token_file and ca_file.
+fn paths_after_relative_to(config: OriginConfig, dir: &str) -> Vec<PathBuf> {
+    match config.relative_to(Path::new(dir)).unwrap() {
+        OriginConfig::Fs { root } => vec![root],
+        OriginConfig::Vault { path } => vec![path],
+        OriginConfig::Http {
+            auth: HttpAuth::Bearer { token_file, .. },
+            tls: Some(HttpTls { ca_file, .. }),
+            ..
+        } => vec![token_file.unwrap(), ca_file.unwrap()],
+        _ => panic!("unexpected variant"),
+    }
+}
+
+#[test]
+fn absolute_paths_are_untouched_by_relative_to() {
+    let configs = [
+        OriginConfig::Fs {
+            root: "/srv/data".into(),
+        },
+        OriginConfig::Vault {
+            path: "/srv/data".into(),
+        },
+        http_with_paths("/srv/data"),
+    ];
+    for config in configs {
+        for path in paths_after_relative_to(config, "/etc/nimbus") {
+            assert_eq!(path, PathBuf::from("/srv/data"));
+        }
+    }
+}
+
+#[test]
+fn each_path_field_resolves_against_the_config_dir() {
+    let configs = [
+        OriginConfig::Fs {
+            root: "data".into(),
+        },
+        OriginConfig::Vault {
+            path: "data".into(),
+        },
+        http_with_paths("data"),
+    ];
+    for config in configs {
+        for path in paths_after_relative_to(config, "/etc/nimbus") {
+            assert_eq!(path, PathBuf::from("/etc/nimbus/data"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_nested_chain_resolves_per_directory() {
+    let dir = tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    write_fs_vault(&b, "inner", "data");
+    let outer = a.join("outer.toml");
+    std::fs::write(
+        &outer,
+        "name = \"outer\"\n\n[origin_config]\ntype = \"vault\"\npath = \"../b/vault.toml\"\n",
+    )
+    .unwrap();
+
+    let (_, _, origin) = VaultConfig::build(outer).unwrap();
+
+    // outer's `../b/vault.toml` is relative to a/, inner's `data` to b/: b/data.
+    assert_eq!(names_listed(origin.as_ref()).await, vec!["hello.txt"]);
+}
+
+/// A command origin config in `dir` whose `list_cmd` is `list_cmd` and whose extras are
+/// `extras` (a TOML table body), the rest of its commands unused.
+fn write_command_config(dir: &Path, list_cmd: &str, extras: &str) -> PathBuf {
+    let path = dir.join("origin.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "type = \"command\"\nlist_cmd = \"{list_cmd}\"\nfetch_cmd = \"true\"\n\
+             get_cmd = \"true\"\nput_cmd = \"true\"\nsend_cmd = \"true\"\n\
+             delete_cmd = \"true\"\n\n[extras]\n{extras}"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// A directory whose name has a space and a `'`, the two things shell quoting has to survive.
+fn awkward_dir() -> (tempfile::TempDir, PathBuf) {
+    let base = tempdir().unwrap();
+    let dir = base.path().join("it's a dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    (base, dir)
+}
+
+#[tokio::test]
+async fn config_dir_in_a_template_is_shell_quoted() {
+    let (_base, dir) = awkward_dir();
+    std::fs::write(dir.join("list.json"), "[]").unwrap();
+    let config = write_command_config(&dir, "cat {config_dir}/list.json", "");
+
+    let origin = OriginConfig::from_file(config).unwrap();
+
+    // Unquoted, `sh` would split the path at the space (or choke on the `'`).
+    assert!(names_listed(origin.as_ref()).await.is_empty());
+}
+
+#[tokio::test]
+async fn config_dir_inside_an_extras_value_is_expanded() {
+    let (_base, dir) = awkward_dir();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data").join("list.json"), "[]").unwrap();
+    let config = write_command_config(
+        &dir,
+        "cat {root}/list.json",
+        "root = \"{config_dir}/data\"\n",
+    );
+
+    let origin = OriginConfig::from_file(config).unwrap();
+
+    assert!(names_listed(origin.as_ref()).await.is_empty());
+}
+
+#[test]
+fn a_user_config_dir_extra_is_refused() {
+    let config = OriginConfig::Command {
+        list_cmd: "true".to_string(),
+        fetch_cmd: "true".to_string(),
+        get_cmd: "true".to_string(),
+        put_cmd: "true".to_string(),
+        send_cmd: "true".to_string(),
+        delete_cmd: "true".to_string(),
+        extras: Some(HashMap::from([(
+            "config_dir".to_string(),
+            "/mine".to_string(),
+        )])),
+        rename_cmd: None,
+    };
+
+    let error = match config.relative_to(Path::new("/etc/nimbus")) {
+        Ok(_) => panic!("a user `config_dir` extra should be refused"),
+        Err(e) => e.to_string(),
+    };
+
+    assert!(error.contains("`config_dir` is reserved"), "{error}");
+}
+
+#[test]
+fn save_keeps_relative_paths() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vault.toml");
+    let config = VaultConfig::new(
+        "v".to_string(),
+        ObjectId::default(),
+        OriginConfig::Fs {
+            root: "data".into(),
+        },
+    );
+
+    config.save(&path).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("root = \"data\""), "{saved}");
+}
+
+/// A command config whose every template is `template`, with `extras`.
+fn command_config(template: &str, extras: &[(&str, &str)]) -> OriginConfig {
+    OriginConfig::Command {
+        list_cmd: template.to_string(),
+        fetch_cmd: template.to_string(),
+        get_cmd: template.to_string(),
+        put_cmd: template.to_string(),
+        send_cmd: template.to_string(),
+        delete_cmd: template.to_string(),
+        extras: Some(
+            extras
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+        rename_cmd: None,
+    }
+}
+
+#[cfg(unix)]
+fn non_utf8_dir() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(b"/srv/vault-\xff"))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_config_dir_is_fine_when_nothing_uses_config_dir() {
+    let config = command_config("true", &[("root", "/srv/data")])
+        .relative_to(&non_utf8_dir())
+        .unwrap();
+    match config {
+        OriginConfig::Command { extras, .. } => {
+            let extras = extras.unwrap();
+            assert_eq!(extras.get("root").map(String::as_str), Some("/srv/data"));
+            assert!(!extras.contains_key("config_dir"));
+        }
+        _ => panic!("expected a command config"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_config_dir_is_refused_when_config_dir_is_used() {
+    for config in [
+        command_config("ls {config_dir}", &[]),
+        command_config("ls {root}", &[("root", "{config_dir}/data")]),
+    ] {
+        let error = match config.relative_to(&non_utf8_dir()) {
+            Ok(_) => panic!("a non-UTF-8 {{config_dir}} should be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("UTF-8"), "{error}");
+    }
 }

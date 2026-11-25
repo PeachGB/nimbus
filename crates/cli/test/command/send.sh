@@ -1,10 +1,10 @@
 #!/bin/sh
-# Ejemplo de `send_cmd` atomico: el payload llega por stdin. Se escribe en un
-# archivo temporal del mismo directorio y solo se mueve sobre el destino si
-# stdin termino bien. Si nimbus aborta la transferencia, mata este proceso
-# antes de cerrar stdin, asi que el `mv` nunca corre y el destino queda intacto.
+# An atomic `send_cmd` example: the payload arrives on stdin. It is written to
+# a temp file in the same directory and only moved over the destination if
+# stdin ended cleanly. If nimbus aborts the transfer, it kills this process
+# before closing stdin, so the `mv` never runs and the destination is left intact.
 #
-# Uso en el config: send_cmd = "{root}/send.sh {root}/data/{id}"
+# Usage in the config: send_cmd = "{root}/send.sh {root}/data/{id}"
 set -eu
 dest="${1:-$(dirname "$0")/data/last-upload.bin}"
 tmp="$(dirname "$dest")/.nimbus-tmp.$(basename "$dest").$$"

@@ -60,7 +60,8 @@ cargo build --release
 
 Build a single crate with `-p`, e.g. `cargo build -p nimbus-vault --release`.
 Everything here needs **Rust 1.88** or newer (`rust-version` in the workspace
-manifest); that floor comes from the dependencies, not from the code.
+manifest): the code uses let-chains, which need 1.88 (edition 2024 alone would
+need 1.85).
 
 ## The crates
 
@@ -70,7 +71,7 @@ This repo is a Cargo workspace with six crates:
 |-------|---------|------------|
 | [`nimbus-tui`](crates/tui/README.md) | `cargo install nimbus-tui` | A ranger-style terminal file manager over vaults, and a usable one over plain `$HOME` with no vaults at all. |
 | [`nimbus-cli`](crates/cli/README.md) | `cargo install nimbus-cli` | One command per invocation, or an interactive REPL. |
-| [`nimbus-daemon`](crates/daemon/README.md) | `cargo install nimbus-daemon` | Serves a directory of vaults over HTTP, for the `http` origin to mount. |
+| [`nimbus-daemon`](crates/daemon/README.md) | `cargo install nimbus-daemon` | Serves a directory of vaults over HTTP or HTTPS, for the `http` origin to mount. |
 | [`nimbus-creator`](crates/creator/README.md) | `cargo install nimbus-creator` | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend. |
 | [`nimbus-vault`](crates/vault/README.md) | `cargo add nimbus-vault` | The library everything else is built on: `Object`, `Vault`, `Origin` and its four implementations. |
 | [`nimbus-core`](crates/core/README.md) | `cargo add nimbus-core` | The shared core of the frontends above: `App`, holding the vault registry, current vault/cwd, local staging vault, and session persistence. |
@@ -141,6 +142,13 @@ known limits (operations block the event loop; there's no undo or trash).
       async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object>;
       async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()>;
       async fn delete(&self, id: &ObjectId) -> VaultResult<()>;
+      // Optional: the default answers `Unsupported`, and callers fall back to copy + delete.
+      async fn rename(
+          &self,
+          id: &ObjectId,
+          new_parent: &ObjectId,
+          new_name: &str,
+      ) -> VaultResult<Object>;
   }
   ```
 
@@ -216,6 +224,14 @@ type = "bearer"
 token_env = "NIMBUS_TOKEN"
 ```
 
+An HTTPS server (such as a daemon with `[tls]`) takes an `https://` `base_url`, plus an
+`[origin_config.tls]` table with `ca_file` or `pin_sha256` when no public CA vouches for its
+certificate; see [TLS in `crates/vault/README.md`](crates/vault/README.md#tls-origin_configtls).
+A daemon with bearer auth on a network address refuses plain HTTP, so pair
+`[origin_config.auth]` with an `https://` `base_url`.
+
+> New in 0.4.0 (unreleased). Until then, clone the repo and build from the checkout: `cargo install --path crates/cli` (or `crates/tui`)
+
 ```toml
 # vault.toml — backed by another vault
 name = "outer-vault"
@@ -224,6 +240,26 @@ name = "outer-vault"
 type = "vault"
 path = "inner.toml"
 ```
+
+**Relative paths resolve against the directory of the config file that contains them**,
+not the current directory, so a config means the same thing wherever nimbus starts
+(`inner.toml` above is the file next to `vault.toml`). Absolute paths are used as they
+are, and `~` is not expanded. The fields this covers:
+
+- in a vault config: the `fs` `root`, the `vault` `path`, and for `http` the auth
+  `token_file` and the tls `ca_file`;
+- in `cli_config.toml`: `local_vault_path`;
+- in `daemon_config.toml`: `vaults_path`, `[tls]` `cert_file` and `key_file`, and the
+  `[auth]` `token_file`.
+
+Command-line flags (`--vaults`, `--tls-cert`, `--tls-key`, `--config`) stay relative to
+the current directory, like any flag. A `command` origin's `extras` are plain strings that
+nimbus doesn't interpret, so point them at the config's directory with the
+`{config_dir}` placeholder (`root = "{config_dir}/data"`); see
+[Command templating](crates/vault/README.md#command-templating). `new <config>` stores the
+config's absolute path, so a registered vault opens from any directory.
+
+> New in 0.4.0 (unreleased): before it, relative paths resolved against the current directory, so an existing config that relied on that now means something else; make those paths absolute or relative to the config file. For a vault registered with a relative config path, run `new <config>` again from the directory you originally registered it from (or `forget <vault>` first if the file moved or you're elsewhere). Until then, clone the repo and build from the checkout: `cargo install --path crates/cli` (or `crates/tui`)
 
 ```rust
 use nimbus_vault::vault::Vault;
@@ -297,7 +333,7 @@ vault-builder wizard from [`nimbus-creator`](crates/creator/README.md).
 
 ## Serving vaults over HTTP
 
-`nimbus-daemon` serves a directory of vault configs over HTTP, which is what the
+`nimbus-daemon` serves a directory of vault configs over HTTP or HTTPS, which is what the
 `http` origin was waiting for: one machine holds the data, the rest mount it as a
 vault and use the same `ls`/`get`/`put`/`push`/`pull` they'd use on a local folder.
 
@@ -317,18 +353,28 @@ read_only = false                    # refuse every write
 
 [auth]                               # default: no authentication
 type = "bearer"
-token = "s3cr3t"
+token_file = "/etc/nimbus/token"     # or token = "s3cr3t", inline
+
+[tls]                                # optional: serve HTTPS
+cert_file = "/etc/nimbus/cert.pem"   # PEM chain, leaf first
+key_file  = "/etc/nimbus/key.pem"
 ```
 
 Every `*.toml` under `vaults_path` is opened as a vault and addressed by the `name`
 inside it, at `/v/<name>/…`. The routes mirror the URL templates `OriginHTTP`
-uses (plus an optional `/rename/{id}` for native moves), so a client only points `base_url` at `http://host:8080/v/<name>` and fills in
-the default paths — the `http` example above is a complete client config for one.
+uses (plus an optional `/rename/{id}` for native moves), so a client only points
+`base_url` at `http://host:8080/v/<name>` (or `https://…` when the daemon serves
+TLS, with `[origin_config.tls]` if its certificate is private) and fills in the
+default paths — the `http` example above is a complete client config for one.
 
-It's a server, not a scheduler: it doesn't sync anything on its own. There's no TLS
-either, so anything leaving the host wants a reverse proxy or a tunnel in front. See
+It's a server, not a scheduler: it doesn't sync anything on its own. It can serve
+HTTPS itself through `[tls]` (or `--tls-cert`/`--tls-key`), refuses a bearer token over
+plain HTTP on a non-loopback address, and can still sit behind a reverse proxy instead;
+see [TLS](crates/daemon/README.md#tls). See
 [`crates/daemon/README.md`](crates/daemon/README.md) for the full API, the
 authentication model, and how ids are validated at the boundary.
+
+> New in 0.4.0 (unreleased). Until then, clone the repo and build from the checkout: `cargo install --path crates/daemon`
 
 ## Configuration locations
 
@@ -338,9 +384,9 @@ Every binary shares the same layout, all derived from `nimbus_vault::config_home
 | Path | What |
 |------|------|
 | `<config>/.nimbus/cli_config.toml` | `default_local_vault`, `local_vault_path` |
-| `<config>/.nimbus/daemon_config.toml` | `vaults_path`, `bind`, `read_only`, `[auth]` |
+| `<config>/.nimbus/daemon_config.toml` | `vaults_path`, `bind`, `read_only`, `allow_insecure_http`, `[auth]` (`token` or `token_file`), `[tls]` |
 | `<config>/.nimbus/vaults/<name>.toml` | where the creator wizard saves new vault configs |
-| `<state>/nimbus/session.toml` | the registry of `name → config path`, plus the vault and directory the last session ended in |
+| `<state>/nimbus/session.toml` | the registry of `name → config path` (absolute), plus the vault and directory the last session ended in. `<state>` is `$XDG_STATE_HOME` or `~/.local/state` on Linux, `~/Library/Application Support` on macOS, and `%LOCALAPPDATA%` on Windows. Never the temp directory: with no such directory nimbus refuses to start rather than keep a session the system may delete. On macOS and Windows only (the systems where older versions used it), a session file left in the temp directory (`<temp>/nimbus/session.toml`) is moved over once. On macOS only if it is a regular file you own that no one else can write, in a directory that is the same (anything else is left alone with a warning); Windows's temp directory is per-user. If both exist, the new one wins and the old one is left alone |
 
 A vault config can live anywhere — `new <path>` registers it from wherever it is.
 The `vaults/` directory is just the wizard's default, so created vaults stay
@@ -463,9 +509,11 @@ cargo clippy --workspace --all-targets
 [`crates/cli/test/`](crates/cli/test/README.md) holds a hand-run vault config **per
 origin type** — `fs`, `http` (served by a stdlib Python reference origin), `command`
 (a POSIX-sh reference origin), and a vault wrapping another vault — so features can
-be exercised against something other than a plain filesystem. Point
-`XDG_STATE_HOME` at a scratch directory first and your real vault registry is left
-alone:
+be exercised against something other than a plain filesystem.
+
+Their paths are relative to each config file (see [The model](#the-model)), so they work
+from any directory. Point `XDG_STATE_HOME` at a scratch directory first and your real
+vault registry is left alone:
 
 ```bash
 export XDG_STATE_HOME=$(mktemp -d)
@@ -473,8 +521,7 @@ cargo run -p nimbus-cli
 nimbus />> new crates/cli/test/fs/fs.toml
 ```
 
-The configs carry **absolute** paths, so they need updating if the repo moves — see
-that README for the per-origin walkthrough.
+See that README for the per-origin walkthrough.
 
 ## Design principles
 

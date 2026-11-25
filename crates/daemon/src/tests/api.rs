@@ -1,5 +1,5 @@
 use super::*;
-use crate::auth::AuthConfig;
+use crate::auth::Auth;
 use nimbus_vault::{
     object::Metadata,
     origin::{
@@ -19,7 +19,7 @@ fn fs_vault(name: &str, root: std::path::PathBuf) -> Vault {
     .unwrap()
 }
 
-fn state_for(vault: Vault, read_only: bool, auth: AuthConfig) -> AppState {
+fn state_for(vault: Vault, read_only: bool, auth: Auth) -> AppState {
     let mut vaults = HashMap::new();
     vaults.insert(vault.get_name().clone(), vault);
     AppState::from_parts(vaults, read_only, auth)
@@ -71,7 +71,7 @@ async fn an_http_origin_can_read_a_served_vault() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let origin = origin_for(&base, "photos");
@@ -100,7 +100,7 @@ async fn an_http_origin_can_write_to_a_served_vault() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let origin = origin_for(&base, "photos");
@@ -133,7 +133,7 @@ async fn a_client_rooted_at_the_default_slash_can_write_to_the_root() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let origin = origin_for(&base, "photos");
@@ -154,7 +154,7 @@ async fn the_vault_root_is_reachable_however_the_client_spells_it() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let client = reqwest::Client::new();
@@ -177,7 +177,7 @@ async fn the_index_lists_the_served_vaults() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
 
@@ -197,7 +197,7 @@ async fn an_unknown_vault_is_a_404() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
 
@@ -214,7 +214,7 @@ async fn a_missing_object_is_a_404_so_the_client_sees_not_found() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let origin = origin_for(&base, "photos");
@@ -237,7 +237,7 @@ async fn a_read_only_daemon_still_serves_reads() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         true,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let origin = origin_for(&base, "photos");
@@ -252,7 +252,7 @@ async fn a_read_only_daemon_refuses_every_write() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         true,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let client = reqwest::Client::new();
@@ -288,13 +288,36 @@ async fn a_protected_daemon_refuses_requests_without_the_token() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::Bearer {
-            token: "s3cr3t".to_string(),
+        Auth::Bearer {
+            token: "s3cr3t".into(),
         },
     ))
     .await;
 
     let response = reqwest::get(format!("{base}{VAULT_PREFIX}/photos/list"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 401);
+    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+}
+
+#[tokio::test]
+async fn a_protected_daemon_refuses_a_wrong_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = spawn(state_for(
+        fs_vault("photos", dir.path().to_path_buf()),
+        false,
+        Auth::Bearer {
+            token: "s3cr3t".into(),
+        },
+    ))
+    .await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}{VAULT_PREFIX}/photos/list"))
+        .bearer_auth("nope")
+        .send()
         .await
         .unwrap();
 
@@ -309,8 +332,8 @@ async fn a_protected_daemon_serves_requests_carrying_the_token() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::Bearer {
-            token: "s3cr3t".to_string(),
+        Auth::Bearer {
+            token: "s3cr3t".into(),
         },
     ))
     .await;
@@ -332,15 +355,15 @@ async fn a_vault_configured_with_the_token_can_use_a_protected_daemon() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::Bearer {
-            token: "s3cr3t".to_string(),
+        Auth::Bearer {
+            token: "s3cr3t".into(),
         },
     ))
     .await;
 
     let origin = origin_for(&base, "photos")
         .with_auth(&HttpAuth::Bearer {
-            token: Some("s3cr3t".to_string()),
+            token: Some("s3cr3t".into()),
             token_env: None,
             token_file: None,
         })
@@ -363,8 +386,8 @@ async fn health_answers_without_credentials() {
     let base = spawn(state_for(
         fs_vault("photos", dir.path().to_path_buf()),
         false,
-        AuthConfig::Bearer {
-            token: "s3cr3t".to_string(),
+        Auth::Bearer {
+            token: "s3cr3t".into(),
         },
     ))
     .await;
@@ -428,12 +451,7 @@ async fn put_with_a_name_that_escapes_the_vault_is_a_400_and_creates_nothing() {
     let outer = tempfile::tempdir().unwrap();
     let root = outer.path().join("vault");
     std::fs::create_dir(&root).unwrap();
-    let base = spawn(state_for(
-        fs_vault("v", root.clone()),
-        false,
-        AuthConfig::None,
-    ))
-    .await;
+    let base = spawn(state_for(fs_vault("v", root.clone()), false, Auth::None)).await;
 
     let client = reqwest::Client::new();
     for name in ["../escaped.txt", "a/b", ".."] {
@@ -461,7 +479,7 @@ async fn names_with_url_special_characters_round_trip_through_the_daemon() {
     let base = spawn(state_for(
         fs_vault("v", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let origin = origin_for(&base, "v");
@@ -498,7 +516,7 @@ async fn send_applies_the_modified_header_and_pushing_twice_is_a_no_op() {
     let base = spawn(state_for(
         fs_vault("v", served_dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let remote = origin_for(&base, "v");
@@ -529,7 +547,7 @@ async fn send_with_a_malformed_modified_header_is_a_400() {
     let base = spawn(state_for(
         fs_vault("v", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let response = reqwest::Client::new()
@@ -555,10 +573,12 @@ async fn rename_route_moves_an_object_natively() {
     let base = spawn(state_for(
         fs_vault("v", dir.path().to_path_buf()),
         false,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
-    let origin = origin_for(&base, "v").with_rename_url(Some("/rename/{id}".to_string()));
+    let origin = origin_for(&base, "v")
+        .with_rename_url(Some("/rename/{id}".to_string()))
+        .unwrap();
 
     let moved = origin
         .rename(
@@ -580,12 +600,7 @@ async fn rename_route_rejects_hostile_names_and_destinations() {
     let root = outer.path().join("vault");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("a.txt"), b"x").unwrap();
-    let base = spawn(state_for(
-        fs_vault("v", root.clone()),
-        false,
-        AuthConfig::None,
-    ))
-    .await;
+    let base = spawn(state_for(fs_vault("v", root.clone()), false, Auth::None)).await;
     let client = reqwest::Client::new();
 
     for body in [
@@ -615,7 +630,7 @@ async fn rename_route_is_refused_when_read_only() {
     let base = spawn(state_for(
         fs_vault("v", dir.path().to_path_buf()),
         true,
-        AuthConfig::None,
+        Auth::None,
     ))
     .await;
     let response = reqwest::Client::new()

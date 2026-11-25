@@ -1,6 +1,6 @@
 #!/bin/sh
-# helper para el vault de tipo "command": get/list contra ./data, emitiendo
-# el JSON que espera OriginCommand (mismo shape que Object en object.rs).
+# Helper for the "command" vault: get/list against ./data, printing the JSON
+# that OriginCommand expects (the same shape as Object in object.rs).
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/data" && pwd)"

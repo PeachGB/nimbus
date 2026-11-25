@@ -2,7 +2,9 @@ mod api;
 mod auth;
 mod config;
 mod error;
+mod server;
 mod state;
+mod tls;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -22,8 +24,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    tls::install_crypto_provider();
     let args = Args::parse();
     let config = Config::resolve(&args)?;
+    // Before anything is bound: an unsafe combination (a bearer token over plain HTTP on a
+    // reachable address) stops here.
+    for warning in config.validate()? {
+        warn!("{warning}");
+    }
     let state = AppState::load(&config)?;
 
     let names = state.vault_names();
@@ -40,21 +48,28 @@ async fn main() -> Result<()> {
             config.vaults_path.display()
         );
     }
-    if config.auth.is_open() && !config.bind.ip().is_loopback() {
-        warn!(
-            "listening on {} with no authentication configured — anyone who can reach this \
-             port can read{} these vaults",
-            config.bind,
-            if config.read_only { "" } else { " and write" }
-        );
-    }
+    // Loaded before binding, so a missing or mismatched certificate fails without ever
+    // listening.
+    let https = match &config.tls {
+        Some(tls) => Some(tls::Https::load(tls).await?),
+        None => None,
+    };
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
-    info!("listening on http://{}", listener.local_addr()?);
+    let router = api::router(state);
 
-    api::serve(listener, api::router(state))
-        .await
-        .context("serving")
+    match https {
+        Some(https) => {
+            https
+                .serve(listener, router, server::ctrl_c(), server::SHUTDOWN_GRACE)
+                .await
+        }
+        None => {
+            info!("listening on http://{}", listener.local_addr()?);
+            server::serve_http(listener, router, server::ctrl_c(), server::SHUTDOWN_GRACE).await
+        }
+    }
+    .context("serving")
 }

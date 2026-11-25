@@ -47,13 +47,13 @@ Each vault you register (other than the automatic `LOCAL` one) is defined by its
 nimbus> new /path/to/vault.toml
 ```
 
-or launch the interactive wizard (built on [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator)) by running `new` with no path — it prompts for a name, root id, origin type, and that origin's fields, then writes and registers the resulting `vault.toml`. The wizard defaults to saving under `~/.config/.nimbus/vaults/<name>.toml`, so vaults you create stay together and can be found again; the path is editable, and it refuses to overwrite an existing config.
+or launch the interactive wizard (built on [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator)) by running `new` with no path — it prompts for a name, root id, origin type, and that origin's fields, then writes and registers the resulting `vault.toml`. The wizard defaults to saving under `~/.config/.nimbus/vaults/<name>.toml`, so vaults you create stay together and can be found again; the path is editable, and it refuses to overwrite an existing config. A path you type for a field (an `fs` root, an inner vault's config) is relative to the directory you ran `new` from, and is saved absolute, because paths in a saved config resolve against the config's own directory.
 
 Registering a name that's already taken by a *different* config is refused, since replacing it would leave the original vault unreachable. Use `forget <vault>` to free the name first. Re-registering the **same** config path is fine — that's how an edit to a config file gets picked up.
 
 ## Session model
 
-Three things are persisted to `~/.local/state/nimbus/session.toml`: the registry of vaults (name → config path), the vault you had selected, and the directory you were in. They're written on `new`, on `forget`, and on the way out — whether you typed `exit`, hit `Ctrl-C`/`Ctrl-D`, or ran a single command.
+Three things are persisted to `session.toml` in the platform's state directory (`~/.local/state/nimbus/` on Linux, or `$XDG_STATE_HOME/nimbus/`; `~/Library/Application Support/nimbus/` on macOS; `%LOCALAPPDATA%\nimbus\` on Windows): the registry of vaults (name → the config's absolute path, so a vault registered from one directory opens from any other), the vault you had selected, and the directory you were in. On macOS and Windows only, a session file an older version left in the temp directory is moved over once. On macOS only if it is a regular file you own that no one else can write, in a directory that is the same (anything else is left alone with a warning); Windows's temp directory is per-user. They're written on `new`, on `forget`, and on the way out — whether you typed `exit`, hit `Ctrl-C`/`Ctrl-D`, or ran a single command.
 
 That's what makes the one-shot mode usable rather than a novelty:
 
@@ -182,13 +182,13 @@ If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `comma
 - `ls` always reflects the true current state of a vault's origin — it's never served from cache.
 - Content (file bytes) is streamed, not buffered — large files don't get fully loaded into memory during transfer.
 - `mv` and `push`/`pull`'s local↔remote transfers only proceed with the destructive step (delete, in `mv`'s case) after the copy has succeeded.
-- The session file (`$XDG_STATE_HOME/nimbus/session.toml`) is written atomically and with mode `0600`. Each save merges into what's on disk, so a CLI and a TUI open at once don't drop each other's newly registered vaults. A session file that can't be parsed is moved to `session.toml.bak` with a warning, and the next start begins a fresh session.
+- The session file (see above for where it lives; never the temp directory) is written atomically and with mode `0600`. Each save merges into what's on disk, so a CLI and a TUI open at once don't drop each other's newly registered vaults. A session file that can't be parsed is moved to `session.toml.bak` with a warning, and the next start begins a fresh session.
 - Tab completion currently covers subcommand names and `cd`'s first argument only; other commands' path arguments aren't completed yet. It's a REPL feature — in one-shot mode your shell's completion is what's running.
 - To script several commands in one process, pipe them into the REPL (`printf 'select v\nls\n' | nimbus-cli`). One command per invocation is the other option, and the session file is what carries state between them.
 
 ## Testing against other origins
 
-[`test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md) holds a vault config per origin type (`fs`, `http`, `command`, and a vault wrapping another vault), including reference `http` and `command` origin implementations to run them against. Export a scratch `XDG_STATE_HOME` before you start and your real vault registry is left untouched — see that README for the per-origin walkthrough.
+[`test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md) holds a vault config per origin type (`fs`, `http`, `command`, and a vault wrapping another vault), including reference `http` and `command` origin implementations to run them against. Their paths are relative to each config file, so they work from any directory; export a scratch `XDG_STATE_HOME` before you start so your real vault registry is left untouched — see that README for the per-origin walkthrough.
 
 ## License
 

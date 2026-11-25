@@ -259,9 +259,16 @@ async fn delete_returns_not_found_on_404() {
 
 // --- authentication ---
 
+/// The header `auth` resolves to, as plain text for comparing. `Secret` has no `==` on purpose.
+fn header(auth: &HttpAuth) -> Option<String> {
+    auth.header_value()
+        .unwrap()
+        .map(|value| value.expose().to_string())
+}
+
 fn bearer(token: &str) -> HttpAuth {
     HttpAuth::Bearer {
-        token: Some(token.to_string()),
+        token: Some(token.into()),
         token_env: None,
         token_file: None,
     }
@@ -356,15 +363,12 @@ async fn a_401_says_to_look_at_the_auth_config() {
 
 #[test]
 fn no_credentials_means_no_header_value() {
-    assert_eq!(HttpAuth::None.header_value().unwrap(), None);
+    assert_eq!(header(&HttpAuth::None), None);
 }
 
 #[test]
 fn a_literal_token_becomes_a_bearer_header() {
-    assert_eq!(
-        bearer("s3cr3t").header_value().unwrap(),
-        Some("Bearer s3cr3t".to_string())
-    );
+    assert_eq!(header(&bearer("s3cr3t")), Some("Bearer s3cr3t".to_string()));
 }
 
 #[test]
@@ -379,10 +383,7 @@ fn a_token_can_come_from_a_file_without_its_trailing_newline() {
         token_file: Some(path),
     };
 
-    assert_eq!(
-        auth.header_value().unwrap(),
-        Some("Bearer s3cr3t".to_string())
-    );
+    assert_eq!(header(&auth), Some("Bearer s3cr3t".to_string()));
 }
 
 #[test]
@@ -409,10 +410,7 @@ fn a_token_can_come_from_the_environment() {
         token_file: None,
     };
 
-    assert_eq!(
-        auth.header_value().unwrap(),
-        Some("Bearer s3cr3t".to_string())
-    );
+    assert_eq!(header(&auth), Some("Bearer s3cr3t".to_string()));
     unsafe { std::env::remove_var(name) };
 }
 
@@ -445,7 +443,7 @@ fn two_token_sources_at_once_are_refused_rather_than_ranked() {
     // Silently preferring one would let a stale `token` override the `token_env` someone
     // added to replace it.
     let auth = HttpAuth::Bearer {
-        token: Some("from-config".to_string()),
+        token: Some("from-config".into()),
         token_env: Some("NIMBUS_TEST_TOKEN_UNUSED".to_string()),
         token_file: None,
     };
@@ -569,7 +567,9 @@ async fn a_501_answer_to_rename_is_unsupported_so_callers_fall_back() {
         when.method(Method::POST).path("/rename/a");
         then.status(501);
     });
-    let origin = make_origin(&server).with_rename_url(Some("/rename/{id}".to_string()));
+    let origin = make_origin(&server)
+        .with_rename_url(Some("/rename/{id}".to_string()))
+        .unwrap();
     let result = origin
         .rename(&ObjectId::from("a"), &ObjectId::from(""), "b")
         .await;
@@ -608,10 +608,12 @@ fn origin_at(base: String) -> OriginHTTP {
 
 #[tokio::test]
 async fn a_request_to_a_stalled_server_times_out() {
-    let origin = origin_at(stalled_server().await).with_timeouts(
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_millis(300),
-    );
+    let origin = origin_at(stalled_server().await)
+        .with_timeouts(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -642,10 +644,12 @@ async fn the_read_timeout_is_idle_based_so_a_slow_but_moving_body_completes() {
             socket.write_all(b"x").await.unwrap();
         }
     });
-    let origin = origin_at(format!("http://{address}")).with_timeouts(
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_millis(400),
-    );
+    let origin = origin_at(format!("http://{address}"))
+        .with_timeouts(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(400),
+        )
+        .unwrap();
 
     let mut stream = origin.fetch(&ObjectId::from("big")).await.unwrap();
     let mut body = Vec::new();
@@ -671,4 +675,64 @@ async fn an_unreachable_server_fails_fast() {
     .await
     .expect("connecting hung");
     assert!(result.is_err());
+}
+
+#[test]
+fn no_debug_view_shows_the_token() {
+    let token = "s3cr3t-in-debug";
+    let auth = bearer(token);
+    let header = auth.header_value().unwrap();
+
+    // A whole vault opened from a config holding the token inline.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("vault.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "name = \"remote\"\n\n[origin_config]\ntype = \"http\"\n\
+             base_url = \"http://127.0.0.1:9\"\nlist_url = \"/list/{{id}}\"\n\
+             fetch_url = \"/fetch/{{id}}\"\nget_url = \"/get/{{id}}\"\nput_url = \"/put/{{id}}\"\n\
+             send_url = \"/send/{{id}}\"\ndelete_url = \"/delete/{{id}}\"\n\n\
+             [origin_config.auth]\ntype = \"bearer\"\ntoken = \"{token}\"\n"
+        ),
+    )
+    .unwrap();
+    let vault = crate::vault::Vault::new(config).unwrap();
+
+    // Errors about a configured token, which carry it nowhere either.
+    let unsendable = bearer(&format!("{token}\n"));
+    let Err(unsendable) = origin_with_auth(&unsendable) else {
+        panic!("a token with a newline can't be sent in a header");
+    };
+    let ambiguous = HttpAuth::Bearer {
+        token: Some(token.into()),
+        token_env: Some("NIMBUS_TEST_TOKEN_UNUSED".to_string()),
+        token_file: None,
+    }
+    .header_value()
+    .unwrap_err();
+
+    for (what, debug) in [
+        ("HttpAuth", format!("{auth:?}")),
+        ("header_value", format!("{header:?}")),
+        ("Vault", format!("{vault:?}")),
+        ("unsendable-token error", format!("{unsendable:?}")),
+        ("two-sources error", format!("{ambiguous:?}")),
+    ] {
+        assert!(!debug.contains(token), "{what} shows the token: {debug}");
+    }
+}
+
+/// An `OriginHTTP` with `auth` applied, for the errors `with_auth` reports.
+fn origin_with_auth(auth: &HttpAuth) -> VaultResult<OriginHTTP> {
+    OriginHTTP::new(
+        "http://127.0.0.1:9".to_string(),
+        "/fetch/{id}".to_string(),
+        "/list/{id}".to_string(),
+        "/get/{id}".to_string(),
+        "/put/{id}".to_string(),
+        "/send/{id}".to_string(),
+        "/delete/{id}".to_string(),
+    )
+    .with_auth(auth)
 }

@@ -13,14 +13,15 @@ It's usable on its own: nothing here depends on the frontends, and a `Vault` can
 ## What's here
 
 - **`vault.rs`** — `Vault`: holds a name, an `Arc<dyn Origin>`, a local `Object` cache (`Mutex<HashMap<ObjectId, Object>>`), and a single root `ObjectId`. `Vault::new(path)` reads a `VaultConfig` from a TOML file at `path` and bootstraps the origin and root id from it. `find(path)` walks a filesystem-style `PathBuf` component by component, calling `list` at each level and matching child names, to resolve it to an `ObjectId` starting from the root. `get` serves from the cache when present, falling back to the origin and caching the result; `list` always hits the origin but caches every child it returns (and updates the parent's cached child-id list, if the parent is itself cached as a `Branch`/`Root`); `delete` evicts an id from the cache. `fetch`/`send` stream payloads straight through the origin and are never cached. `put(object, destination)` writes `object` under `destination` and caches (and returns) the `Object` the origin reports back — not the input — since an origin isn't required to rename `object` in place (see [The `put` contract](#the-put-contract)); on failure, nothing is cached. `pull(id, remote)`/`push(id, remote)` recursively sync `id`'s subtree between this vault's origin and an arbitrary `&dyn Origin`, threading `put`'s returned `Object` through to the following `send` — see [Syncing between origins](#syncing-between-origins) below.
-- **`config.rs`** — `VaultConfig`: the on-disk shape of a vault (`name`, an optional `root_id` defaulting to `"/"`, plus an `origin_config`), and `OriginConfig`, a tagged enum (`type = "fs" | "command" | "http" | "vault"`) describing how to build the origin declaratively — the `http` variant also carries an optional `auth` table (`HttpAuth`), which is why it's the variant's last field: it's the only one that serializes as a TOML table, and a table has to come after every plain value in the same struct or `VaultConfig::save` fails on a config it just built. `VaultConfig::build(path)` reads and parses the TOML file and returns the vault's name, root id, and the matching `Box<dyn Origin>`. `OriginConfig::from_file(path)` builds just the `Box<dyn Origin>` from a TOML file containing only the `origin_config` shape (no `name`/`root_id`), for callers that want to talk to an origin directly without opening a `Vault` — see [Building an origin without a vault](#building-an-origin-without-a-vault). `OriginConfig::build(self)` takes `self` by value rather than `&self`, so it moves each variant's fields straight into the `Origin` it constructs instead of cloning them. `VaultConfig::save(path)` writes the config out, creating the parent directory if needed; `VaultConfig::default_dir()`/`default_path(name)` give the conventional location for a new vault's config (see [Where configs live](#where-configs-live)).
+- **`config.rs`** — `VaultConfig`: the on-disk shape of a vault (`name`, an optional `root_id` defaulting to `"/"`, plus an `origin_config`), and `OriginConfig`, a tagged enum (`type = "fs" | "command" | "http" | "vault"`) describing how to build the origin declaratively — the `http` variant also carries the optional `auth` (`HttpAuth`) and `tls` (`HttpTls`) tables, which is why they're the variant's last fields: they're the only ones that serialize as TOML tables, and a table has to come after every plain value in the same struct or `VaultConfig::save` fails on a config it just built. `VaultConfig::build(path)` reads and parses the TOML file, resolves its relative paths against the file's directory (`OriginConfig::relative_to`, see [Relative paths in a config](#relative-paths-in-a-config)), and returns the vault's name, root id, and the matching `Box<dyn Origin>`. `OriginConfig::from_file(path)` builds just the `Box<dyn Origin>` from a TOML file containing only the `origin_config` shape (no `name`/`root_id`), for callers that want to talk to an origin directly without opening a `Vault` — see [Building an origin without a vault](#building-an-origin-without-a-vault). `OriginConfig::build(self)` takes `self` by value rather than `&self`, so it moves each variant's fields straight into the `Origin` it constructs instead of cloning them. `VaultConfig::save(path)` writes the config out, creating the parent directory if needed; `VaultConfig::default_dir()`/`default_path(name)` give the conventional location for a new vault's config (see [Where configs live](#where-configs-live)).
 - **`object.rs`** — `Object` (`Leaf` / `Branch` / `Root` variants), `ObjectId` (newtype around `String`, defaults to `ROOT_ID` (`"/"`), with `is_root()`), `Metadata` (size, content type, modified time, free-form `extra` map, plus `hash_value()` for a stable content hash). `Object::push` appends a child id onto a `Branch`/`Root`; `Object::with_id` overwrites an object's id in place (used by origins that rename an object on `put`, e.g. `OriginFileSystem`); `Object::with_name` does the same for the name, which is what turns a copy into a rename — `Origin::put` writes an object under its own `get_name()`, so setting the name before `put` is the only rename primitive there is (both are no-ops for `Root`). `Object::get_name()` returns `ROOT_NAME` (`"##ROOT##"`) for `Root`, which has no real name. `Object::changed(remote)` compares `hash_value()` on both sides' metadata to detect drift between a local and remote copy of the same object, returning `false` if either side has no metadata (e.g. `Root`).
-- **`origin/mod.rs`** — the `Origin` trait (`fetch`, `list`, `get`, `put`, `send`, `delete`, plus `Send + Sync`) that every backend implements.
+- **`origin/mod.rs`** — the `Origin` trait (`fetch`, `list`, `get`, `put`, `send`, `delete`, the optional `rename`, plus `Send + Sync`) that every backend implements.
 - **`origin/fs.rs`** — `OriginFileSystem`: origin backed by a directory on disk. `ObjectId`s are relative paths under `root`. `put` resolves the object's path as `{destination}/{name}`, renames the object in place (via `Object::with_id`) to that path, and creates the file/directory (`put` creates, `send` fills in). Names are validated and every id is resolved inside `root`, symlinks included (see [Symlinks](#symlinks-in-fs-vaults)). `put` creates a missing file but **never truncates** an existing one. `send` replaces contents **atomically**: it writes a hidden sibling temp file (`.nimbus-tmp.*`, which `list` hides), fsyncs it, gives it the object's `modified` time if there is one, renames it over the destination, and fsyncs the directory. Readers see the old contents or the complete new ones, never a mix, and a failed or interrupted transfer leaves the destination untouched. `fsutil::atomic_write` is the same pattern for small files: configs and the session state.
 - **`origin/command.rs`** — `OriginCommand`: origin backed by shell commands, one per operation (`fetch_cmd`, `list_cmd`, `get_cmd`, `put_cmd`, `send_cmd`, `delete_cmd`). Every command runs under `sh -c` and is `{placeholder}`-templated with the object id, name, metadata and kind, plus arbitrary `extra_vars` (guarded by an internal `futures::lock::Mutex`, since `put` needs to set a `destination` var without requiring `&mut self`); `list`/`get` expect the command's stdout to be JSON matching `Object`. `put` runs `put_cmd`, then re-`get`s `"{destination}/{name}"` to return the stored `Object` — it does **not** rename the input object in place, unlike `OriginFileSystem`. See [Command templating](#command-templating) for which placeholders reach which template.
-- **`origin/http.rs`** — `OriginHTTP`: origin backed by a REST-ish HTTP API. `base_url` plus a `{id}`-templated path per operation (`fetch_url`, `list_url`, `get_url`, `put_url`, `send_url`, `delete_url`). Every URL is `base_url` (trailing `/` trimmed) followed by that operation's template with `{id}` substituted. `get`/`list` are `GET`s deserialized as JSON; `fetch` streams the response body; `put` `PUT`s the `Object` as JSON to `put_url` — with `{id}` filled in from the **destination**, not the object — then re-`get`s `"{destination}/{name}"` to return the stored `Object` (again, without mutating the input); `send` `PUT`s the payload stream as the request body of `send_url` (templated with the object's own id); `delete` is a `DELETE`. Any non-2xx response becomes a `VaultError`, with 404 mapped to `NotFound` and 401/403 to an error naming `[origin_config.auth]`, since that's where the cause is. Credentials come from `HttpAuth` (`with_auth`, or an `[auth]` table inside `[origin_config]`) and are attached in the one place every request passes through, so an operation added later can't forget to authenticate — see [Authenticating an HTTP origin](#authenticating-an-http-origin).
+- **`origin/http.rs`** — `OriginHTTP`: origin backed by a REST-ish HTTP API. `base_url` plus a `{id}`-templated path per operation (`fetch_url`, `list_url`, `get_url`, `put_url`, `send_url`, `delete_url`). Every URL is `base_url` (trailing `/` trimmed) followed by that operation's template with `{id}` substituted. `get`/`list` are `GET`s deserialized as JSON; `fetch` streams the response body; `put` `PUT`s the `Object` as JSON to `put_url` — with `{id}` filled in from the **destination**, not the object — then re-`get`s `"{destination}/{name}"` to return the stored `Object` (again, without mutating the input); `send` `PUT`s the payload stream as the request body of `send_url` (templated with the object's own id); `delete` is a `DELETE`. Any non-2xx response becomes a `VaultError`, with 404 mapped to `NotFound` and 401/403 to an error naming `[origin_config.auth]`, since that's where the cause is. Credentials come from `HttpAuth` (`with_auth`, or an `[auth]` table inside `[origin_config]`) and are attached in the one place every request passes through, so an operation added later can't forget to authenticate — see [Authenticating an HTTP origin](#authenticating-an-http-origin). An `https://` server no public CA vouches for is trusted through `[origin_config.tls]` (see [TLS](#tls-origin_configtls)), and an optional `rename_url` enables native moves (see [Moving and renaming](#moving-and-renaming)).
 - **`origin/vault.rs`** — `OriginVault`: origin backed by another `Vault` (held as `Arc<Vault>`). Every trait method just forwards to the wrapped vault's method of the same name — see [Using a vault as an origin](#using-a-vault-as-an-origin).
 - **`error.rs`** — `VaultError` (`thiserror`-based) / `VaultResult<T>`, the error type used across the crate. `NotFound` carries the id/url/name that wasn't found; `Io`, `Json`, `Toml`, and `HTTP` wrap the corresponding std/serde/toml/reqwest errors via `#[from]`.
+- **`secret.rs`** — `Secret`: a string for credentials (the daemon's bearer token, an `http` origin's inline `token` and the header built from it). Its `Debug` prints `<redacted>`, it serializes as the plain string so configs are unchanged, and it has no `==`: `Secret::matches` compares in constant time, and `expose()` hands out the value where it's needed.
 
 ## Origin trait
 
@@ -33,6 +34,13 @@ pub trait Origin: Send + Sync {
     async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object>;
     async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()>;
     async fn delete(&self, id: &ObjectId) -> VaultResult<()>;
+    // Optional: the default answers `Unsupported`, and callers fall back to copy + delete.
+    async fn rename(
+        &self,
+        id: &ObjectId,
+        new_parent: &ObjectId,
+        new_name: &str,
+    ) -> VaultResult<Object>;
 }
 ```
 
@@ -96,8 +104,17 @@ Which placeholders are available depends on the operation, because `put`/`send` 
 
 | Template | Gets |
 |----------|------|
-| `list_cmd`, `fetch_cmd`, `get_cmd`, `delete_cmd` | `{id}` + configured `extras` |
-| `put_cmd`, `send_cmd` | `{id}`, `{name}`, `{size}`, `{content_type}`, `{modified}`, `{kind}`, `{destination}`, the object's own `meta.extra`, + configured `extras` |
+| `list_cmd`, `fetch_cmd`, `get_cmd`, `delete_cmd` | `{id}` + configured `extras` + `{config_dir}` |
+| `put_cmd`, `send_cmd` | `{id}`, `{name}`, `{size}`, `{content_type}`, `{modified}`, `{kind}`, `{destination}`, the object's own `meta.extra`, + configured `extras` + `{config_dir}` |
+
+`{config_dir}` is the absolute directory of the config file the origin was loaded from, set
+when the file is read (`VaultConfig::build`, `OriginConfig::from_file`). It is the one
+placeholder also expanded **inside** `extras` values, so `root = "{config_dir}/data"` keeps a
+command vault's data next to its config wherever nimbus runs. Nothing else in `extras` is
+interpreted: they're plain strings, and nimbus can't know which ones are paths. `config_dir`
+is reserved, so an extra with that name is an error. Like every placeholder it is shell-quoted
+where a template uses it (see [Values are shell-quoted](#values-are-shell-quoted)). A config
+built in code with `OriginConfig::build` has no file, so no `{config_dir}`.
 
 `{kind}` is `leaf` or `branch`. Without it a `put_cmd` has no way to tell whether it is being
 asked to create a file or a directory, which makes `mkdir` impossible to implement against a
@@ -169,6 +186,30 @@ overwrite** anything they didn't mean to — the creator wizard checks before sa
 default path is derived from the vault name and reusing a name would otherwise destroy the
 existing config.
 
+## Relative paths in a config
+
+A relative path in a config file resolves against **the directory of the file that contains
+it**, not the current directory, so a config means the same thing wherever the program
+starts. Absolute paths are used as they are, and `~` is not expanded. The fields:
+
+- `fs`: `root`
+- `vault`: `path` (the inner config then resolves its own paths against *its* directory, so a
+  chain of nested vaults works however the files are laid out)
+- `http`: `[origin_config.auth]` `token_file` and `[origin_config.tls]` `ca_file`
+- `command`: none, since `extras` are plain strings; use `{config_dir}` (see
+  [Command templating](#command-templating))
+
+Resolution happens once, when the file is read: `VaultConfig::build` and
+`OriginConfig::from_file` call `OriginConfig::relative_to(fsutil::config_dir(path))` before
+building. Only that resolved copy is built, so `VaultConfig::save` writes paths exactly as they
+were given and never turns a relative path into an absolute one. `OriginConfig::build` on its
+own resolves nothing: a config built in code keeps the meaning its paths have for the current
+directory, and `relative_to` is there for a caller that wants the file behaviour.
+`fsutil::config_dir` and `fsutil::resolve_against` are the two helpers behind it, shared with
+the CLI and the daemon for their own config files.
+
+> New in 0.4.0 (unreleased): before it, relative paths resolved against the current directory, so an existing config that relied on that now means something else; make those paths absolute or relative to the config file. Until then, clone the repo and depend on the checkout: `cargo add nimbus-vault --path <checkout>/crates/vault`, or `nimbus-vault = { path = "<checkout>/crates/vault" }` in Cargo.toml
+
 ## Building an origin without a vault
 
 `OriginConfig::from_file(path)` reads just the `origin_config` shape from a TOML file and constructs the matching `Box<dyn Origin>` — no `name`, `root_id`, or `Vault` required:
@@ -216,8 +257,31 @@ unreadable file surfaces as the vault is opened rather than as a 401 halfway thr
 A vault that fails to open this way stays *registered* — an unset variable in one shell doesn't
 unregister it (see [`nimbus-core`](https://github.com/PeachGB/nimbus/tree/main/crates/core)).
 
-There is no TLS here beyond whatever `base_url` names: a bearer token on plaintext `http://` is
-readable by anything on the path.
+In code, an inline `token` is a `secret::Secret` (`HttpAuth::Bearer { token: Some("…".into()), .. }`,
+read back with `.expose()`), and `HttpAuth::header_value` returns the `Authorization` value as a
+`Secret` too, so `{:?}` on an `HttpAuth`, the header, or a `Vault` holding one never prints the
+token. `Secret` has no `==` (comparing secrets is what a timing attack measures), and so
+neither does `HttpAuth`: match on the variant instead.
+
+> New in 0.4.0 (unreleased): `HttpAuth::Bearer.token` was an `Option<String>`, and `HttpAuth` implemented `PartialEq`/`Eq`. Until then, clone the repo and depend on the checkout: `cargo add nimbus-vault --path <checkout>/crates/vault`, or `nimbus-vault = { path = "<checkout>/crates/vault" }` in Cargo.toml
+
+### TLS: `[origin_config.tls]`
+
+An `https://` `base_url` is verified against the public roots by default. For a server no public CA vouches for (a daemon with its own certificate), set exactly one of:
+
+> New in 0.4.0 (unreleased). Until then, clone the repo and depend on the checkout: `cargo add nimbus-vault --path <checkout>/crates/vault`, or `nimbus-vault = { path = "<checkout>/crates/vault" }` in Cargo.toml
+
+```toml
+[origin_config.tls]
+ca_file = "/etc/nimbus/ca.pem"   # trust only this CA (bundle); the public roots are then NOT trusted
+# or
+pin_sha256 = "AB:CD:…"           # trust exactly this certificate, like an SSH host key
+```
+
+- `ca_file` is a PEM bundle; the hostname in `base_url` must match the certificate. `~` is not expanded (nor is it for `token_file`).
+- `pin_sha256` is the certificate's SHA-256, 64 hex characters, colons and either case allowed: `openssl x509 -in cert.pem -noout -fingerprint -sha256`. Issuer, hostname and dates are not checked, but the server must still prove it holds the certificate's private key.
+- Both at once, neither, any plain `http://` request URL (`base_url`, a full-URL template, or `rename_url`, whichever order it is set in), an unreadable or certificate-less `ca_file`, or a malformed pin is an error when the vault opens. An empty `base_url` is fine when the templates themselves are full `https://` URLs.
+- There is no option to skip verification: TLS without authentication is defeated by anyone in the middle.
 
 ## Using a vault as an origin
 
@@ -241,7 +305,7 @@ type = "vault"
 path = "inner.toml"
 ```
 
-`OriginConfig::build`/`OriginConfig::from_file` open `inner.toml` as a full `Vault` (via `Vault::new`) and wrap it in an `OriginVault`, so `outer-vault`'s origin is `inner-vault` in its entirety — any error opening `inner.toml` (missing file, invalid TOML, bad origin config) propagates out of the outer build.
+`OriginConfig::build`/`OriginConfig::from_file` open `inner.toml` (relative to `outer.toml`'s directory when loaded from a file) as a full `Vault` (via `Vault::new`) and wrap it in an `OriginVault`, so `outer-vault`'s origin is `inner-vault` in its entirety — any error opening `inner.toml` (missing file, invalid TOML, bad origin config) propagates out of the outer build.
 
 ## Constants
 
@@ -257,7 +321,7 @@ These are `pub`, so external code (e.g. a custom `Origin`) can reuse the same ke
 
 ## Status
 
-192 unit tests (plus 45 doctests) covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths, plus authentication: every operation carrying the header — one mock per operation, so one that forgot would fail rather than pass unnoticed — no header at all when no credentials are configured, the 401 message, and each way a token can be resolved or refused), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
+Unit tests (plus doctests) cover `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths, plus authentication: every operation carrying the header — one mock per operation, so one that forgot would fail rather than pass unnoticed — no header at all when no credentials are configured, the 401 message, and each way a token can be resolved or refused), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
 
 Regression tests worth knowing about, all in `origin::command`: configured `extras` reaching `put_cmd`/`send_cmd`, `{kind}` distinguishing a leaf from a branch, per-object `meta.extra` beating a config default, and `{destination}` being refreshed rather than cached across two `put`s to different parents.
 

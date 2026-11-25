@@ -55,6 +55,20 @@ pub struct App {
     forgotten: HashSet<String>,
 }
 
+/// What [`App::migrate_legacy_session`] found at the legacy (temp-dir) session path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacySession {
+    /// No legacy file: nothing to do.
+    None,
+    /// The legacy file was moved to the new path.
+    Moved,
+    /// Both existed: the new file wins and the legacy one is left alone.
+    KeptNew,
+    /// The legacy file isn't plainly this user's own (the reason says why), so it was left
+    /// untouched and not imported.
+    Refused(String),
+}
+
 /// What [`App::save_edit`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
@@ -83,7 +97,10 @@ impl Default for App {
             current_vault: None,
             local_root: None,
             local_root_canonical: None,
-            state_path: Self::default_state_path(),
+            // No migration here, and no fallback: on a system with no state or data directory
+            // the path is empty, and `save` fails instead of writing somewhere unexpected.
+            state_path: Self::session_path(dirs::state_dir(), dirs::data_local_dir())
+                .unwrap_or_default(),
             saved_session: None,
             registered: HashSet::new(),
             forgotten: HashSet::new(),
@@ -98,11 +115,180 @@ impl App {
     pub fn current_vault(&self) -> Option<String> {
         self.current_vault.clone()
     }
-    fn default_state_path() -> PathBuf {
-        dirs::state_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("nimbus")
-            .join("session.toml")
+    /// Where the session file lives: `nimbus/session.toml` under the platform's state
+    /// directory, else its local data directory (macOS and Windows have no state directory).
+    /// `dirs::state_dir` honours `$XDG_STATE_HOME` on Linux. Never the temp directory, which
+    /// the system may clear: with neither directory there is no session to keep.
+    fn session_path(
+        state_dir: Option<PathBuf>,
+        data_local_dir: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        state_dir
+            .or(data_local_dir)
+            .map(|dir| dir.join("nimbus").join("session.toml"))
+            .ok_or_else(|| {
+                anyhow!("no state or local data directory on this system; can't keep a session")
+            })
+    }
+
+    /// Where an older version may have left the session file: `<temp>/nimbus/session.toml`,
+    /// which it used only on systems with no state directory. With a state directory (every
+    /// Linux system) no older version ever wrote there, so there is nothing to migrate and the
+    /// temp directory is not looked at: any file there was put there by someone else.
+    fn legacy_session_path(state_dir: Option<&Path>, temp_dir: &Path) -> Option<PathBuf> {
+        match state_dir {
+            Some(_) => None,
+            None => Some(temp_dir.join("nimbus").join("session.toml")),
+        }
+    }
+
+    /// Moves a session file left at `legacy` by an older version to `new`.
+    ///
+    /// `legacy` sits in the shared temp directory, where any local user can create files, so it
+    /// is imported only if it is plainly this user's own (see [`Self::check_legacy_session`]);
+    /// otherwise it is left untouched and reported as [`LegacySession::Refused`]. A session
+    /// file names config files whose commands run as the user, so importing a planted one would
+    /// run someone else's commands.
+    ///
+    /// One rule when both exist: the new file wins, and the legacy one is left exactly as it
+    /// is ([`LegacySession::KeptNew`]), so nothing a newer run saved is ever overwritten.
+    /// The move never leaves a half-written `new`: a plain `rename`, or, when the temp
+    /// directory is another filesystem, an atomic copy (a temp file beside `new`, then a
+    /// rename) followed by removing the legacy file. Either way `new` ends up `0600`, like
+    /// every session save.
+    fn migrate_legacy_session(new: &Path, legacy: &Path) -> std::io::Result<LegacySession> {
+        // `symlink_metadata`, so a dangling symlink still counts as present and gets refused.
+        if std::fs::symlink_metadata(legacy).is_err() {
+            return Ok(LegacySession::None);
+        }
+        let state_dir = new
+            .parent()
+            .ok_or_else(|| std::io::Error::other("the session path has no directory"))?;
+        std::fs::create_dir_all(state_dir)?;
+        if let Err(reason) = Self::check_legacy_session(legacy, state_dir) {
+            return Ok(LegacySession::Refused(reason));
+        }
+        if new.exists() {
+            return Ok(LegacySession::KeptNew);
+        }
+        if std::fs::rename(legacy, new).is_ok() {
+            Self::make_private(new)?;
+        } else {
+            let bytes = std::fs::read(legacy)?;
+            nimbus_vault::fsutil::atomic_write(new, &bytes, Some(0o600))?;
+            std::fs::remove_file(legacy)?;
+        }
+        Ok(LegacySession::Moved)
+    }
+
+    /// Whether the legacy session file is one this user could have written and no one else
+    /// could have changed: on Unix, it and its `nimbus` directory must be a regular file and a
+    /// real directory (no symlinks: nothing is followed), owned by the owner of `state_dir`
+    /// (the directory this user just created), and not writable by group or others. On other
+    /// systems the temp directory is per-user, so there is nothing to check.
+    fn check_legacy_session(legacy: &Path, state_dir: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(state_dir)
+                .map_err(|e| format!("can't read {}: {e}", state_dir.display()))?
+                .uid();
+            let parent = legacy
+                .parent()
+                .ok_or_else(|| format!("{} has no directory", legacy.display()))?;
+            Self::check_owned_entry(parent, true, owner)?;
+            Self::check_owned_entry(legacy, false, owner)?;
+        }
+        #[cfg(not(unix))]
+        let _ = (legacy, state_dir);
+        Ok(())
+    }
+
+    /// One step of [`Self::check_legacy_session`]: `path`, not followed if it is a symlink, is
+    /// a directory (`dir`) or a regular file, owned by `owner`, and not group- or
+    /// world-writable. The error says which of these failed.
+    #[cfg(unix)]
+    fn check_owned_entry(path: &Path, dir: bool, owner: u32) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        let kind_ok = if dir {
+            meta.file_type().is_dir()
+        } else {
+            meta.file_type().is_file()
+        };
+        if !kind_ok {
+            let wanted = if dir { "a directory" } else { "a regular file" };
+            return Err(format!("{} is not {wanted}", path.display()));
+        }
+        if meta.uid() != owner {
+            return Err(format!(
+                "{} is owned by uid {}, not you (uid {owner})",
+                path.display(),
+                meta.uid()
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is writable by other users (mode {:o})",
+                path.display(),
+                meta.mode() & 0o777
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sets `path` to `0600` (Unix only): a renamed file keeps whatever mode it had.
+    fn make_private(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
+    }
+
+    /// The session file for this run, after moving a legacy one into place where there can be
+    /// one. Logs one line about what happened to a legacy file; a refused or failed move only
+    /// warns, and the session then starts from whatever is at the new path.
+    fn init_session_path() -> Result<PathBuf> {
+        let state_dir = dirs::state_dir();
+        let legacy = Self::legacy_session_path(state_dir.as_deref(), &std::env::temp_dir());
+        let path = Self::session_path(state_dir, dirs::data_local_dir())?;
+        if let Some(legacy) = legacy {
+            Self::report_migration(&path, &legacy, Self::migrate_legacy_session(&path, &legacy));
+        }
+        Ok(path)
+    }
+
+    /// Prints the one line [`Self::init_session_path`] logs about a legacy session file.
+    fn report_migration(path: &Path, legacy: &Path, outcome: std::io::Result<LegacySession>) {
+        match outcome {
+            Ok(LegacySession::None) => {}
+            Ok(LegacySession::Moved) => eprintln!(
+                "NOTE: moved the session file from {} to {}",
+                legacy.display(),
+                path.display()
+            ),
+            Ok(LegacySession::KeptNew) => eprintln!(
+                "NOTE: ignoring the old session file {}: {} is the one in use (delete the old \
+                 one to silence this)",
+                legacy.display(),
+                path.display()
+            ),
+            Ok(LegacySession::Refused(reason)) => eprintln!(
+                "WARNING: not importing the old session file {}: {reason}. It was left as it \
+                 is; this session starts without it",
+                legacy.display()
+            ),
+            Err(e) => eprintln!(
+                "WARNING: couldn't move the session file from {} to {}: {e}",
+                legacy.display(),
+                path.display()
+            ),
+        }
     }
     pub fn init() -> Result<Self> {
         let cli_config = CliConfig::load()?;
@@ -117,7 +303,7 @@ impl App {
             (None, None)
         };
 
-        let state_path = Self::default_state_path();
+        let state_path = Self::init_session_path()?;
         let saved = Self::load_state(&state_path)?;
 
         let saved_session = saved
@@ -551,7 +737,7 @@ impl App {
 
     pub fn select(&mut self, vault_name: String) -> Result<()> {
         if !self.vaults.contains_key(&vault_name) {
-            return Err(anyhow!("VAULT '{}' DOESN'T EXITS", vault_name));
+            return Err(anyhow!("VAULT '{}' DOESN'T EXIST", vault_name));
         }
         let Some(vault) = self.vaults.get(&vault_name) else {
             return Err(anyhow!("NO VAULT NAMED {}", vault_name));
@@ -562,24 +748,38 @@ impl App {
         Ok(())
     }
 
-    /// Registers the vault described by the config file at `cfg`.
+    /// Registers the vault described by the config file at `cfg`. The path is stored
+    /// canonical (absolute, symlinks resolved), so the vault opens again from any directory.
     ///
     /// Re-registering the *same* config path is allowed and reloads it, which is how an edit to
     /// a config file is picked up. A different config claiming a name that's already taken is
     /// refused: silently replacing the entry would leave the original vault unreachable, with
     /// nothing pointing at its data any more. [`Self::forget_vault`] is the way to free a name.
     pub fn new_vault(&mut self, cfg: PathBuf) -> Result<()> {
+        // Stored canonical, so the session can open it again from any directory, and so the
+        // same file reached by two spellings counts as the same config.
+        let cfg = cfg
+            .canonicalize()
+            .map_err(|e| anyhow!("CAN'T OPEN VAULT CONFIG {}: {e}", cfg.display()))?;
         let vault = Vault::new(cfg.clone())?;
         let name = vault.get_name().clone();
 
         if let Some(existing) = self.vault_configs.get(&name)
             && existing != &cfg
         {
-            return Err(anyhow!(
-                "VAULT '{}' IS ALREADY REGISTERED (config: {}) — FORGET IT FIRST OR PICK ANOTHER NAME",
-                name,
-                existing.display()
-            ));
+            if Self::is_same_config(existing, &cfg) {
+                eprintln!(
+                    "NOTE: vault '{name}' was registered as {}; now stored as {}",
+                    existing.display(),
+                    cfg.display()
+                );
+            } else {
+                return Err(anyhow!(
+                    "VAULT '{}' IS ALREADY REGISTERED (config: {}) — FORGET IT FIRST OR PICK ANOTHER NAME",
+                    name,
+                    existing.display()
+                ));
+            }
         }
 
         self.vault_configs.insert(name.clone(), cfg);
@@ -587,6 +787,16 @@ impl App {
         self.registered.insert(name.clone());
         self.vaults.insert(name, vault);
         self.save()
+    }
+
+    /// Whether a registry entry `existing` names the same file as the canonical path `cfg`.
+    /// Entries saved before registration canonicalized paths can be relative or otherwise
+    /// spelled differently; one that still resolves (from the current directory) to `cfg` is
+    /// the same vault, so `new` updates it instead of refusing the name.
+    fn is_same_config(existing: &Path, cfg: &Path) -> bool {
+        existing
+            .canonicalize()
+            .is_ok_and(|existing| existing == cfg)
     }
 
     /// Drops `name` from the registry, so nimbus stops tracking it. Purely a bookkeeping
@@ -604,7 +814,7 @@ impl App {
         // Against the registry, not the opened vaults: a vault whose config currently fails to
         // build is still registered, and forgetting it is exactly how you'd get rid of it.
         if !self.vaults.contains_key(&name) && !self.vault_configs.contains_key(&name) {
-            return Err(anyhow!("VAULT '{}' DOESN'T EXITS", name));
+            return Err(anyhow!("VAULT '{}' DOESN'T EXIST", name));
         }
         self.vaults.remove(&name);
         self.vault_configs.remove(&name);

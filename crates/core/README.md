@@ -58,7 +58,7 @@ a terminal is a bug worth reporting — the whole point of the split is that it 
 - **`app.rs`** — `App`: holds every registered `Vault` (by name), the special `LOCAL` vault (the
   user's own filesystem, when `default_local_vault` is enabled), the current vault/cwd, and
   vault-config paths so they can be re-registered on the next run. `App::init()` loads
-  `CliConfig`, opens the vaults registered in `<state>/nimbus/session.toml`, and (re-)registers
+  `CliConfig` (a relative `local_vault_path` resolves against `cli_config.toml`'s directory), opens the vaults registered in `<state>/nimbus/session.toml` (`<state>` is the platform state directory, else its local data directory, never the temp directory; on macOS and Windows only, a session file an older version left in the temp directory is moved over once. On macOS only if it is a regular file the user owns that no one else can write, in a directory that is the same (anything else is left alone with a warning); Windows's temp directory is per-user), and (re-)registers
   `LOCAL` if configured. `App::save()` writes that session file back.
 
   The session path is a **field** (`state_path`), not a constant, so tests can point it at a
@@ -171,7 +171,9 @@ standing in.
 - **`delete`** refuses a non-empty directory unless forced. The check only runs for directories:
   asking an origin to list a leaf is an error, not an empty listing, so applying it universally
   made every file undeletable without `--force`.
-- **`new_vault`** refuses a name already registered to a *different* config path — silently
+- **`new_vault`** canonicalizes the config path first, so the session stores an absolute path that
+  opens from any directory, and two spellings of one file count as the same config. It refuses a
+  name already registered to a *different* config path — silently
   replacing the entry would leave the original vault unreachable, with nothing pointing at its
   data. Re-registering the **same** path is allowed, and is how an edit to a config file gets
   picked up (including fixing one that failed to open). `forget_vault` frees a name; it is

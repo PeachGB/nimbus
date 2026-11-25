@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use nimbus_vault::{config::OriginConfig, origin::http::HttpAuth};
 
@@ -120,7 +120,7 @@ impl OriginKind {
         let get = |key: &str| values.get(key).cloned().unwrap_or_default();
         match self {
             OriginKind::Fs => OriginConfig::Fs {
-                root: get("root").into(),
+                root: absolute_answer(get("root")),
             },
             OriginKind::Http => {
                 let base_url = get("base_url");
@@ -138,6 +138,7 @@ impl OriginKind {
                     send_url: get("send_url"),
                     delete_url: get("delete_url"),
                     rename_url: None,
+                    tls: None,
                     auth: if token_env.is_empty() {
                         HttpAuth::None
                     } else {
@@ -168,8 +169,38 @@ impl OriginKind {
                 }
             }
             OriginKind::Vault => OriginConfig::Vault {
-                path: get("path").into(),
+                path: absolute_answer(get("path")),
             },
         }
+    }
+}
+
+/// A path typed at a wizard prompt, made absolute the way a shell would read it: a leading `~`
+/// is the home directory ([`expand_tilde`]), and anything else relative is relative to the
+/// current directory, which is what the prompt completes against. A saved config resolves its
+/// relative paths against its own directory instead, so the answer is stored absolute to keep
+/// the meaning the user typed, whether or not they pressed Tab. An answer that can't be made
+/// absolute (an empty one, or an unreadable cwd) is kept as typed.
+fn absolute_answer(answer: String) -> PathBuf {
+    let path = PathBuf::from(expand_tilde(&answer));
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+/// Expands a leading `~` or `~/...` to the user's home directory, so typed paths behave like
+/// they would in a shell. Left untouched if there's no such prefix (`~user` included, which
+/// names another user's home) or the home dir is unknown.
+pub(crate) fn expand_tilde(input: &str) -> String {
+    let rest = match input.strip_prefix('~') {
+        Some("") => "",
+        Some(rest) if rest.starts_with('/') => &rest[1..],
+        _ => return input.to_string(),
+    };
+    let Some(home) = dirs::home_dir() else {
+        return input.to_string();
+    };
+    if rest.is_empty() {
+        home.to_string_lossy().into_owned()
+    } else {
+        home.join(rest).to_string_lossy().into_owned()
     }
 }

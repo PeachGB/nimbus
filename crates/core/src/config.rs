@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +27,20 @@ impl CliConfig {
             });
         }
         let raw = std::fs::read_to_string(&path)?;
-        Ok(toml::from_str(&raw)?)
+        let config: CliConfig = toml::from_str(&raw)?;
+        config.relative_to(&path)
+    }
+
+    /// Resolves a relative `local_vault_path` against the directory of `config_path`, the file
+    /// it was read from, so it doesn't depend on the current directory.
+    fn relative_to(self, config_path: &Path) -> Result<Self> {
+        let dir = nimbus_vault::fsutil::config_dir(config_path)?;
+        Ok(CliConfig {
+            local_vault_path: self
+                .local_vault_path
+                .map(|path| nimbus_vault::fsutil::resolve_against(&dir, path)),
+            ..self
+        })
     }
     pub fn local_path(&self) -> PathBuf {
         self.local_vault_path

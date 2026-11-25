@@ -236,14 +236,6 @@ pub fn object_id(raw: &str) -> Result<ObjectId, ApiError> {
     })
 }
 
-pub async fn serve(listener: tokio::net::TcpListener, router: Router) -> std::io::Result<()> {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-}
-
 #[cfg(test)]
 #[path = "tests/api.rs"]
 mod tests;

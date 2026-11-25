@@ -3,26 +3,28 @@ use nimbus_vault::vault::Vault;
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tracing::warn;
 
-use crate::{auth::AuthConfig, config::Config, error::ApiError};
+use crate::{auth::Auth, config::Config, error::ApiError};
 
 #[derive(Clone)]
 pub struct AppState {
     vaults: Arc<HashMap<String, Vault>>,
     pub read_only: bool,
-    pub auth: Arc<AuthConfig>,
+    pub auth: Arc<Auth>,
 }
 
 impl AppState {
     pub fn load(config: &Config) -> Result<Self> {
+        // First, so a bad token file stops startup before any vault is opened.
+        let auth = config.auth.resolve()?;
         Ok(AppState {
             vaults: Arc::new(load_vaults(&config.vaults_path)?),
             read_only: config.read_only,
-            auth: Arc::new(config.auth.clone()),
+            auth: Arc::new(auth),
         })
     }
 
     #[cfg(test)]
-    pub fn from_parts(vaults: HashMap<String, Vault>, read_only: bool, auth: AuthConfig) -> Self {
+    pub fn from_parts(vaults: HashMap<String, Vault>, read_only: bool, auth: Auth) -> Self {
         AppState {
             vaults: Arc::new(vaults),
             read_only,

@@ -163,8 +163,10 @@
 pub mod config;
 /// The crate's error type, [`error::VaultError`], and the [`VaultResult`] alias built from it.
 pub mod error;
-/// Atomic file replacement ([`fsutil::atomic_write`]) and the temp-file naming it shares with
-/// the `fs` origin.
+/// Atomic file replacement ([`fsutil::atomic_write`]), the temp-file naming it shares with the
+/// `fs` origin, [`fsutil::read_secret`] for a secret kept alone in a file, and
+/// [`fsutil::config_dir`] / [`fsutil::resolve_against`] for resolving a config file's relative
+/// paths.
 pub mod fsutil;
 /// The tree node type, [`object::Object`], along with [`object::ObjectId`] and
 /// [`object::Metadata`].
@@ -172,6 +174,8 @@ pub mod object;
 /// The [`origin::Origin`] trait and its built-in implementations (`fs`, `http`, `command`,
 /// `vault`).
 pub mod origin;
+/// [`secret::Secret`], a string for credentials whose `Debug` never shows it.
+pub mod secret;
 /// [`vault::Vault`], the tree-like view over an `Origin` that ties everything together.
 pub mod vault;
 

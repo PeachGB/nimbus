@@ -19,6 +19,8 @@ bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 percent-encoding = "2.3"
+rustls.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -32,3 +34,5 @@ dirs.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 httpmock = "0.7"
+rcgen.workspace = true
+tokio-rustls.workspace = true

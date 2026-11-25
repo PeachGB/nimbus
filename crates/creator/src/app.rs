@@ -308,28 +308,11 @@ fn default_save_path(name: &str) -> String {
     VaultConfig::default_path(name).display().to_string()
 }
 
-/// Expands a leading `~` or `~/...` to the user's home directory, so typed paths behave like
-/// they would in a shell. Left untouched if there's no leading `~` or the home dir is unknown.
-fn expand_tilde(input: &str) -> String {
-    let Some(rest) = input.strip_prefix('~') else {
-        return input.to_string();
-    };
-    let Some(home) = dirs::home_dir() else {
-        return input.to_string();
-    };
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
-    if rest.is_empty() {
-        home.to_string_lossy().into_owned()
-    } else {
-        home.join(rest).to_string_lossy().into_owned()
-    }
-}
-
 /// Directory entries under `input`'s parent whose name starts with `input`'s last component,
 /// each formatted back into a path string (directories get a trailing `/`). Understands a
 /// leading `~` the way a shell would.
 fn path_suggestions(input: &str) -> Vec<String> {
-    let input = expand_tilde(input);
+    let input = crate::builder::expand_tilde(input);
     let path = Path::new(&input);
     let (dir, dir_is_dot, prefix) = if input.is_empty() || input.ends_with('/') {
         (

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Servidor de prueba para el origin "http" de nimbus (crates/vault/src/origin/http.rs).
-Sirve el directorio ./data como si fuera un vault remoto, hablando el mismo JSON
-que espera OriginHTTP (el enum `Object` de object.rs, con tag externo:
+Test server for nimbus's "http" origin (crates/vault/src/origin/http.rs).
+Serves the ./data directory as if it were a remote vault, speaking the same JSON
+that OriginHTTP expects (the `Object` enum from object.rs, externally tagged:
 {"Leaf": {...}} / {"Branch": {...}}).
 
-Uso:
-    python3 server.py [puerto]   # default 8787
+Usage:
+    python3 server.py [port]   # default 8787
 """
 import http.server
 import json
@@ -155,7 +155,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
-        print(f"sirviendo {DATA_DIR} en http://127.0.0.1:{PORT}")
+        print(f"serving {DATA_DIR} at http://127.0.0.1:{PORT}")
         httpd.serve_forever()
 
 

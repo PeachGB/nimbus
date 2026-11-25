@@ -74,18 +74,41 @@ fn an_empty_directory_serves_no_vaults() {
 
 #[test]
 fn writes_are_refused_only_when_read_only() {
-    let open = AppState::from_parts(HashMap::new(), false, AuthConfig::None);
+    let open = AppState::from_parts(HashMap::new(), false, Auth::None);
     assert!(open.ensure_writable().is_ok());
 
-    let locked = AppState::from_parts(HashMap::new(), true, AuthConfig::None);
+    let locked = AppState::from_parts(HashMap::new(), true, Auth::None);
     assert!(matches!(locked.ensure_writable(), Err(ApiError::ReadOnly)));
 }
 
 #[test]
 fn an_unknown_vault_name_is_reported_with_the_name() {
-    let state = AppState::from_parts(HashMap::new(), false, AuthConfig::None);
+    let state = AppState::from_parts(HashMap::new(), false, Auth::None);
     match state.vault("nope") {
         Err(ApiError::UnknownVault(name)) => assert_eq!(name, "nope"),
         other => panic!("expected UnknownVault, got {other:?}"),
     }
+}
+
+#[test]
+fn load_fails_naming_a_missing_token_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        vaults_path: dir.path().to_path_buf(),
+        bind: "127.0.0.1:8080".parse().unwrap(),
+        read_only: false,
+        auth: crate::auth::AuthConfig::Bearer {
+            token: None,
+            token_file: Some(dir.path().join("missing-token")),
+        },
+        tls: None,
+        allow_insecure_http: false,
+    };
+
+    let error = match AppState::load(&config) {
+        Ok(_) => panic!("a missing token file should stop startup"),
+        Err(e) => format!("{e:#}"),
+    };
+
+    assert!(error.contains("missing-token"), "{error}");
 }

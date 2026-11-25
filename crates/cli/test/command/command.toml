@@ -10,4 +10,4 @@ send_cmd   = "{root}/send.sh {root}/data/{id}"
 delete_cmd = "rm -rf {root}/data/{id}"
 
 [origin_config.extras]
-root = "/home/arian/projects/rust/nimbus/crates/cli/test/command"
+root = "{config_dir}"

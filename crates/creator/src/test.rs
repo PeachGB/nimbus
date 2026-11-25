@@ -225,3 +225,47 @@ fn a_refused_save_can_be_retried_at_another_path() {
     let vault = nimbus_vault::vault::Vault::new(free).unwrap();
     assert_eq!(vault.get_name(), "newcomer");
 }
+
+#[test]
+fn a_relative_path_answer_is_saved_absolute_against_the_cwd() {
+    use crate::builder::OriginKind;
+    use nimbus_vault::config::OriginConfig;
+    use std::collections::HashMap;
+
+    let cwd = std::env::current_dir().unwrap();
+    let answers = |key: &str, value: &str| HashMap::from([(key.to_string(), value.to_string())]);
+
+    // The prompt completes against the cwd, so that is what a relative answer means; stored
+    // as typed, it would resolve against the saved config's directory instead.
+    match OriginKind::Fs.build(&answers("root", "data")) {
+        OriginConfig::Fs { root } => assert_eq!(root, cwd.join("data")),
+        _ => panic!("expected an fs config"),
+    }
+    match OriginKind::Vault.build(&answers("path", "inner.toml")) {
+        OriginConfig::Vault { path } => assert_eq!(path, cwd.join("inner.toml")),
+        _ => panic!("expected a vault config"),
+    }
+}
+
+#[test]
+fn a_tilde_path_answer_is_saved_under_the_home_directory() {
+    use crate::builder::OriginKind;
+    use nimbus_vault::config::OriginConfig;
+    use std::collections::HashMap;
+
+    let Some(home) = dirs::home_dir() else {
+        return; // nothing to expand to on this system
+    };
+    let answers = |value: &str| HashMap::from([("root".to_string(), value.to_string())]);
+    let root_for = |value: &str| match OriginKind::Fs.build(&answers(value)) {
+        OriginConfig::Fs { root } => root,
+        _ => panic!("expected an fs config"),
+    };
+
+    // Typed without Tab: the same expansion completion would have done.
+    assert_eq!(root_for("~/vault-data"), home.join("vault-data"));
+    assert_eq!(root_for("~"), home);
+    // `~user` is another user's home, not this one's: left to the cwd rule like any name.
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(root_for("~other/x"), cwd.join("~other/x"));
+}

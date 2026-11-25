@@ -13,6 +13,8 @@ pub mod command;
 pub mod fs;
 /// [`http::OriginHTTP`]: an origin backed by a REST-ish HTTP API.
 pub mod http;
+/// Server trust for the http origin: `[origin_config.tls]` parsing and certificate pinning.
+pub mod tls;
 /// [`vault::OriginVault`]: an origin backed by another `Vault`.
 pub mod vault;
 

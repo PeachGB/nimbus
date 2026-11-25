@@ -195,6 +195,56 @@ fn new_vault_re_registering_the_same_config_is_allowed() {
     assert_eq!(app.vault_configs.get("reloadable"), Some(&path));
 }
 
+/// `path` (absolute) spelled relative to the current directory, the way a session written
+/// before registration canonicalized paths could hold it, without changing the cwd.
+fn relative_from_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative: PathBuf = std::iter::repeat_n("..", cwd.components().count() - 1).collect();
+    relative.push(path.strip_prefix("/").unwrap());
+    relative
+}
+
+#[test]
+fn new_vault_updates_an_old_relative_entry_for_the_same_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_vault_config(dir.path(), "v.toml", "upgraded");
+    let mut app = make_app(HashMap::new());
+    app.vault_configs
+        .insert("upgraded".to_string(), relative_from_cwd(&path));
+
+    app.new_vault(path.clone()).unwrap();
+
+    assert_eq!(
+        app.vault_configs.get("upgraded"),
+        Some(&path.canonicalize().unwrap())
+    );
+}
+
+#[test]
+fn new_vault_stores_the_canonical_absolute_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_vault_config(dir.path(), "v.toml", "canonical");
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    // Relative to the cwd and with a `..` in it: two ways a typed path differs from the file.
+    let typed = relative_from_cwd(&dir.path().join("sub/../v.toml"));
+
+    let mut app = make_app(HashMap::new());
+    app.new_vault(typed).unwrap();
+
+    let stored = app.vault_configs.get("canonical").unwrap();
+    assert!(stored.is_absolute());
+    assert_eq!(stored, &path.canonicalize().unwrap());
+}
+
+#[test]
+fn new_vault_names_a_config_that_does_not_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let mut app = make_app(HashMap::new());
+    let error = app.new_vault(missing.clone()).unwrap_err().to_string();
+    assert!(error.contains(&missing.display().to_string()), "{error}");
+}
+
 #[test]
 fn forget_vault_frees_the_name_for_a_different_config() {
     let dir = tempfile::tempdir().unwrap();
@@ -2154,4 +2204,188 @@ async fn mv_force_still_replaces_a_file() {
         );
         assert!(!root.path().join("a.txt").exists(), "native={native}");
     }
+}
+
+// --- session file location ---
+
+#[test]
+fn session_path_prefers_the_state_dir() {
+    let path = App::session_path(Some("/state".into()), Some("/data".into())).unwrap();
+    assert_eq!(path, PathBuf::from("/state/nimbus/session.toml"));
+}
+
+#[test]
+fn session_path_falls_back_to_the_local_data_dir() {
+    let path = App::session_path(None, Some("/data".into())).unwrap();
+    assert_eq!(path, PathBuf::from("/data/nimbus/session.toml"));
+}
+
+#[test]
+fn session_path_refuses_to_guess_without_either_dir() {
+    assert!(App::session_path(None, None).is_err());
+}
+
+#[test]
+fn legacy_session_path_is_under_the_temp_dir_without_a_state_dir() {
+    assert_eq!(
+        App::legacy_session_path(None, Path::new("/tmp")),
+        Some(PathBuf::from("/tmp/nimbus/session.toml"))
+    );
+}
+
+#[test]
+fn a_legacy_session_file_is_ignored_when_there_is_a_state_dir() {
+    // No older version wrote to the temp dir on such a system, so a file there is someone
+    // else's: it must not even be looked at.
+    assert_eq!(
+        App::legacy_session_path(Some(Path::new("/state")), Path::new("/tmp")),
+        None
+    );
+}
+
+/// A legacy and a new session path in one scratch dir; the new one's parent doesn't exist yet.
+fn session_paths(dir: &Path) -> (PathBuf, PathBuf) {
+    let legacy = dir.join("tmp/nimbus/session.toml");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    (dir.join("state/nimbus/session.toml"), legacy)
+}
+
+#[test]
+fn migrating_moves_a_legacy_session_file_and_makes_it_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let (new, legacy) = session_paths(dir.path());
+    std::fs::write(&legacy, "current_vault = \"old\"\n").unwrap();
+
+    let outcome = App::migrate_legacy_session(&new, &legacy).unwrap();
+
+    assert_eq!(outcome, LegacySession::Moved);
+    assert!(!legacy.exists());
+    assert_eq!(
+        std::fs::read_to_string(&new).unwrap(),
+        "current_vault = \"old\"\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&new).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[test]
+fn migrating_keeps_the_new_session_file_when_both_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let (new, legacy) = session_paths(dir.path());
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "current_vault = \"old\"\n").unwrap();
+    std::fs::write(&new, "current_vault = \"new\"\n").unwrap();
+
+    let outcome = App::migrate_legacy_session(&new, &legacy).unwrap();
+
+    assert_eq!(outcome, LegacySession::KeptNew);
+    assert_eq!(
+        std::fs::read_to_string(&new).unwrap(),
+        "current_vault = \"new\"\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&legacy).unwrap(),
+        "current_vault = \"old\"\n"
+    );
+}
+
+#[test]
+fn migrating_does_nothing_without_a_legacy_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (new, legacy) = session_paths(dir.path());
+
+    let outcome = App::migrate_legacy_session(&new, &legacy).unwrap();
+
+    assert_eq!(outcome, LegacySession::None);
+    assert!(!new.exists());
+}
+
+/// Asserts that migrating refuses the legacy file, leaving it (and the new path) untouched.
+#[cfg(unix)]
+fn assert_migration_refused(new: &Path, legacy: &Path, why: &str) {
+    let before = std::fs::symlink_metadata(legacy).unwrap();
+    match App::migrate_legacy_session(new, legacy).unwrap() {
+        LegacySession::Refused(reason) => assert!(reason.contains(why), "{reason}"),
+        other => panic!("expected a refusal ({why}), got {other:?}"),
+    }
+    assert!(!new.exists());
+    let after = std::fs::symlink_metadata(legacy).unwrap();
+    assert_eq!(before.file_type(), after.file_type());
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_group_or_world_writable_legacy_session_file_is_refused() {
+    for mode in [0o620, 0o602, 0o666] {
+        let dir = tempfile::tempdir().unwrap();
+        let (new, legacy) = session_paths(dir.path());
+        std::fs::write(&legacy, "current_vault = \"planted\"\n").unwrap();
+        set_mode(&legacy, mode);
+        assert_migration_refused(&new, &legacy, "writable by other users");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_legacy_session_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (new, legacy) = session_paths(dir.path());
+    let target = dir.path().join("elsewhere.toml");
+    std::fs::write(&target, "current_vault = \"planted\"\n").unwrap();
+    std::os::unix::fs::symlink(&target, &legacy).unwrap();
+    assert_migration_refused(&new, &legacy, "not a regular file");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_legacy_session_file_in_a_writable_directory_is_refused() {
+    for mode in [0o775, 0o777, 0o1777] {
+        let dir = tempfile::tempdir().unwrap();
+        let (new, legacy) = session_paths(dir.path());
+        std::fs::write(&legacy, "current_vault = \"planted\"\n").unwrap();
+        set_mode(legacy.parent().unwrap(), mode);
+        assert_migration_refused(&new, &legacy, "writable by other users");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_legacy_session_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("session.toml"), "current_vault = \"planted\"\n").unwrap();
+    std::fs::create_dir(dir.path().join("tmp")).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("tmp/nimbus")).unwrap();
+    let new = dir.path().join("state/nimbus/session.toml");
+    let legacy = dir.path().join("tmp/nimbus/session.toml");
+    assert_migration_refused(&new, &legacy, "not a directory");
+}
+
+// A file owned by another uid can't be created without root, so ownership is checked through
+// `check_owned_entry` directly, with an owner that isn't the file's.
+#[cfg(unix)]
+#[test]
+fn a_legacy_session_file_owned_by_another_user_is_refused() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.toml");
+    std::fs::write(&file, "").unwrap();
+    let mine = std::fs::metadata(&file).unwrap().uid();
+
+    assert!(App::check_owned_entry(&file, false, mine).is_ok());
+    let error = App::check_owned_entry(&file, false, mine.wrapping_add(1)).unwrap_err();
+    assert!(error.contains("owned by uid"), "{error}");
+    let error = App::check_owned_entry(dir.path(), true, mine.wrapping_add(1)).unwrap_err();
+    assert!(error.contains("owned by uid"), "{error}");
 }

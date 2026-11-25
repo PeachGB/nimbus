@@ -1,7 +1,7 @@
 [package]
 name = "nimbus-daemon"
-description = """Serves a directory of nimbus vaults over HTTP, so a remote nimbus can mount \
-them through the `http` origin."""
+description = """Serves a directory of nimbus vaults over HTTP or HTTPS, so a remote nimbus \
+can mount them through the `http` origin."""
 readme = "README.md"
 documentation = "https://docs.rs/nimbus-daemon"
 keywords = ["nimbus", "sync", "vault", "server", "http"]
@@ -17,10 +17,12 @@ homepage.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+axum-server.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
 nimbus-vault = { version = "0.3.0", path = "../vault/" }
+rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 toml.workspace = true
@@ -29,6 +31,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 bytes.workspace = true
+rcgen.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

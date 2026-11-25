@@ -7,7 +7,8 @@ use std::{
 };
 
 /// Prefix of the in-flight temp files written next to a destination before they are renamed
-/// over it. [`crate::origin::fs::OriginFileSystem::list`] hides entries with this prefix.
+/// over it. [`OriginFileSystem`](crate::origin::fs::OriginFileSystem)'s
+/// [`Origin::list`](crate::origin::Origin::list) hides entries with this prefix.
 pub const TEMP_PREFIX: &str = ".nimbus-tmp.";
 
 /// A unique, hidden path next to `path` — same directory, so a later `rename` onto `path` stays
@@ -115,6 +116,71 @@ pub fn sync_parent_dir(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// The directory a config file's relative paths resolve against: the parent of `config_path`
+/// made absolute against the cwd ([`std::path::absolute`], so no symlink resolution and the
+/// file needn't exist). Being absolute is what makes the result independent of a later cwd.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use nimbus_vault::fsutil::config_dir;
+///
+/// assert_eq!(config_dir(Path::new("/etc/nimbus/vault.toml"))?, Path::new("/etc/nimbus"));
+/// assert_eq!(config_dir(Path::new("vault.toml"))?, std::env::current_dir()?);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn config_dir(config_path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(config_path)?;
+    Ok(absolute.parent().map(Path::to_path_buf).unwrap_or(absolute))
+}
+
+/// `path` if it is absolute, else `dir.join(path)`. No normalization, no filesystem access.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use nimbus_vault::fsutil::resolve_against;
+///
+/// let dir = Path::new("/etc/nimbus");
+/// assert_eq!(resolve_against(dir, "data".into()), PathBuf::from("/etc/nimbus/data"));
+/// assert_eq!(resolve_against(dir, "/srv/data".into()), PathBuf::from("/srv/data"));
+/// ```
+pub fn resolve_against(dir: &Path, path: PathBuf) -> PathBuf {
+    match path.is_absolute() {
+        true => path,
+        false => dir.join(path),
+    }
+}
+
+/// Reads a secret kept alone in a file, such as a bearer token. The contents are used
+/// verbatim, except that trailing `\r` and `\n` are dropped: an editor or `echo` adds a newline
+/// that isn't part of the secret. Leading and inner whitespace stay. `path` is used as given,
+/// with no `~` expansion. A file that is empty after trimming is an `InvalidData` error, so an
+/// empty file can't quietly mean "no secret". So is a file that isn't UTF-8.
+///
+/// # Examples
+///
+/// ```
+/// let dir = tempfile::tempdir()?;
+/// let path = dir.path().join("token");
+/// std::fs::write(&path, "s3cr3t\n")?;
+/// assert_eq!(nimbus_vault::fsutil::read_secret(&path)?, "s3cr3t");
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn read_secret(path: &Path) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(path)?;
+    let secret = raw.trim_end_matches(['\r', '\n']);
+    if secret.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the file is empty",
+        ));
+    }
+    Ok(secret.to_string())
 }
 
 #[cfg(test)]

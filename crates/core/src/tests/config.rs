@@ -38,3 +38,24 @@ fn local_path_falls_back_to_home_dir_when_unset() {
     let expected = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     assert_eq!(cfg.local_path(), expected);
 }
+
+#[test]
+fn a_relative_local_vault_path_resolves_against_the_config_dir() {
+    let cfg: CliConfig = toml::from_str("local_vault_path = \"files\"").unwrap();
+    let cfg = cfg
+        .relative_to(Path::new("/home/me/.config/.nimbus/cli_config.toml"))
+        .unwrap();
+    assert_eq!(
+        cfg.local_vault_path,
+        Some(PathBuf::from("/home/me/.config/.nimbus/files"))
+    );
+}
+
+#[test]
+fn an_absolute_local_vault_path_is_untouched() {
+    let cfg: CliConfig = toml::from_str("local_vault_path = \"/srv/files\"").unwrap();
+    let cfg = cfg
+        .relative_to(Path::new("/home/me/.config/.nimbus/cli_config.toml"))
+        .unwrap();
+    assert_eq!(cfg.local_vault_path, Some(PathBuf::from("/srv/files")));
+}

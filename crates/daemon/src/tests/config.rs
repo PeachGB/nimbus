@@ -16,6 +16,7 @@ fn flags_win_over_the_file() {
         bind: Some("127.0.0.1:1111".parse().unwrap()),
         read_only: Some(false),
         auth: None,
+        ..FileConfig::default()
     };
     let args = Args {
         vaults: Some(PathBuf::from("/from/flag")),
@@ -104,14 +105,17 @@ fn the_token_flag_replaces_the_configured_auth() {
         ..FileConfig::default()
     };
     let args = Args {
-        token: Some("from-flag".to_string()),
+        token: Some("from-flag".into()),
         ..args()
     };
 
     let config = Config::merge(file, &args, &config_path()).unwrap();
 
     match config.auth {
-        AuthConfig::Bearer { token } => assert_eq!(token, "from-flag"),
+        AuthConfig::Bearer { token, token_file } => {
+            assert_eq!(token.as_ref().map(Secret::expose), Some("from-flag"));
+            assert_eq!(token_file, None);
+        }
         other => panic!("expected a bearer token, got {other:?}"),
     }
 }
@@ -145,7 +149,9 @@ fn a_full_config_file_parses() {
     assert_eq!(file.vaults_path, Some(PathBuf::from("/srv/nimbus/vaults")));
     assert_eq!(file.read_only, Some(true));
     match file.auth.unwrap() {
-        AuthConfig::Bearer { token } => assert_eq!(token, "s3cr3t"),
+        AuthConfig::Bearer { token, .. } => {
+            assert_eq!(token.as_ref().map(Secret::expose), Some("s3cr3t"))
+        }
         other => panic!("expected a bearer token, got {other:?}"),
     }
 }
@@ -284,9 +290,7 @@ fn a_config_holding_a_bearer_token_is_written_private() {
 
     let mut with_token = FileConfig::initial();
     with_token.vaults_path = Some(dir.path().join("vaults"));
-    with_token.auth = Some(AuthConfig::Bearer {
-        token: "s3cr3t".to_string(),
-    });
+    with_token.auth = Some(bearer());
     let secret = dir.path().join("secret.toml");
     with_token.write(&secret).unwrap();
     assert_eq!(mode_of(&secret), 0o600);
@@ -296,4 +300,345 @@ fn a_config_holding_a_bearer_token_is_written_private() {
     let plain = dir.path().join("plain.toml");
     open.write(&plain).unwrap();
     assert_ne!(mode_of(&plain), 0o600);
+}
+
+// --- TLS settings and the plain-HTTP safety rule ---
+
+/// A resolved config with `bind` and `auth`, and everything TLS-related off.
+fn config_with(bind: &str, auth: AuthConfig) -> Config {
+    Config {
+        vaults_path: PathBuf::from("/vaults"),
+        bind: bind.parse().unwrap(),
+        read_only: false,
+        auth,
+        tls: None,
+        allow_insecure_http: false,
+    }
+}
+
+fn bearer() -> AuthConfig {
+    AuthConfig::Bearer {
+        token: Some("s3cr3t".into()),
+        token_file: None,
+    }
+}
+
+fn bearer_from_file() -> AuthConfig {
+    AuthConfig::Bearer {
+        token: None,
+        token_file: Some(PathBuf::from("/etc/nimbus/token")),
+    }
+}
+
+fn some_tls() -> TlsConfig {
+    TlsConfig {
+        cert_file: PathBuf::from("/etc/nimbus/cert.pem"),
+        key_file: PathBuf::from("/etc/nimbus/key.pem"),
+    }
+}
+
+#[test]
+fn validate_refuses_a_bearer_token_over_plain_http_on_a_reachable_address() {
+    for bind in ["192.168.1.10:8080", "0.0.0.0:8080", "[::]:8080"] {
+        let error = config_with(bind, bearer()).validate().unwrap_err();
+        assert!(error.to_string().contains("plain HTTP"), "{bind}: {error}");
+    }
+}
+
+#[test]
+fn validate_allows_it_with_allow_insecure_http_but_warns() {
+    let mut config = config_with("0.0.0.0:8080", bearer());
+    config.allow_insecure_http = true;
+    let warnings = config.validate().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("allow_insecure_http")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn validate_accepts_loopback_or_tls_without_warnings() {
+    for bind in ["127.0.0.1:8080", "[::1]:8080"] {
+        assert_eq!(
+            config_with(bind, bearer()).validate().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+    let mut with_tls = config_with("0.0.0.0:8443", bearer());
+    with_tls.tls = Some(some_tls());
+    assert_eq!(with_tls.validate().unwrap(), Vec::<String>::new());
+}
+
+#[test]
+fn validate_only_warns_about_no_auth_on_a_reachable_address() {
+    let warnings = config_with("0.0.0.0:8080", AuthConfig::None)
+        .validate()
+        .unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("no authentication"), "{warnings:?}");
+    assert!(
+        config_with("127.0.0.1:8080", AuthConfig::None)
+            .validate()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_tls_table_round_trips_through_the_config_file() {
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        allow_insecure_http: Some(true),
+        tls: Some(some_tls()),
+        ..FileConfig::default()
+    };
+    let written = toml::to_string_pretty(&file).unwrap();
+    assert!(written.contains("[tls]"), "{written}");
+    let read_back: FileConfig = toml::from_str(&written).unwrap();
+    assert_eq!(read_back.tls, Some(some_tls()));
+    assert_eq!(read_back.allow_insecure_http, Some(true));
+}
+
+#[test]
+fn the_generated_default_config_has_no_tls_settings() {
+    let written = toml::to_string_pretty(&FileConfig::initial()).unwrap();
+    assert!(!written.contains("tls"), "{written}");
+    assert!(!written.contains("allow_insecure_http"), "{written}");
+}
+
+#[test]
+fn an_unknown_key_in_the_tls_table_is_an_error() {
+    let raw = "vaults_path = \"/vaults\"\n\n[tls]\ncert_file = \"c.pem\"\nkey_file = \"k.pem\"\nskip_verify = true\n";
+    assert!(toml::from_str::<FileConfig>(raw).is_err());
+}
+
+#[test]
+fn tls_cert_without_tls_key_is_an_error() {
+    // Rejected by clap on the command line...
+    assert!(Args::try_parse_from(["nimbus-daemon", "--tls-cert", "c.pem"]).is_err());
+    assert!(Args::try_parse_from(["nimbus-daemon", "--tls-key", "k.pem"]).is_err());
+    // ...and by merge for an `Args` built any other way.
+    let args = Args {
+        tls_cert: Some(PathBuf::from("c.pem")),
+        ..Args::default()
+    };
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        ..FileConfig::default()
+    };
+    assert!(Config::merge(file, &args, &config_path()).is_err());
+}
+
+#[test]
+fn tls_flags_win_over_the_tls_table() {
+    let parsed = Args::try_parse_from([
+        "nimbus-daemon",
+        "--tls-cert",
+        "flag.pem",
+        "--tls-key",
+        "flag.key",
+    ])
+    .unwrap();
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        tls: Some(some_tls()),
+        ..FileConfig::default()
+    };
+    let config = Config::merge(file, &parsed, &config_path()).unwrap();
+    assert_eq!(
+        config.tls,
+        Some(TlsConfig {
+            cert_file: PathBuf::from("flag.pem"),
+            key_file: PathBuf::from("flag.key"),
+        })
+    );
+
+    let from_file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        tls: Some(some_tls()),
+        ..FileConfig::default()
+    };
+    let config = Config::merge(from_file, &args(), &config_path()).unwrap();
+    assert_eq!(config.tls, Some(some_tls()));
+}
+
+#[test]
+fn allow_insecure_http_comes_only_from_the_file() {
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        allow_insecure_http: Some(true),
+        ..FileConfig::default()
+    };
+    assert!(
+        Config::merge(file, &args(), &config_path())
+            .unwrap()
+            .allow_insecure_http
+    );
+    assert!(Args::try_parse_from(["nimbus-daemon", "--allow-insecure-http"]).is_err());
+}
+
+// --- token_file ---
+
+#[test]
+fn the_auth_table_accepts_token_file() {
+    let raw = r#"
+        [auth]
+        type = "bearer"
+        token_file = "/etc/nimbus/token"
+    "#;
+
+    let file: FileConfig = toml::from_str(raw).unwrap();
+
+    match file.auth.unwrap() {
+        AuthConfig::Bearer { token, token_file } => {
+            assert_eq!(token.as_ref().map(Secret::expose), None);
+            assert_eq!(token_file, Some(PathBuf::from("/etc/nimbus/token")));
+        }
+        other => panic!("expected a bearer token file, got {other:?}"),
+    }
+}
+
+#[test]
+fn token_flag_replaces_a_token_file_from_the_file() {
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        auth: Some(bearer_from_file()),
+        ..FileConfig::default()
+    };
+    let args = Args {
+        token: Some("from-flag".into()),
+        ..args()
+    };
+
+    let config = Config::merge(file, &args, &config_path()).unwrap();
+
+    match config.auth {
+        AuthConfig::Bearer { token, token_file } => {
+            assert_eq!(token.as_ref().map(Secret::expose), Some("from-flag"));
+            assert_eq!(token_file, None);
+        }
+        other => panic!("expected a bearer token, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_refuses_a_token_file_over_plain_http_on_a_reachable_address() {
+    let error = config_with("0.0.0.0:8080", bearer_from_file())
+        .validate()
+        .unwrap_err();
+    assert!(error.to_string().contains("plain HTTP"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_with_only_a_token_file_is_not_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = FileConfig::initial();
+    config.vaults_path = Some(dir.path().join("vaults"));
+    config.auth = Some(bearer_from_file());
+    assert!(!bearer_from_file().holds_secret());
+
+    let path = dir.path().join("daemon_config.toml");
+    config.write(&path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_ne!(mode, 0o600);
+}
+
+// --- secrets stay out of Debug ---
+
+#[test]
+fn no_debug_view_shows_the_token() {
+    let args = Args::try_parse_from(["nimbus-daemon", "--token", "s3cr3t"]).unwrap();
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/vaults")),
+        auth: Some(bearer()),
+        ..FileConfig::default()
+    };
+    let file_view = format!("{file:?}");
+    let config = Config::merge(file, &args, &config_path()).unwrap();
+    let views = [
+        format!("{:?}", bearer()),
+        format!("{:?}", bearer().resolve().unwrap()),
+        file_view,
+        format!("{args:?}"),
+        format!("{config:?}"),
+    ];
+
+    for view in views {
+        assert!(!view.contains("s3cr3t"), "{view}");
+    }
+}
+
+#[test]
+fn relative_paths_in_the_file_resolve_against_its_directory() {
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("vaults")),
+        auth: Some(AuthConfig::Bearer {
+            token: None,
+            token_file: Some(PathBuf::from("secrets/token")),
+        }),
+        tls: Some(TlsConfig {
+            cert_file: PathBuf::from("tls/cert.pem"),
+            key_file: PathBuf::from("../keys/key.pem"),
+        }),
+        ..FileConfig::default()
+    };
+    let config = Config::merge(file, &args(), Path::new("/etc/nimbus/daemon_config.toml")).unwrap();
+
+    assert_eq!(config.vaults_path, PathBuf::from("/etc/nimbus/vaults"));
+    assert_eq!(
+        config.tls,
+        Some(TlsConfig {
+            cert_file: PathBuf::from("/etc/nimbus/tls/cert.pem"),
+            key_file: PathBuf::from("/etc/nimbus/../keys/key.pem"),
+        })
+    );
+    match config.auth {
+        AuthConfig::Bearer { token_file, .. } => {
+            assert_eq!(token_file, Some(PathBuf::from("/etc/nimbus/secrets/token")))
+        }
+        other => panic!("expected bearer auth, got {other:?}"),
+    }
+}
+
+#[test]
+fn absolute_paths_in_the_file_are_untouched() {
+    let file = FileConfig {
+        vaults_path: Some(PathBuf::from("/srv/vaults")),
+        tls: Some(some_tls()),
+        ..FileConfig::default()
+    };
+    let config = Config::merge(file, &args(), Path::new("/etc/nimbus/daemon_config.toml")).unwrap();
+    assert_eq!(config.vaults_path, PathBuf::from("/srv/vaults"));
+    assert_eq!(config.tls, Some(some_tls()));
+}
+
+#[test]
+fn path_flags_stay_relative_to_the_current_directory() {
+    let parsed = Args::try_parse_from([
+        "nimbus-daemon",
+        "--vaults",
+        "vaults",
+        "--tls-cert",
+        "cert.pem",
+        "--tls-key",
+        "key.pem",
+    ])
+    .unwrap();
+    let config = Config::merge(
+        FileConfig::default(),
+        &parsed,
+        Path::new("/etc/nimbus/daemon_config.toml"),
+    )
+    .unwrap();
+    assert_eq!(config.vaults_path, PathBuf::from("vaults"));
+    assert_eq!(
+        config.tls,
+        Some(TlsConfig {
+            cert_file: PathBuf::from("cert.pem"),
+            key_file: PathBuf::from("key.pem"),
+        })
+    );
 }
