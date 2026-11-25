@@ -25,5 +25,6 @@ toml.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tokio.workspace = true
 tempfile.workspace = true

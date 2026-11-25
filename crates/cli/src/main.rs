@@ -38,12 +38,18 @@ enum Commands {
         path: String,
         vault: Option<String>,
         dest: Option<String>,
+        /// overwrite an existing object of the same name
+        #[arg(short, long)]
+        force: bool,
     },
     ///gets object inside vault; without a destination it lands in the local vault's root
     Get {
         path: String,
         vault: Option<String>,
         dest: Option<String>,
+        /// overwrite an existing object of the same name
+        #[arg(short, long)]
+        force: bool,
     },
     ///creates a directory
     Mkdir {
@@ -80,6 +86,9 @@ enum Commands {
         path: String,
         destination: String,
         vault: Option<String>,
+        /// overwrite an existing object of the same name
+        #[arg(short, long)]
+        force: bool,
     },
     ///moves an object; paths are relative to the cwd, or prefix one with `vault:` to address
     ///another vault from its root. The destination may be an existing directory, or a new
@@ -88,14 +97,23 @@ enum Commands {
         path: String,
         destination: String,
         vault: Option<String>,
+        /// overwrite an existing object of the same name
+        #[arg(short, long)]
+        force: bool,
     },
-    ///push local vault into vault
+    ///push local vault into vault; files newer on the vault are reported, not overwritten
     Push {
         vault: Option<String>,
+        /// also overwrite files that are newer on the destination
+        #[arg(short, long)]
+        force: bool,
     },
-    ///pulls from origin onto local vault
+    ///pulls from origin onto local vault; files newer locally are reported, not overwritten
     Pull {
         vault: Option<String>,
+        /// also overwrite files that are newer on the destination
+        #[arg(short, long)]
+        force: bool,
     },
     Exit,
 }
@@ -105,6 +123,29 @@ enum Commands {
 #[allow(clippy::await_holding_refcell_ref)]
 async fn run_dispatch(app: &Rc<RefCell<App>>, cli: Cli) -> Result<()> {
     dispatch(&mut app.borrow_mut(), cli).await
+}
+
+/// Prints a push/pull summary. Conflicts aren't an error (everything else was synced), but they
+/// are what the user most needs to see, so they go to stderr with a hint.
+fn print_sync(report: nimbus_core::SyncReport) -> Result<()> {
+    match report.conflicts.is_empty() {
+        true => println!("{}", sync_summary(&report)),
+        false => eprintln!("{}", sync_summary(&report)),
+    }
+    Ok(())
+}
+
+/// The push/pull summary: counts, one line per conflict with its reason, and the `--force` hint
+/// only when some conflict can actually be forced. A file/directory mismatch or a symlink
+/// leaving the vault can't be, so suggesting it for those would send the user in circles.
+fn sync_summary(report: &nimbus_core::SyncReport) -> String {
+    match report.has_forceable_conflicts() {
+        true => format!(
+            "{report}\nfiles newer at the destination were left as they are; rerun with --force to \
+             overwrite them"
+        ),
+        false => report.to_string(),
+    }
 }
 
 async fn dispatch(app: &mut App, cli: Cli) -> Result<()> {
@@ -123,18 +164,30 @@ async fn dispatch(app: &mut App, cli: Cli) -> Result<()> {
             }
         }
         Commands::Cd { path } => app.cd(path).await,
-        Commands::Put { path, vault, dest } => app.put(path, vault, dest).await,
-        Commands::Get { path, vault, dest } => app.get(path, vault, dest).await,
+        Commands::Put {
+            path,
+            vault,
+            dest,
+            force,
+        } => app.put_with(path, vault, dest, force).await,
+        Commands::Get {
+            path,
+            vault,
+            dest,
+            force,
+        } => app.get_with(path, vault, dest, force).await,
         Commands::Cp {
             path,
             destination,
             vault,
-        } => app.cp(path, destination, vault).await,
+            force,
+        } => app.cp_with(path, destination, vault, force).await,
         Commands::Mv {
             path,
             destination,
             vault,
-        } => app.mv(path, destination, vault).await,
+            force,
+        } => app.mv_with(path, destination, vault, force).await,
         Commands::Mkdir { path, vault } => app.mkdir(path, vault).await,
         Commands::Touch { path, vault } => app.touch(path, vault).await,
         Commands::Forget { vault } => app.forget_vault(vault),
@@ -144,8 +197,8 @@ async fn dispatch(app: &mut App, cli: Cli) -> Result<()> {
             vault,
         } => app.rename(path, new_name, vault).await,
         Commands::Delete { path, vault, force } => app.delete(path, vault, force).await,
-        Commands::Push { vault } => app.push(vault).await,
-        Commands::Pull { vault } => app.pull(vault).await,
+        Commands::Push { vault, force } => print_sync(app.push_with(vault, force).await?),
+        Commands::Pull { vault, force } => print_sync(app.pull_with(vault, force).await?),
         Commands::Exit => app.exit(),
     }
 }

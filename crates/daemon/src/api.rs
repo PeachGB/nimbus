@@ -2,10 +2,10 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path as UrlPath, State},
-    http::header,
+    http::{HeaderMap, header},
     middleware,
     response::IntoResponse,
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
 };
 use futures::StreamExt;
 use nimbus_vault::{
@@ -35,7 +35,8 @@ pub fn router(state: AppState) -> Router {
             .route(&route("fetch"), get(fetch))
             .route(&route("put"), put(put_object))
             .route(&route("send"), put(send))
-            .route(&route("delete"), delete(delete_object));
+            .route(&route("delete"), delete(delete_object))
+            .route(&route("rename"), post(rename_object));
     }
 
     vaults
@@ -90,6 +91,10 @@ async fn put_object(
 ) -> Result<Json<Object>, ApiError> {
     state.ensure_writable()?;
     let (vault, destination) = target(&state, &params)?;
+    // `target` vets the id in the URL; the name in the body is the other half of where the
+    // object lands, and a `../x` there would put it outside the vault.
+    nimbus_vault::object::validate_name(&object.get_name())
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(
         vault.get_origin().put(&mut object, &destination).await?,
     ))
@@ -98,13 +103,22 @@ async fn put_object(
 async fn send(
     State(state): State<AppState>,
     UrlPath(params): UrlPath<HashMap<String, String>>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<(), ApiError> {
     state.ensure_writable()?;
     let (vault, id) = target(&state, &params)?;
     let origin = vault.get_origin();
 
-    let object = origin.get(&id).await?;
+    // The stored object takes the time the client sent (its source's), or the current time
+    // when there is none. Leaving the metadata `get` returned would re-stamp the file with
+    // its own old time.
+    let modified = modified_header(&headers)?;
+    let mut object = origin.get(&id).await?;
+    if let Some(mut meta) = object.get_meta() {
+        meta.modified = modified;
+        object.set_meta(meta);
+    }
     let payload = body
         .into_data_stream()
         .map(|chunk| chunk.map_err(|e| VaultError::OriginError(e.to_string())))
@@ -112,6 +126,61 @@ async fn send(
 
     origin.send(&object, payload).await?;
     Ok(())
+}
+
+/// The optional `x-nimbus-modified` header of a `send`: the source's modification time, which
+/// the stored copy takes. `Ok(None)` when absent; a value that isn't RFC 3339 is a
+/// [`ApiError::BadRequest`].
+pub fn modified_header(
+    headers: &HeaderMap,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    let Some(value) = headers.get(nimbus_vault::MODIFIED_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|time| Some(time.with_timezone(&chrono::Utc)))
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "{} must be an RFC 3339 timestamp",
+                nimbus_vault::MODIFIED_HEADER
+            ))
+        })
+}
+
+/// Body of `POST .../rename/{id}`: where to move the object, and under what name.
+#[derive(serde::Deserialize)]
+struct RenameRequest {
+    /// The new parent's id; empty or `/` for the vault root.
+    destination: String,
+    /// The object's new name: a single path component.
+    name: String,
+}
+
+/// Moves an object in one step through the origin's native rename (a single `rename(2)` for
+/// an fs vault). Answers `501` when the origin can't, so a client can fall back to
+/// copy-then-delete.
+async fn rename_object(
+    State(state): State<AppState>,
+    UrlPath(params): UrlPath<HashMap<String, String>>,
+    Json(request): Json<RenameRequest>,
+) -> Result<Json<Object>, ApiError> {
+    state.ensure_writable()?;
+    let (vault, id) = target(&state, &params)?;
+    let destination = match request.destination.as_str() {
+        "" | "/" => vault.get_id(),
+        raw => object_id(raw)?,
+    };
+    nimbus_vault::object::validate_name(&request.name)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        vault
+            .get_origin()
+            .rename(&id, &destination, &request.name)
+            .await?,
+    ))
 }
 
 async fn delete_object(

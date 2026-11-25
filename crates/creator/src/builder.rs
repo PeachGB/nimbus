@@ -137,6 +137,7 @@ impl OriginKind {
                     put_url: get("put_url"),
                     send_url: get("send_url"),
                     delete_url: get("delete_url"),
+                    rename_url: None,
                     auth: if token_env.is_empty() {
                         HttpAuth::None
                     } else {
@@ -163,6 +164,7 @@ impl OriginKind {
                     send_cmd: get("send_cmd"),
                     delete_cmd: get("delete_cmd"),
                     extras,
+                    rename_cmd: None,
                 }
             }
             OriginKind::Vault => OriginConfig::Vault {

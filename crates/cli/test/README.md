@@ -60,13 +60,18 @@ ls
   interpolaban el `meta.extra` del objeto, por eso acá están hardcodeados.
 - `send` ahora corre bajo `sh -c` como el resto, así que `send_cmd` puede ser un
   comando con argumentos y placeholders — ya no tiene que ser la ruta pelada a un
-  script. `command/send.sh` vuelca stdin a un archivo fijo
-  (`data/last-upload.bin`), que era el único `send` posible antes; un `send`
-  correcto por objeto tendría que escribir en `{root}/data/{id}`.
+  script. `command/send.sh` recibe el destino como argumento
+  (`{root}/data/{id}`), escribe stdin en un temporal y recién al final hace
+  `mv` sobre el destino: si nimbus aborta la transferencia mata el script antes
+  de cerrar stdin, así que el destino nunca queda a medio escribir.
 - Se agregó `{kind}` (`leaf`/`branch`), sin el cual `put_cmd` no podía distinguir
   crear un archivo de crear un directorio (y `mkdir` era imposible).
 
-Los `.toml` de esta carpeta no se actualizaron para aprovechar nada de eso.
+De los `.toml` de esta carpeta sólo `send_cmd` se actualizó para aprovecharlo.
+
+Los valores de los placeholders llegan ya entre comillas para `sh` (ver
+`crates/vault/README.md#values-are-shell-quoted`): no hay que envolver `{id}`
+ni `{name}` en comillas dentro del template.
 
 ## http/ — `type = "http"`
 

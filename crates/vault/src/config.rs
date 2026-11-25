@@ -90,15 +90,23 @@ impl VaultConfig {
     /// Serializes this config to TOML and writes it to `path`.
     pub fn save(&self, path: &std::path::Path) -> VaultResult<()> {
         let toml = toml::to_string_pretty(self)?;
-        // The conventional directory (see [`Self::default_dir`]) won't exist until the first
-        // vault is created, so saving there has to be able to make it.
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, toml)?;
+        // Atomic, so an interrupted save can't leave a truncated config that no longer parses.
+        // Missing parent directories (the conventional one, see [`Self::default_dir`], doesn't
+        // exist until the first vault is created) are made on the way.
+        crate::fsutil::atomic_write(path, toml.as_bytes(), self.file_mode())?;
         Ok(())
+    }
+
+    /// `Some(0o600)` when the config holds a credential in plain text (an HTTP `token`), so
+    /// other users on the machine can't read it. `None` keeps the default permissions.
+    fn file_mode(&self) -> Option<u32> {
+        match &self.origin_config {
+            OriginConfig::Http {
+                auth: HttpAuth::Bearer { token: Some(_), .. },
+                ..
+            } => Some(0o600),
+            _ => None,
+        }
     }
 
     /// Directory new vault configs are written to by default: `vaults/` under
@@ -207,6 +215,10 @@ pub enum OriginConfig {
         /// Extra `{placeholder}` substitutions available to every command template, beyond
         /// the object id/name/metadata.
         extras: Option<HashMap<String, String>>,
+        /// Optional template for a native move (`{id}`, `{destination}`, `{name}`); see
+        /// `OriginCommand::with_rename_cmd`. Without it, moves copy then delete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rename_cmd: Option<String>,
     },
     /// Builds an [`crate::origin::fs::OriginFileSystem`]: an origin backed by a directory on
     /// disk.
@@ -232,6 +244,10 @@ pub enum OriginConfig {
 
         /// `{id}`-templated path to delete an object.
         delete_url: String,
+        /// Optional `{id}`-templated path for a native move; see
+        /// `OriginHTTP::with_rename_url`. Without it, moves copy then delete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rename_url: Option<String>,
         /// Credentials to present on every request; defaults to sending none. Last of the
         /// variant's fields because it's the only one that serializes as a TOML table, and a
         /// table has to come after every plain value in the same struct.
@@ -292,9 +308,13 @@ impl OriginConfig {
                 send_cmd,
                 delete_cmd,
                 extras,
-            } => Ok(Box::new(OriginCommand::new(
-                fetch_cmd, list_cmd, get_cmd, put_cmd, send_cmd, delete_cmd, extras,
-            ))),
+                rename_cmd,
+            } => Ok(Box::new(
+                OriginCommand::new(
+                    fetch_cmd, list_cmd, get_cmd, put_cmd, send_cmd, delete_cmd, extras,
+                )
+                .with_rename_cmd(rename_cmd),
+            )),
             OriginConfig::Fs { root } => Ok(Box::new(OriginFileSystem::new(root))),
             OriginConfig::Http {
                 base_url,
@@ -304,6 +324,7 @@ impl OriginConfig {
                 put_url,
                 send_url,
                 delete_url,
+                rename_url,
                 auth,
             } => {
                 let base_url = base_url.unwrap_or_default();
@@ -311,6 +332,7 @@ impl OriginConfig {
                     OriginHTTP::new(
                         base_url, fetch_url, list_url, get_url, put_url, send_url, delete_url,
                     )
+                    .with_rename_url(rename_url)
                     .with_auth(&auth)?,
                 ))
             }

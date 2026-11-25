@@ -163,6 +163,9 @@
 pub mod config;
 /// The crate's error type, [`error::VaultError`], and the [`VaultResult`] alias built from it.
 pub mod error;
+/// Atomic file replacement ([`fsutil::atomic_write`]) and the temp-file naming it shares with
+/// the `fs` origin.
+pub mod fsutil;
 /// The tree node type, [`object::Object`], along with [`object::ObjectId`] and
 /// [`object::Metadata`].
 pub mod object;
@@ -186,6 +189,11 @@ pub const ROOT_NAME: &str = "##ROOT##";
 /// [`origin::command::OriginCommand`]/[`origin::http::OriginHTTP`] templates (rendered as
 /// `{id}`).
 pub const PLACEHOLDER_ID: &str = "id";
+
+/// HTTP header `OriginHTTP::send` uses to pass the object's modification time (RFC 3339) along
+/// with its contents, so a server can give the stored copy the source's time (see
+/// `Origin::send`). `nimbus-daemon` honours it.
+pub const MODIFIED_HEADER: &str = "x-nimbus-modified";
 /// Template placeholder key substituted with an object's name in
 /// [`origin::command::OriginCommand`] templates (rendered as `{name}`).
 pub const PLACEHOLDER_NAME: &str = "name";

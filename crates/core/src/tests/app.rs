@@ -19,6 +19,8 @@ fn make_app(vaults: HashMap<String, Vault>) -> App {
         // would otherwise rewrite the developer's own vault registry from a test run.
         state_path: scratch_state_path(),
         saved_session: None,
+        registered: HashSet::new(),
+        forgotten: HashSet::new(),
     }
 }
 
@@ -1586,4 +1588,570 @@ async fn cd_completions_with_no_vault_selected_and_slash_lists_vault_directories
 
     let candidates = app.cd_completions("v1/do").await;
     assert_eq!(candidates, vec!["v1/docs".to_string()]);
+}
+
+// --- regressions: moves are native renames; copies never overwrite without --force ---
+
+/// An fs origin with no native `rename`, so moves take the copy-then-delete fallback. Fails
+/// `fetch` for any id ending in `fail_on`, to simulate a copy breaking partway.
+struct NoRenameOrigin {
+    inner: OriginFileSystem,
+    fail_on: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl nimbus_vault::origin::Origin for NoRenameOrigin {
+    async fn fetch(&self, id: &ObjectId) -> nimbus_vault::VaultResult<ByteStream> {
+        if let Some(suffix) = self.fail_on
+            && id.as_str().ends_with(suffix)
+        {
+            return Err(VaultError::OriginError("simulated failure".to_string()));
+        }
+        self.inner.fetch(id).await
+    }
+    async fn list(&self, id: &ObjectId) -> nimbus_vault::VaultResult<Vec<Object>> {
+        self.inner.list(id).await
+    }
+    async fn get(&self, id: &ObjectId) -> nimbus_vault::VaultResult<Object> {
+        self.inner.get(id).await
+    }
+    async fn put(
+        &self,
+        object: &mut Object,
+        destination: &ObjectId,
+    ) -> nimbus_vault::VaultResult<Object> {
+        self.inner.put(object, destination).await
+    }
+    async fn send(&self, object: &Object, payload: ByteStream) -> nimbus_vault::VaultResult<()> {
+        self.inner.send(object, payload).await
+    }
+    async fn delete(&self, id: &ObjectId) -> nimbus_vault::VaultResult<()> {
+        self.inner.delete(id).await
+    }
+}
+
+fn no_rename_vault(name: &str, root: PathBuf, fail_on: Option<&'static str>) -> Vault {
+    let origin = NoRenameOrigin {
+        inner: OriginFileSystem::new(root),
+        fail_on,
+    };
+    Vault::from_parts(name.to_string(), Arc::new(origin), ObjectId::from("")).unwrap()
+}
+
+fn single_vault_app(vault: Vault) -> App {
+    let name = vault.get_name().clone();
+    let mut vaults = HashMap::new();
+    vaults.insert(name.clone(), vault);
+    let mut app = make_app(vaults);
+    app.select(name).unwrap();
+    app
+}
+
+#[cfg(unix)]
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().ino()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mv_within_a_vault_is_a_native_rename() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("big/nested")).unwrap();
+    std::fs::write(root.path().join("big/nested/a.txt"), b"data").unwrap();
+    std::fs::create_dir(root.path().join("archive")).unwrap();
+    let before = inode(&root.path().join("big"));
+    let mut app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    app.mv("big".to_string(), "archive".to_string(), None)
+        .await
+        .unwrap();
+
+    // Same inode: the directory was renamed, not copied and deleted.
+    assert_eq!(inode(&root.path().join("archive/big")), before);
+    assert!(!root.path().join("big").exists());
+    assert_eq!(
+        std::fs::read(root.path().join("archive/big/nested/a.txt")).unwrap(),
+        b"data"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_is_a_native_rename() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    std::fs::write(root.path().join("docs/a.txt"), b"x").unwrap();
+    let before = inode(&root.path().join("docs"));
+    let mut app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    app.rename("docs".to_string(), "papers".to_string(), None)
+        .await
+        .unwrap();
+    assert_eq!(inode(&root.path().join("papers")), before);
+    assert!(root.path().join("papers/a.txt").exists());
+}
+
+#[tokio::test]
+async fn mv_falls_back_to_copy_and_delete_without_a_native_rename() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("docs/deep")).unwrap();
+    std::fs::write(root.path().join("docs/deep/a.txt"), b"data").unwrap();
+    std::fs::create_dir(root.path().join("archive")).unwrap();
+    let mut app = single_vault_app(no_rename_vault("v1", root.path().to_path_buf(), None));
+
+    app.mv("docs".to_string(), "archive".to_string(), None)
+        .await
+        .unwrap();
+    assert!(!root.path().join("docs").exists());
+    assert_eq!(
+        std::fs::read(root.path().join("archive/docs/deep/a.txt")).unwrap(),
+        b"data"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fallback_move_leaves_the_source_and_no_partial_copy() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    std::fs::write(root.path().join("docs/1.txt"), b"one").unwrap();
+    std::fs::write(root.path().join("docs/2.txt"), b"two").unwrap();
+    std::fs::create_dir(root.path().join("archive")).unwrap();
+    let mut app = single_vault_app(no_rename_vault(
+        "v1",
+        root.path().to_path_buf(),
+        Some("2.txt"),
+    ));
+
+    let result = app
+        .mv("docs".to_string(), "archive".to_string(), None)
+        .await;
+    assert!(result.is_err());
+    // The source is intact and the half-made copy was removed.
+    assert_eq!(
+        std::fs::read(root.path().join("docs/1.txt")).unwrap(),
+        b"one"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("docs/2.txt")).unwrap(),
+        b"two"
+    );
+    assert!(!root.path().join("archive/docs").exists());
+}
+
+#[tokio::test]
+async fn cp_into_a_directory_holding_the_same_name_needs_force() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"new").unwrap();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::fs::write(root.path().join("dir/a.txt"), b"old").unwrap();
+    let mut app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    let refused = app
+        .cp("a.txt".to_string(), "dir".to_string(), None)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("--force"), "{refused}");
+    assert_eq!(
+        std::fs::read(root.path().join("dir/a.txt")).unwrap(),
+        b"old"
+    );
+
+    app.cp_with("a.txt".to_string(), "dir".to_string(), None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("dir/a.txt")).unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn cp_onto_an_existing_file_path_overwrites_only_with_force() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"new").unwrap();
+    std::fs::write(root.path().join("b.txt"), b"old").unwrap();
+    let mut app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    assert!(
+        app.cp("a.txt".to_string(), "b.txt".to_string(), None)
+            .await
+            .is_err()
+    );
+    app.cp_with("a.txt".to_string(), "b.txt".to_string(), None, true)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.path().join("b.txt")).unwrap(), b"new");
+}
+
+#[tokio::test]
+async fn mv_with_force_replaces_an_existing_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"new").unwrap();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::fs::write(root.path().join("dir/a.txt"), b"old").unwrap();
+    let mut app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    assert!(
+        app.mv("a.txt".to_string(), "dir".to_string(), None)
+            .await
+            .is_err()
+    );
+    assert!(root.path().join("a.txt").exists());
+    app.mv_with("a.txt".to_string(), "dir".to_string(), None, true)
+        .await
+        .unwrap();
+    assert!(!root.path().join("a.txt").exists());
+    assert_eq!(
+        std::fs::read(root.path().join("dir/a.txt")).unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn a_file_never_replaces_a_directory_even_with_force() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("thing"), b"a file").unwrap();
+    std::fs::create_dir_all(root.path().join("dir/thing")).unwrap();
+    std::fs::write(root.path().join("dir/thing/keep.txt"), b"keep").unwrap();
+    let mut app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    for force in [false, true] {
+        let err = app
+            .cp_with("thing".to_string(), "dir".to_string(), None, force)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a directory"), "{err}");
+    }
+    assert_eq!(
+        std::fs::read(root.path().join("dir/thing/keep.txt")).unwrap(),
+        b"keep"
+    );
+}
+
+#[tokio::test]
+async fn put_and_get_refuse_to_overwrite_without_force() {
+    let local_root = tempfile::tempdir().unwrap();
+    let remote_root = tempfile::tempdir().unwrap();
+    std::fs::write(local_root.path().join("a.txt"), b"local").unwrap();
+    std::fs::write(remote_root.path().join("a.txt"), b"remote").unwrap();
+    let mut vaults = HashMap::new();
+    vaults.insert(
+        LOCAL_VAULT_NAME.to_string(),
+        fs_vault(LOCAL_VAULT_NAME, local_root.path().to_path_buf()),
+    );
+    vaults.insert(
+        "v1".to_string(),
+        fs_vault("v1", remote_root.path().to_path_buf()),
+    );
+    let mut app = make_app(vaults);
+    app.select("v1".to_string()).unwrap();
+    app.local_root_canonical = Some(local_root.path().canonicalize().unwrap());
+    app.local_root = Some(local_root.path().to_path_buf());
+
+    let local_file = local_root
+        .path()
+        .join("a.txt")
+        .to_string_lossy()
+        .into_owned();
+    assert!(app.put(local_file.clone(), None, None).await.is_err());
+    assert!(app.get("a.txt".to_string(), None, None).await.is_err());
+    assert_eq!(
+        std::fs::read(remote_root.path().join("a.txt")).unwrap(),
+        b"remote"
+    );
+    assert_eq!(
+        std::fs::read(local_root.path().join("a.txt")).unwrap(),
+        b"local"
+    );
+
+    app.put_with(local_file, None, None, true).await.unwrap();
+    assert_eq!(
+        std::fs::read(remote_root.path().join("a.txt")).unwrap(),
+        b"local"
+    );
+}
+
+#[tokio::test]
+async fn write_object_bytes_stamps_a_new_modification_time() {
+    // An edit saved back must look newer than before; reusing the old time (as a copy does)
+    // would make push/pull treat the edited file as unchanged or older.
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("a.txt");
+    std::fs::write(&path, b"old").unwrap();
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old_time)
+        .unwrap();
+    let app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    app.write_object_bytes(ObjectId::from("a.txt"), b"edited".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+    assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > old_time);
+}
+
+// --- regressions: the session file is written atomically and merged, not clobbered ---
+
+fn registry_on_disk(path: &Path) -> HashMap<String, PathBuf> {
+    let saved: SavedState = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    saved.vault_configs
+}
+
+#[test]
+fn two_sessions_registering_vaults_keep_both() {
+    // The CLI and TUI open at the same time: each used to overwrite the whole registry, so the
+    // vault registered in one vanished when the other saved.
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("session.toml");
+    let a_cfg = write_vault_config(dir.path(), "a.toml", "vault-a");
+    let b_cfg = write_vault_config(dir.path(), "b.toml", "vault-b");
+    let mut first = make_app(HashMap::new());
+    let mut second = make_app(HashMap::new());
+    first.state_path = shared.clone();
+    second.state_path = shared.clone();
+
+    first.new_vault(a_cfg.clone()).unwrap();
+    second.new_vault(b_cfg.clone()).unwrap();
+    // Any later save from the first session (e.g. on exit) must not drop vault-b either.
+    first.save().unwrap();
+
+    let registry = registry_on_disk(&shared);
+    assert_eq!(registry.get("vault-a"), Some(&a_cfg));
+    assert_eq!(registry.get("vault-b"), Some(&b_cfg));
+}
+
+#[test]
+fn a_vault_forgotten_in_one_session_is_not_brought_back_by_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("session.toml");
+    let cfg = write_vault_config(dir.path(), "a.toml", "vault-a");
+    let mut first = make_app(HashMap::new());
+    first.state_path = shared.clone();
+    first.new_vault(cfg.clone()).unwrap();
+
+    // A second session that started while vault-a was registered...
+    let mut second = make_app(HashMap::new());
+    second.state_path = shared.clone();
+    second.vault_configs.insert("vault-a".to_string(), cfg);
+    // ...doesn't resurrect it after the first session forgets it.
+    first.forget_vault("vault-a".to_string()).unwrap();
+    second.save().unwrap();
+
+    assert!(!registry_on_disk(&shared).contains_key("vault-a"));
+}
+
+#[test]
+fn a_corrupt_session_file_is_moved_aside_instead_of_blocking_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.toml");
+    std::fs::write(&path, "vault_configs = { truncated").unwrap();
+
+    let saved = App::load_state(&path).unwrap();
+    assert!(saved.vault_configs.is_empty());
+    assert!(!path.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("session.toml.bak")).unwrap(),
+        "vault_configs = { truncated"
+    );
+}
+
+#[test]
+fn a_missing_session_file_is_a_fresh_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = App::load_state(&dir.path().join("none.toml")).unwrap();
+    assert!(saved.vault_configs.is_empty() && saved.current_vault.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_session_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = make_app(HashMap::new());
+    app.state_path = dir.path().join("session.toml");
+    app.save().unwrap();
+    let mode = std::fs::metadata(&app.state_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+// --- regressions: saving an edit back never overwrites a change made meanwhile ---
+
+#[tokio::test]
+async fn save_edit_writes_when_nothing_changed_since_opening() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"v1").unwrap();
+    let app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    let opened = app.fresh_object(ObjectId::from("a.txt")).await.unwrap();
+    let outcome = app.save_edit(&opened, b"edited".to_vec()).await.unwrap();
+    assert_eq!(outcome, SaveOutcome::Saved);
+    assert_eq!(std::fs::read(root.path().join("a.txt")).unwrap(), b"edited");
+}
+
+#[tokio::test]
+async fn save_edit_refuses_when_the_object_changed_while_editing() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("a.txt");
+    std::fs::write(&path, b"v1").unwrap();
+    let app = single_vault_app(fs_vault("v1", root.path().to_path_buf()));
+
+    let opened = app.fresh_object(ObjectId::from("a.txt")).await.unwrap();
+    // Someone else saves a new version while the editor is open.
+    std::fs::write(&path, b"saved elsewhere in the meantime").unwrap();
+
+    let outcome = app.save_edit(&opened, b"my edit".to_vec()).await.unwrap();
+    assert_eq!(outcome, SaveOutcome::ChangedMeanwhile);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"saved elsewhere in the meantime"
+    );
+}
+
+// --- regression: saving an edit keeps the object's metadata, only resetting `modified` ---
+
+#[tokio::test]
+async fn write_object_bytes_keeps_per_object_metadata_for_send_cmd() {
+    // It used to replace the metadata with `Metadata::new()` plus the size, so a `send_cmd`
+    // using the object's own `{bucket}` extra (or `{content_type}`) ran with the literal braces.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let object_json = r#"{"Leaf":{"name":"a.txt","id":"a.txt","meta":{"size":3,"content_type":"text/plain","modified":"2026-01-01T00:00:00Z","extra":{"bucket":"b1"}}}}"#;
+    let origin = nimbus_vault::origin::command::OriginCommand::new(
+        "true".to_string(),
+        "echo []".to_string(),
+        format!("echo '{object_json}'"),
+        "true".to_string(),
+        format!(
+            "cat > {d}/out-{{bucket}}; printf %s {{content_type}} > {d}/ct; \
+             printf %s {{size}} > {d}/size; printf %s {{modified}} > {d}/modified"
+        ),
+        "true".to_string(),
+        None,
+    );
+    let vault = Vault::from_parts("c".to_string(), Arc::new(origin), ObjectId::from("")).unwrap();
+    let app = single_vault_app(vault);
+
+    app.write_object_bytes(ObjectId::from("a.txt"), b"edited".to_vec())
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(dir.path().join("out-b1")).unwrap(), b"edited");
+    assert!(!dir.path().join("out-{bucket}").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("ct")).unwrap(),
+        "text/plain"
+    );
+    // The size follows the new content; the old modification time is not reused.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("size")).unwrap(),
+        "6"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("modified")).unwrap(),
+        ""
+    );
+}
+
+// --- regression: `mv --force` onto an existing directory behaves the same on every origin ---
+
+/// `docs/` (with `a.txt`) and `dest/docs/` (with `b.txt`) in one vault root.
+fn two_docs_dirs() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("docs")).unwrap();
+    std::fs::write(root.path().join("docs/a.txt"), b"a").unwrap();
+    std::fs::create_dir_all(root.path().join("dest/docs")).unwrap();
+    std::fs::write(root.path().join("dest/docs/b.txt"), b"b").unwrap();
+    root
+}
+
+#[tokio::test]
+async fn mv_force_refuses_to_replace_a_directory_with_or_without_a_native_rename() {
+    // Before: the fs origin's native rename failed with an origin error, while an origin
+    // without one merged the two trees and deleted the source.
+    for native in [true, false] {
+        let root = two_docs_dirs();
+        let vault = match native {
+            true => fs_vault("v1", root.path().to_path_buf()),
+            false => no_rename_vault("v1", root.path().to_path_buf(), None),
+        };
+        let mut app = single_vault_app(vault);
+
+        let err = app
+            .mv_with("docs".to_string(), "dest".to_string(), None, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("can't replace a directory"),
+            "{err}"
+        );
+        // Nothing moved or merged.
+        assert!(root.path().join("docs/a.txt").exists(), "native={native}");
+        assert!(
+            !root.path().join("dest/docs/a.txt").exists(),
+            "native={native}"
+        );
+        assert!(
+            root.path().join("dest/docs/b.txt").exists(),
+            "native={native}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cp_force_merges_into_an_existing_directory_on_every_origin() {
+    for native in [true, false] {
+        let root = two_docs_dirs();
+        let vault = match native {
+            true => fs_vault("v1", root.path().to_path_buf()),
+            false => no_rename_vault("v1", root.path().to_path_buf(), None),
+        };
+        let mut app = single_vault_app(vault);
+
+        app.cp_with("docs".to_string(), "dest".to_string(), None, true)
+            .await
+            .unwrap();
+        assert!(
+            root.path().join("dest/docs/a.txt").exists(),
+            "native={native}"
+        );
+        assert!(
+            root.path().join("dest/docs/b.txt").exists(),
+            "native={native}"
+        );
+        assert!(root.path().join("docs/a.txt").exists(), "native={native}");
+    }
+}
+
+#[tokio::test]
+async fn mv_force_still_replaces_a_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"new").unwrap();
+    std::fs::create_dir(root.path().join("dest")).unwrap();
+    std::fs::write(root.path().join("dest/a.txt"), b"old").unwrap();
+    for native in [true, false] {
+        std::fs::write(root.path().join("a.txt"), b"new").unwrap();
+        std::fs::write(root.path().join("dest/a.txt"), b"old").unwrap();
+        let vault = match native {
+            true => fs_vault("v1", root.path().to_path_buf()),
+            false => no_rename_vault("v1", root.path().to_path_buf(), None),
+        };
+        let mut app = single_vault_app(vault);
+        app.mv_with("a.txt".to_string(), "dest".to_string(), None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("dest/a.txt")).unwrap(),
+            b"new"
+        );
+        assert!(!root.path().join("a.txt").exists(), "native={native}");
+    }
 }

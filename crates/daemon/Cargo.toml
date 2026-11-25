@@ -17,6 +17,7 @@ homepage.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
 nimbus-vault = { version = "0.2.1", path = "../vault/" }
@@ -29,4 +30,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 bytes.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

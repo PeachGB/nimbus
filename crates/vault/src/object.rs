@@ -8,6 +8,31 @@ use chrono::{DateTime, Utc};
 
 use crate::{VaultResult, error::VaultError};
 
+/// Checks that `name` is safe to use as one path component on any origin: not empty, not `.` or
+/// `..`, and free of `/`, `\` and NUL. Every origin's `put` calls this, because a name is the
+/// one piece of a transfer the *other* side controls — without it, a remote listing an object
+/// named `../../.bashrc` could have `pull` write outside the destination vault.
+///
+/// # Examples
+///
+/// ```
+/// use nimbus_vault::object::validate_name;
+///
+/// assert!(validate_name("notes.txt").is_ok());
+/// assert!(validate_name("a#b ?.txt").is_ok());
+/// assert!(validate_name("../escape").is_err());
+/// assert!(validate_name("/etc/passwd").is_err());
+/// assert!(validate_name("..").is_err());
+/// assert!(validate_name("").is_err());
+/// ```
+pub fn validate_name(name: &str) -> VaultResult<()> {
+    let bad = name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']);
+    match bad {
+        true => Err(VaultError::InvalidName(name.to_string())),
+        false => Ok(()),
+    }
+}
+
 /// Identifies an `Object` within a `Vault`'s origin. Meaning is origin-specific
 /// (a relative path for `OriginFileSystem`, an opaque id for `OriginHTTP`, etc).
 ///
@@ -419,6 +444,81 @@ impl Object {
         };
         local_meta.hash_value() != remote_meta.hash_value()
     }
+
+    /// Replaces this object's metadata. A no-op for `Object::Root`, which has none.
+    ///
+    /// Used before a `send` to carry the *source's* metadata (above all its modification time)
+    /// onto the object being written, so the copy ends up comparing equal to its source.
+    pub fn set_meta(&mut self, new_meta: Metadata) -> &mut Self {
+        if let Object::Leaf { meta, .. } | Object::Branch { meta, .. } = self {
+            *meta = new_meta;
+        }
+        self
+    }
+
+    /// Decides what syncing `self` (the source) onto `dest` should do. Unlike
+    /// [`Self::changed`], this knows which side is newer, so a sync never overwrites a
+    /// destination that was edited after the source.
+    ///
+    /// - A file and a directory with the same id are a [`SyncDecision::KindMismatch`].
+    /// - Two directories are always [`SyncDecision::Same`]: a directory has no content of its
+    ///   own, and its children are compared one by one.
+    /// - Two files with identical metadata are `Same`. Otherwise, when both carry a
+    ///   modification time, the later one wins: [`SyncDecision::SourceNewer`] or
+    ///   [`SyncDecision::DestNewer`]. Anything else (a missing time, equal times with
+    ///   different sizes) is [`SyncDecision::Unknown`], which a sync treats as "copy".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chrono::{TimeZone, Utc};
+    /// use nimbus_vault::object::{Metadata, Object, ObjectId, SyncDecision};
+    ///
+    /// let file = |hour| {
+    ///     let mut meta = Metadata::new();
+    ///     meta.set_size(5).set_modified(Utc.with_ymd_and_hms(2026, 1, 1, hour, 0, 0).unwrap());
+    ///     Object::Leaf { name: "a".into(), id: ObjectId::from("a"), meta }
+    /// };
+    /// assert_eq!(file(9).compare(&file(9)), SyncDecision::Same);
+    /// assert_eq!(file(10).compare(&file(9)), SyncDecision::SourceNewer);
+    /// assert_eq!(file(9).compare(&file(10)), SyncDecision::DestNewer);
+    /// ```
+    pub fn compare(&self, dest: &Object) -> SyncDecision {
+        let is_leaf = |o: &Object| matches!(o, Object::Leaf { .. });
+        match (is_leaf(self), is_leaf(dest)) {
+            (false, false) => return SyncDecision::Same,
+            (true, false) | (false, true) => return SyncDecision::KindMismatch,
+            (true, true) => {}
+        }
+        let (Some(src), Some(dst)) = (self.get_meta(), dest.get_meta()) else {
+            return SyncDecision::Unknown;
+        };
+        if src.hash_value() == dst.hash_value() {
+            return SyncDecision::Same;
+        }
+        match (src.modified, dst.modified) {
+            (Some(s), Some(d)) if s > d => SyncDecision::SourceNewer,
+            (Some(s), Some(d)) if s < d => SyncDecision::DestNewer,
+            _ => SyncDecision::Unknown,
+        }
+    }
+}
+
+/// The outcome of [`Object::compare`]: what syncing a source object onto its destination
+/// counterpart should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDecision {
+    /// Nothing to do: identical files, or two directories.
+    Same,
+    /// The source was modified after the destination; copy it.
+    SourceNewer,
+    /// The destination was modified after the source. Copying would lose that newer edit, so
+    /// a sync reports a conflict instead (unless forced).
+    DestNewer,
+    /// Not enough metadata to tell which side is newer; a sync copies.
+    Unknown,
+    /// One side is a file and the other a directory. Never overwritten, even when forced.
+    KindMismatch,
 }
 
 #[cfg(test)]

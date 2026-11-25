@@ -2,6 +2,7 @@ use futures::stream::BoxStream;
 
 use crate::{
     VaultResult,
+    error::VaultError,
     object::{Object, ObjectId},
 };
 use bytes::Bytes;
@@ -76,7 +77,31 @@ pub trait Origin: Send + Sync {
     /// Writes `object`'s metadata (without payload) to the origin.
     async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object>;
     /// Streams `payload` to the origin as `object`'s contents.
+    ///
+    /// When `object`'s metadata has a `modified` time, an origin that can store one should give
+    /// it to the written object. Copies pass their source's time this way, so a synced file
+    /// compares equal to its source afterwards. A caller writing *new* content (an edit, not a
+    /// copy) should clear `modified` instead, so the object gets the current time.
     async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()>;
     /// Deletes `id` from the origin.
     async fn delete(&self, id: &ObjectId) -> VaultResult<()>;
+    /// Moves `id` under `new_parent` as `new_name` in one step, returning the moved object.
+    /// Origins that can should make this atomic: afterwards the object exists at exactly one
+    /// of the two places, never both and never half-copied.
+    ///
+    /// Implementations must refuse to replace a directory, or to replace anything with a
+    /// directory. Replacing a file with a file is allowed; callers decide whether they want
+    /// that.
+    ///
+    /// The default returns [`VaultError::Unsupported`], and callers fall back to copying and
+    /// then deleting.
+    async fn rename(
+        &self,
+        id: &ObjectId,
+        new_parent: &ObjectId,
+        new_name: &str,
+    ) -> VaultResult<Object> {
+        let _ = (id, new_parent, new_name);
+        Err(VaultError::Unsupported("rename".to_string()))
+    }
 }

@@ -63,3 +63,79 @@ fn run_executable_reports_a_program_it_could_not_start() {
     let missing = std::env::temp_dir().join("nimbus-opener-test-does-not-exist");
     assert!(run_executable(&missing).is_err());
 }
+
+// --- regression: temp copies live in a private directory ---
+
+#[cfg(unix)]
+#[test]
+fn scratch_dir_is_private_to_the_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = private_scratch_dir().unwrap();
+    let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
+fn scratch_dirs_are_unique_and_removed_on_drop() {
+    let a = private_scratch_dir().unwrap();
+    let b = private_scratch_dir().unwrap();
+    assert_ne!(a.path(), b.path());
+    assert!(a.path().starts_with(std::env::temp_dir()));
+    let kept = a.path().to_path_buf();
+    std::fs::write(kept.join("copy.txt"), b"x").unwrap();
+    drop(a);
+    assert!(!kept.exists());
+}
+
+// --- regression: each public function keeps its own doc comment ---
+
+/// The `///` lines directly above `pub fn {name}` in this module's source.
+fn doc_above(source: &str, name: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with(&format!("pub fn {name}(")))
+        .unwrap_or_else(|| panic!("pub fn {name} not found"));
+    let mut doc: Vec<String> = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|l| l.starts_with("///"))
+        .map(|l| l.trim_start_matches('/').trim().to_string())
+        .collect();
+    doc.reverse();
+    doc
+}
+
+#[test]
+fn every_public_function_has_its_own_doc_comment() {
+    // `private_scratch_dir` was once inserted between `run_executable` and its doc comment, so
+    // `run_executable` had none and the scratch-dir docs opened with the wrong summary.
+    let source = include_str!("../opener.rs");
+    let summaries = [
+        (
+            "is_executable",
+            "Whether the fetched bytes look like a program",
+        ),
+        (
+            "private_scratch_dir",
+            "Creates the directory that temp copies",
+        ),
+        (
+            "run_executable",
+            "Runs the temp copy at `path` as a program",
+        ),
+        ("wait_for_key", "Holds the terminal after a program has run"),
+        (
+            "try_os_open",
+            "Tries the OS's default file-association opener",
+        ),
+    ];
+    for (name, summary) in summaries {
+        let doc = doc_above(source, name);
+        assert!(
+            doc.first().is_some_and(|first| first.starts_with(summary)),
+            "{name}'s doc comment should start with {summary:?}, got {:?}",
+            doc.first()
+        );
+    }
+}

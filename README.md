@@ -265,13 +265,18 @@ nimbus> get <PATH> [VAULT] [DEST]            # copy an object out to the local v
 nimbus> mkdir <PATH> [VAULT]                 # create a directory
 nimbus> touch <PATH> [VAULT]                 # create an empty file
 nimbus> rename <PATH> <NEW_NAME> [VAULT]     # rename in place (a name, not a path)
-nimbus> cp <PATH> <DESTINATION> [VAULT]      # copy an object, within or across vaults
-nimbus> mv <PATH> <DESTINATION> [VAULT]      # move an object, within or across vaults
+nimbus> cp <PATH> <DESTINATION> [VAULT] [--force]  # copy, within or across vaults
+nimbus> mv <PATH> <DESTINATION> [VAULT] [--force]  # move, within or across vaults
 nimbus> delete <PATH> [VAULT] [--force]      # delete an object
-nimbus> push [VAULT]                         # sync the local vault out to a vault
-nimbus> pull [VAULT]                         # sync a vault into the local vault
+nimbus> push [VAULT] [--force]               # sync the local vault out to a vault
+nimbus> pull [VAULT] [--force]               # sync a vault into the local vault
 nimbus> exit                                 # save session state and quit
 ```
+
+Nothing is overwritten silently. `cp`/`mv`/`put`/`get` refuse an existing destination
+without `--force`. `push`/`pull` copy only what's newer on the source side, and report
+(rather than overwrite) files that are newer at the destination unless forced. Every
+overwrite of a file is atomic.
 
 Every path argument is a `vault:path` spec: bare paths are relative to the current
 directory, a leading `/` is absolute within the current vault, and a `vault:` prefix
@@ -316,8 +321,8 @@ token = "s3cr3t"
 ```
 
 Every `*.toml` under `vaults_path` is opened as a vault and addressed by the `name`
-inside it, at `/v/<name>/…`. The six routes mirror the URL templates `OriginHTTP`
-uses, so a client only points `base_url` at `http://host:8080/v/<name>` and fills in
+inside it, at `/v/<name>/…`. The routes mirror the URL templates `OriginHTTP`
+uses (plus an optional `/rename/{id}` for native moves), so a client only points `base_url` at `http://host:8080/v/<name>` and fills in
 the default paths — the `http` example above is a complete client config for one.
 
 It's a server, not a scheduler: it doesn't sync anything on its own. There's no TLS
@@ -432,10 +437,13 @@ invalid TOML, bad origin config) propagates straight out of the outer build.
 
 `Vault::pull(id, remote)` / `Vault::push(id, remote)` recursively sync the subtree
 at `id` between the vault's own origin and any other `&dyn Origin` — a plain
-origin, or another `Vault` wrapped in `OriginVault` — using `Object::changed` (a
-metadata hash comparison) to skip objects that haven't changed. When an object
-needs syncing, they `put` it and then `send` its payload to whatever `Object`
-`put` returned, not the pre-`put` object — see the `put` contract above:
+origin, or another `Vault` wrapped in `OriginVault`. They use `Object::compare`
+to copy only what's missing or newer on the source side, skip identical files, and
+report (not overwrite) files that are newer at the destination unless
+`SyncOptions { force: true }` is passed. Copies keep the source's modification
+time, so a second run transfers nothing. Both return a `SyncReport`. When an
+object needs copying, they `put` it and then `send` its payload to whatever
+`Object` `put` returned, not the pre-`put` object — see the `put` contract above:
 
 ```rust
 // bring the vault's local origin up to date with `remote`

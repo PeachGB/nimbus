@@ -45,6 +45,22 @@ pub fn is_executable(bytes: &[u8], path: &Path) -> bool {
     bytes.starts_with(b"\x7FELF")
 }
 
+/// Creates the directory that temp copies of opened objects are written to: unique, under the
+/// system temp directory, and **0700** on Unix, so other users can't read the copies or plant a
+/// symlink for a write to follow. `tempfile` makes its temp *files* private by default but not
+/// its directories (those get the umask's usual 0755), hence the explicit mode. Deleted when the
+/// returned `TempDir` is dropped.
+pub fn private_scratch_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("nimbus-tui-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
 /// Runs the temp copy at `path` as a program, attached to our stdio, and waits for it to exit.
 ///
 /// The caller is expected to have released the terminal first (raw mode, alt screen, its own

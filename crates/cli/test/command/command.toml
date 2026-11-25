@@ -5,8 +5,8 @@ type = "command"
 list_cmd   = "{root}/cmd-vault.sh list {id}"
 get_cmd    = "{root}/cmd-vault.sh get {id}"
 fetch_cmd  = "cat {root}/data/{id}"
-put_cmd    = "touch /home/arian/projects/rust/nimbus/crates/cli/test/command/data/{name}"
-send_cmd   = "/home/arian/projects/rust/nimbus/crates/cli/test/command/send.sh"
+put_cmd    = "touch {root}/data/{destination}/{name}"
+send_cmd   = "{root}/send.sh {root}/data/{id}"
 delete_cmd = "rm -rf {root}/data/{id}"
 
 [origin_config.extras]

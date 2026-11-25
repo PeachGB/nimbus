@@ -67,8 +67,11 @@ Nothing stops a served vault from having an `http` origin of its own, which make
 | `PUT` | `/v/{vault}/put/{id}` | Creates the JSON `Object` in the body under directory `id`. |
 | `PUT` | `/v/{vault}/send/{id}` | Writes the request body as `id`'s payload (the object must exist). |
 | `DELETE` | `/v/{vault}/delete/{id}` | Deletes `id`. |
+| `POST` | `/v/{vault}/rename/{id}` | Moves `id` in one step; body `{"destination": "<parent id>", "name": "<new name>"}`, answers with the moved `Object`. Enable it on the client with `rename_url = "/rename/{id}"`. |
 
-Errors are `{"error": "..."}` with a status: `404` for an unknown vault or a missing object, `400` for a rejected id, `401` unauthenticated, `403` read-only, `500` for an origin failure. The `404` matters — `OriginHTTP` turns it back into `VaultError::NotFound`, which is what `Vault::push`/`pull` match on to decide an object needs creating.
+Ids arrive percent-encoded (`OriginHTTP` encodes `#`, `?`, `%`, spaces…) and are decoded before use. Object names in a `put` or `rename` body must be a single path component (`object::validate_name`), and anything else is a `400`, so a client can't create files outside the vault. `send` accepts an optional `x-nimbus-modified` header (RFC 3339): the stored file takes that modification time, which is how a `push` through the daemon ends up idempotent. A malformed value is a `400`.
+
+Errors are `{"error": "..."}` with a status: `404` for an unknown vault or a missing object, `400` for a rejected id, name or header, `401` unauthenticated, `403` read-only, `501` when the vault's origin can't do the operation natively (clients then fall back), `500` for an origin failure. The `404` matters — `OriginHTTP` turns it back into `VaultError::NotFound`, which is what `Vault::push`/`pull` match on to decide an object needs creating.
 
 The `500` is the one case where the client isn't told what went wrong: the origin's own message can name a path on the serving host, or the upstream a proxying daemon sits in front of. That detail is logged at `error` level instead, so the operator has it and the caller doesn't.
 
@@ -126,7 +129,7 @@ Repeated leading slashes are collapsed rather than refused: they all mean the sa
 
 ## Caching
 
-Handlers talk to the vault's `Origin` directly rather than through `Vault`'s own methods, bypassing its in-memory object cache. A daemon lives for weeks and its data changes underneath it; serving a cached `Object` would hand clients stale metadata — and stale metadata is exactly what `Object::changed` uses to decide a file doesn't need syncing.
+Handlers talk to the vault's `Origin` directly rather than through `Vault`'s own methods, bypassing its in-memory object cache. A daemon lives for weeks and its data changes underneath it; serving a cached `Object` would hand clients stale metadata — and stale metadata is exactly what `Object::compare` uses to decide a file doesn't need syncing.
 
 ## License
 

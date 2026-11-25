@@ -1,14 +1,18 @@
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use nimbus_vault::{
     config::OriginConfig,
+    error::VaultError,
     object::{Metadata, Object, ObjectId},
     origin::ByteStream,
-    vault::Vault,
+    vault::{SyncOptions, SyncReport, Vault},
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -44,6 +48,21 @@ pub struct App {
     /// The vault and directory read back from the state file, waiting for
     /// [`Self::restore_session`] to await its way there. Taken once it has been applied.
     saved_session: Option<(String, PathBuf)>,
+    /// Vaults this session registered or forgot. [`Self::save`] applies only these to the
+    /// registry it finds on disk, so another CLI/TUI session's changes made in the meantime
+    /// survive: neither can drop a vault the other added, or bring back one it forgot.
+    registered: HashSet<String>,
+    forgotten: HashSet<String>,
+}
+
+/// What [`App::save_edit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// The edit was written back.
+    Saved,
+    /// The object changed in the vault after the edit began, so the edit was **not** written.
+    /// The edited copy is still wherever the caller put it.
+    ChangedMeanwhile,
 }
 
 /// Where a resolved `cp`/`mv` destination points.
@@ -66,6 +85,8 @@ impl Default for App {
             local_root_canonical: None,
             state_path: Self::default_state_path(),
             saved_session: None,
+            registered: HashSet::new(),
+            forgotten: HashSet::new(),
         }
     }
 }
@@ -97,12 +118,7 @@ impl App {
         };
 
         let state_path = Self::default_state_path();
-        let saved: SavedState = if state_path.exists() {
-            let raw = std::fs::read_to_string(&state_path)?;
-            toml::from_str(&raw)?
-        } else {
-            SavedState::default()
-        };
+        let saved = Self::load_state(&state_path)?;
 
         let saved_session = saved
             .current_vault
@@ -121,6 +137,8 @@ impl App {
             local_root_canonical,
             state_path,
             saved_session,
+            registered: HashSet::new(),
+            forgotten: HashSet::new(),
         };
 
         if cli_config.default_local_vault && !app.vaults.contains_key(LOCAL_VAULT_NAME) {
@@ -172,17 +190,69 @@ impl App {
             Some((vault, path)) => (Some(vault.clone()), path.clone()),
             None => (self.current_vault.clone(), self.cwd_path.clone()),
         };
+        // Merge into whatever is on disk now rather than overwriting it: another session may
+        // have registered or forgotten vaults since this one started. Only if the file can't
+        // be read does this session's whole view get written out.
+        let vault_configs = match Self::read_state(&self.state_path) {
+            Ok(Some(on_disk)) => {
+                let mut merged = on_disk.vault_configs;
+                for name in &self.forgotten {
+                    merged.remove(name);
+                }
+                for name in &self.registered {
+                    if let Some(path) = self.vault_configs.get(name) {
+                        merged.insert(name.clone(), path.clone());
+                    }
+                }
+                merged
+            }
+            _ => self.vault_configs.clone(),
+        };
         let state = SavedState {
-            vault_configs: self.vault_configs.clone(),
+            vault_configs,
             current_vault,
             cwd_path: Some(cwd_path),
         };
-        let path = &self.state_path;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, toml::to_string_pretty(&state)?)?;
+        // Atomic, so a crash mid-save can't leave a truncated file that stops the next start;
+        // 0600, because it maps names to configs that may sit next to credentials.
+        nimbus_vault::fsutil::atomic_write(
+            &self.state_path,
+            toml::to_string_pretty(&state)?.as_bytes(),
+            Some(0o600),
+        )?;
         Ok(())
+    }
+
+    /// Reads the state file: `Ok(None)` when there is none yet, an error when it exists but
+    /// can't be read or parsed.
+    fn read_state(path: &Path) -> Result<Option<SavedState>> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Ok(Some(toml::from_str(&raw)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// [`Self::read_state`] for startup. A file that exists but doesn't parse (left truncated
+    /// by an older version, or edited by hand) is moved aside to `<name>.bak` with a warning,
+    /// and the session starts fresh, instead of every command failing until it's fixed by hand.
+    fn load_state(path: &Path) -> Result<SavedState> {
+        match Self::read_state(path) {
+            Ok(saved) => Ok(saved.unwrap_or_default()),
+            Err(e) if e.downcast_ref::<toml::de::Error>().is_some() => {
+                let mut backup = path.as_os_str().to_owned();
+                backup.push(".bak");
+                let backup = PathBuf::from(backup);
+                std::fs::rename(path, &backup)?;
+                eprintln!(
+                    "WARNING: {} couldn't be read ({e}); moved it to {} and started a new session",
+                    path.display(),
+                    backup.display()
+                );
+                Ok(SavedState::default())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Re-enters the vault and directory the previous session ended in.
@@ -430,12 +500,55 @@ impl App {
         let Some(vault) = self.vaults.get(current_vault) else {
             return Err(anyhow!("COULDN'T GET CURRENT WORKING VAULT"));
         };
-        let object = vault.get(id).await?;
+        let mut object = vault.get_fresh(id).await?;
+        // New content, not a copy: clear the old modification time so the origin stamps the
+        // write with the current one (see `Origin::send`). Keeping it would make the edited
+        // file look unchanged — or older than a stale copy elsewhere — to the next push/pull.
+        // Everything else (content type, the object's own `extra` values a `send_cmd` may use)
+        // is kept; only the size changes with the content.
+        if let Some(mut meta) = object.get_meta() {
+            meta.modified = None;
+            meta.set_size(bytes.len() as u64);
+            object.set_meta(meta);
+        }
         let payload: ByteStream =
             Box::pin(futures::stream::once(async move { Ok(Bytes::from(bytes)) }));
         vault.send(&object, payload).await?;
         Ok(())
     }
+    /// `id` in the current vault, read from its origin rather than the cache. Take one before
+    /// handing an object to an editor, so [`Self::save_edit`] can tell whether it changed
+    /// underneath the edit.
+    pub async fn fresh_object(&self, id: ObjectId) -> Result<Object> {
+        let vault = self.current_vault_ref()?;
+        Ok(vault.get_fresh(id).await?)
+    }
+
+    /// Saves an edited copy of `opened` (the object as it was when the edit began, from
+    /// [`Self::fresh_object`]) back to the current vault, unless the object has changed since.
+    /// Writing anyway would silently throw away whatever was saved in the meantime, from
+    /// another device, a sync, or another editor.
+    pub async fn save_edit(&self, opened: &Object, bytes: Vec<u8>) -> Result<SaveOutcome> {
+        let vault = self.current_vault_ref()?;
+        let current = vault.get_fresh(opened.get_id()).await?;
+        let version = |o: &Object| o.get_meta().map(|m| (m.size, m.modified));
+        if version(&current) != version(opened) {
+            return Ok(SaveOutcome::ChangedMeanwhile);
+        }
+        self.write_object_bytes(opened.get_id(), bytes).await?;
+        Ok(SaveOutcome::Saved)
+    }
+
+    fn current_vault_ref(&self) -> Result<&Vault> {
+        let name = self
+            .current_vault
+            .as_ref()
+            .ok_or_else(|| anyhow!("NO VAULT SELECTED"))?;
+        self.vaults
+            .get(name)
+            .ok_or_else(|| anyhow!("COULDN'T GET CURRENT WORKING VAULT"))
+    }
+
     pub fn select(&mut self, vault_name: String) -> Result<()> {
         if !self.vaults.contains_key(&vault_name) {
             return Err(anyhow!("VAULT '{}' DOESN'T EXITS", vault_name));
@@ -470,6 +583,8 @@ impl App {
         }
 
         self.vault_configs.insert(name.clone(), cfg);
+        self.forgotten.remove(&name);
+        self.registered.insert(name.clone());
         self.vaults.insert(name, vault);
         self.save()
     }
@@ -493,6 +608,8 @@ impl App {
         }
         self.vaults.remove(&name);
         self.vault_configs.remove(&name);
+        self.registered.remove(&name);
+        self.forgotten.insert(name.clone());
         // Leaving `current_vault` pointing at a vault that's gone would make every later
         // resolution fail with a confusing "couldn't find configuration" error.
         if self.current_vault.as_deref() == Some(name.as_str()) {
@@ -507,6 +624,17 @@ impl App {
         path: String,
         vault: Option<String>,
         dest: Option<String>,
+    ) -> Result<()> {
+        self.put_with(path, vault, dest, false).await
+    }
+
+    /// [`Self::put`], optionally `force`-overwriting an existing object of the same name.
+    pub async fn put_with(
+        &mut self,
+        path: String,
+        vault: Option<String>,
+        dest: Option<String>,
+        force: bool,
     ) -> Result<()> {
         let local = self
             .vaults
@@ -535,9 +663,24 @@ impl App {
             Some(d) => Self::resolve_relative(&self.cwd_path, &d),
             None => self.cwd_path.clone(),
         };
-        let dest_parent_id = target_vault.find(dest_path).await?;
+        let dest_parent_id = target_vault.find(dest_path.clone()).await?;
+        let name = source_obj.get_name();
+        Self::check_placement(
+            target_vault,
+            &dest_parent_id,
+            &name,
+            &source_obj,
+            force,
+            &dest_path.join(&name),
+        )
+        .await?;
 
-        let placed = target_vault.put(&mut source_obj, &dest_parent_id).await?;
+        let mut placed = target_vault.put(&mut source_obj, &dest_parent_id).await?;
+        // A copy keeps its source's metadata (modification time above all), so it
+        // compares equal to the source on the next push/pull instead of looking newer.
+        if let Some(meta) = source_obj.get_meta() {
+            placed.set_meta(meta);
+        }
 
         if let Object::Leaf { .. } = placed {
             let bytes = local.fetch(source_id).await?;
@@ -551,6 +694,17 @@ impl App {
         path: String,
         vault: Option<String>,
         dest: Option<String>,
+    ) -> Result<()> {
+        self.get_with(path, vault, dest, false).await
+    }
+
+    /// [`Self::get`], optionally `force`-overwriting an existing local object of the same name.
+    pub async fn get_with(
+        &mut self,
+        path: String,
+        vault: Option<String>,
+        dest: Option<String>,
+        force: bool,
     ) -> Result<()> {
         let target_vault_name = match vault {
             Some(v) => v,
@@ -582,9 +736,24 @@ impl App {
             Some(d) => self.resolve_local_path(&d)?,
             None => PathBuf::from("/"),
         };
-        let dest_parent_id = local.find(dest_path).await?;
+        let dest_parent_id = local.find(dest_path.clone()).await?;
+        let name = source_obj.get_name();
+        Self::check_placement(
+            local,
+            &dest_parent_id,
+            &name,
+            &source_obj,
+            force,
+            &dest_path.join(&name),
+        )
+        .await?;
 
-        let placed = local.put(&mut source_obj, &dest_parent_id).await?;
+        let mut placed = local.put(&mut source_obj, &dest_parent_id).await?;
+        // A copy keeps its source's metadata (modification time above all), so it
+        // compares equal to the source on the next push/pull instead of looking newer.
+        if let Some(meta) = source_obj.get_meta() {
+            placed.set_meta(meta);
+        }
 
         if let Object::Leaf { .. } = placed {
             let bytes = source_vault.fetch(source_id).await?;
@@ -646,7 +815,18 @@ impl App {
         destination: String,
         vault: Option<String>,
     ) -> Result<()> {
-        self.transfer(name, destination, vault, false).await
+        self.transfer(name, destination, vault, false, false).await
+    }
+
+    /// [`Self::cp`], optionally `force`-overwriting an existing object of the same name.
+    pub async fn cp_with(
+        &mut self,
+        name: String,
+        destination: String,
+        vault: Option<String>,
+        force: bool,
+    ) -> Result<()> {
+        self.transfer(name, destination, vault, false, force).await
     }
 
     /// Same as [`Self::cp`], but deletes the source (recursively, for a directory) once the copy
@@ -657,7 +837,18 @@ impl App {
         destination: String,
         vault: Option<String>,
     ) -> Result<()> {
-        self.transfer(name, destination, vault, true).await
+        self.transfer(name, destination, vault, true, false).await
+    }
+
+    /// [`Self::mv`], optionally `force`-overwriting an existing object of the same name.
+    pub async fn mv_with(
+        &mut self,
+        name: String,
+        destination: String,
+        vault: Option<String>,
+        force: bool,
+    ) -> Result<()> {
+        self.transfer(name, destination, vault, true, force).await
     }
 
     /// Shared body of [`Self::cp`] and [`Self::mv`]; `delete_source` is the only difference.
@@ -667,6 +858,7 @@ impl App {
         destination: String,
         vault: Option<String>,
         delete_source: bool,
+        force: bool,
     ) -> Result<()> {
         let (source_vault_name, source_path) = self.resolve_spec(&name, vault.as_deref())?;
         let (dest_vault_name, dest_path) = self.resolve_spec(&destination, vault.as_deref())?;
@@ -697,10 +889,10 @@ impl App {
             )
         })?;
 
-        let target = Self::resolve_destination(dest, &dest_path).await?;
+        let target = Self::resolve_destination(dest, &dest_path, force).await?;
 
-        // Only meaningful when the object keeps its name: `cp a.txt .` would have `put`
-        // truncate the file before `send` could read it, but `cp a.txt copy.txt` is fine.
+        // Only meaningful when the object keeps its name: `cp a.txt .` would copy the file
+        // onto itself, but `cp a.txt copy.txt` is fine.
         if same_vault
             && matches!(target, Destination::Into(_))
             && source_path.parent() == Some(dest_path.as_path())
@@ -713,29 +905,147 @@ impl App {
         }
 
         let source_id = source.find(source_path).await?;
-        let (dest_parent_id, rename_to) = match &target {
-            Destination::Into(id) => (id, None),
-            Destination::As(id, new_name) => (id, Some(new_name.as_str())),
+        let source_obj = source.get_fresh(source_id.clone()).await?;
+        let (dest_parent_id, final_name) = match target {
+            Destination::Into(id) => (id, source_obj.get_name()),
+            Destination::As(id, new_name) => (id, new_name),
         };
+        let shown = dest_path.join(&final_name);
+        let existed = Self::check_placement(
+            dest,
+            &dest_parent_id,
+            &final_name,
+            &source_obj,
+            force,
+            &shown,
+        )
+        .await?;
 
-        Self::deep_copy(source, dest, source_id.clone(), dest_parent_id, rename_to).await?;
+        // A move never replaces an existing directory, even forced, on any origin. This
+        // matches Unix `mv`. Without the check, the fs origin's native rename refused it while
+        // origins without one merged the two trees and then deleted the source: the same
+        // command behaved differently per origin, and a merge that fails halfway can't be
+        // undone. `cp --force` merges directories; for a move, delete the target first.
+        if delete_source && existed && !matches!(source_obj, Object::Leaf { .. }) {
+            return Err(anyhow!(
+                "'{}' already exists and is a directory — mv can't replace a directory, even \
+                 with --force; use cp --force to merge into it, or delete it first",
+                shown.display()
+            ));
+        }
+
+        // A move within one vault is a native rename where the origin has one: atomic, and
+        // instant however big the tree is. Only origins without one take the slow path below.
+        if delete_source && same_vault {
+            match source
+                .rename(&source_id, &dest_parent_id, &final_name)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(VaultError::Unsupported(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Self::copy_or_clean_up(
+            source,
+            dest,
+            source_id.clone(),
+            &dest_parent_id,
+            &final_name,
+            existed,
+        )
+        .await?;
         if delete_source {
             source.delete(&source_id).await?;
         }
         Ok(())
     }
 
+    /// Checks whether `source` may be written as `name` under `parent` in `dest`, and returns
+    /// whether something was already there. An existing object is only replaced with `force`,
+    /// and a file never replaces a directory or the other way round, even with `force`.
+    /// `shown` is the path used in error messages.
+    async fn check_placement(
+        dest: &Vault,
+        parent: &ObjectId,
+        name: &str,
+        source: &Object,
+        force: bool,
+        shown: &Path,
+    ) -> Result<bool> {
+        let children = dest.list(parent.clone()).await?;
+        let Some(existing) = children.iter().find(|child| child.get_name() == name) else {
+            return Ok(false);
+        };
+        let is_dir = |o: &Object| !matches!(o, Object::Leaf { .. });
+        if is_dir(existing) != is_dir(source) {
+            return Err(anyhow!(
+                "'{}' already exists and is a {}",
+                shown.display(),
+                if is_dir(existing) {
+                    "directory"
+                } else {
+                    "file"
+                }
+            ));
+        }
+        if !force {
+            return Err(anyhow!(
+                "'{}' already exists — use --force to overwrite it",
+                shown.display()
+            ));
+        }
+        Ok(true)
+    }
+
+    /// [`Self::deep_copy`], but a copy that fails partway doesn't leave a half-copied object
+    /// behind: if nothing was at the destination before (`existed` is false), whatever was
+    /// written there is deleted again before the error is returned.
+    async fn copy_or_clean_up(
+        source: &Vault,
+        dest: &Vault,
+        source_id: ObjectId,
+        dest_parent_id: &ObjectId,
+        name: &str,
+        existed: bool,
+    ) -> Result<Object> {
+        match Self::deep_copy(source, dest, source_id, dest_parent_id, Some(name)).await {
+            Ok(placed) => Ok(placed),
+            Err(e) => {
+                if !existed
+                    && let Ok(children) = dest.list(dest_parent_id.clone()).await
+                    && let Some(partial) = children.iter().find(|c| c.get_name() == name)
+                {
+                    let _ = dest.delete(&partial.get_id()).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Works out what a `cp`/`mv` destination path means: an existing directory to copy *into*,
     /// or a not-yet-existing path to copy *as*.
     ///
-    /// An existing file is rejected rather than treated as a target to overwrite — `put`
-    /// truncates, so a mistyped destination would silently destroy whatever was already there.
-    async fn resolve_destination(dest: &Vault, dest_path: &Path) -> Result<Destination> {
+    /// An existing *file* is only a target with `force`, the same rule as copying into a
+    /// directory that already holds that name (see [`Self::check_placement`]), so a mistyped
+    /// destination can't silently replace whatever was there.
+    async fn resolve_destination(
+        dest: &Vault,
+        dest_path: &Path,
+        force: bool,
+    ) -> Result<Destination> {
         if let Ok(id) = dest.find(dest_path.to_path_buf()).await {
-            return match dest.get(id.clone()).await? {
-                Object::Branch { .. } | Object::Root { .. } => Ok(Destination::Into(id)),
-                _ => Err(anyhow!("'{}' already exists", dest_path.display())),
-            };
+            match dest.get_fresh(id.clone()).await? {
+                Object::Branch { .. } | Object::Root { .. } => return Ok(Destination::Into(id)),
+                _ if !force => {
+                    return Err(anyhow!(
+                        "'{}' already exists — use --force to overwrite it",
+                        dest_path.display()
+                    ));
+                }
+                _ => {}
+            }
         }
 
         let parent = dest_path
@@ -856,7 +1166,14 @@ impl App {
         let source_id = v.find(source_path).await?;
         let parent_id = v.find(parent).await?;
 
-        Self::deep_copy(v, v, source_id.clone(), &parent_id, Some(&new_name)).await?;
+        // Native rename first: atomic, and instant for a large directory. Copy-then-delete is
+        // only the fallback for origins that can't (and cleans up after itself if it fails).
+        match v.rename(&source_id, &parent_id, &new_name).await {
+            Ok(_) => return Ok(()),
+            Err(VaultError::Unsupported(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Self::copy_or_clean_up(v, v, source_id.clone(), &parent_id, &new_name, false).await?;
         v.delete(&source_id).await?;
         Ok(())
     }
@@ -879,7 +1196,12 @@ impl App {
         if let Some(new_name) = rename_to {
             source_obj.with_name(new_name.to_string());
         }
-        let placed = dest.put(&mut source_obj, dest_parent_id).await?;
+        let mut placed = dest.put(&mut source_obj, dest_parent_id).await?;
+        // A copy keeps its source's metadata (modification time above all), so it
+        // compares equal to the source on the next push/pull instead of looking newer.
+        if let Some(meta) = source_obj.get_meta() {
+            placed.set_meta(meta);
+        }
 
         match &placed {
             Object::Leaf { .. } => {
@@ -941,7 +1263,12 @@ impl App {
         Ok(())
     }
 
-    pub async fn push(&mut self, vault: Option<String>) -> Result<()> {
+    pub async fn push(&mut self, vault: Option<String>) -> Result<SyncReport> {
+        self.push_with(vault, false).await
+    }
+    /// [`Self::push`], optionally `force`-overwriting remote files that are newer than the
+    /// local ones (reported as conflicts otherwise).
+    pub async fn push_with(&mut self, vault: Option<String>, force: bool) -> Result<SyncReport> {
         let target_name = match vault {
             Some(v) => v,
             None => self
@@ -962,12 +1289,17 @@ impl App {
             .ok_or_else(|| anyhow!("NO LOCAL VAULT CONFIGURED"))?;
 
         let root = local.get_id();
-        local.push(&root, target_origin.as_ref()).await?;
-
-        Ok(())
+        Ok(local
+            .push_with(&root, target_origin.as_ref(), SyncOptions { force })
+            .await?)
     }
 
-    pub async fn pull(&mut self, vault: Option<String>) -> Result<()> {
+    pub async fn pull(&mut self, vault: Option<String>) -> Result<SyncReport> {
+        self.pull_with(vault, false).await
+    }
+    /// [`Self::pull`], optionally `force`-overwriting local files that are newer than the
+    /// remote ones (reported as conflicts otherwise).
+    pub async fn pull_with(&mut self, vault: Option<String>, force: bool) -> Result<SyncReport> {
         let source_name = match vault {
             Some(v) => v,
             None => self
@@ -988,9 +1320,9 @@ impl App {
             .ok_or_else(|| anyhow!("NO LOCAL VAULT CONFIGURED"))?;
 
         let root = local.get_id();
-        local.pull(&root, source_origin.as_ref()).await?;
-
-        Ok(())
+        Ok(local
+            .pull_with(&root, source_origin.as_ref(), SyncOptions { force })
+            .await?)
     }
     pub fn exit(&mut self) -> Result<()> {
         self.save()?;

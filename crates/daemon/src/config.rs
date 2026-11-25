@@ -83,8 +83,19 @@ impl FileConfig {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::write(path, format!("{GENERATED_HEADER}\n{body}"))
-            .with_context(|| format!("writing {}", path.display()))?;
+        // Atomic, so an interrupted first run can't leave a truncated config that every later
+        // start fails to parse. The generated default never holds a token (`--token` is merged
+        // in memory only), but a config with one is kept private anyway.
+        let mode = match &self.auth {
+            Some(AuthConfig::Bearer { .. }) => Some(0o600),
+            _ => None,
+        };
+        nimbus_vault::fsutil::atomic_write(
+            path,
+            format!("{GENERATED_HEADER}\n{body}").as_bytes(),
+            mode,
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
 
         if let Some(vaults) = &self.vaults_path {
             std::fs::create_dir_all(vaults)

@@ -182,3 +182,94 @@ fn pushing_root_object_type_is_invalid() {
     );
     assert!(matches!(result, Err(VaultError::InvalidMethodCall)));
 }
+
+#[test]
+fn validate_name_accepts_ordinary_names() {
+    for name in [
+        "notes.txt",
+        "a#b",
+        "sp ace",
+        "50%",
+        "ñandú",
+        ".hidden",
+        "...",
+        "a..b",
+    ] {
+        assert!(validate_name(name).is_ok(), "{name:?} should be accepted");
+    }
+}
+
+#[test]
+fn validate_name_rejects_names_that_are_not_one_path_component() {
+    for name in ["", ".", "..", "../x", "a/b", "/etc/passwd", "a\\b", "a\0b"] {
+        assert!(
+            matches!(validate_name(name), Err(VaultError::InvalidName(_))),
+            "{name:?} should be rejected"
+        );
+    }
+}
+
+fn leaf_with(size: u64, modified: Option<i64>) -> Object {
+    let mut meta = Metadata::new();
+    meta.set_size(size);
+    if let Some(secs) = modified {
+        meta.set_modified(chrono::DateTime::from_timestamp(secs, 0).unwrap());
+    }
+    Object::Leaf {
+        name: "a".to_string(),
+        id: ObjectId::from("a"),
+        meta,
+    }
+}
+
+#[test]
+fn compare_knows_which_side_is_newer() {
+    assert_eq!(
+        leaf_with(1, Some(100)).compare(&leaf_with(1, Some(100))),
+        SyncDecision::Same
+    );
+    assert_eq!(
+        leaf_with(1, Some(200)).compare(&leaf_with(9, Some(100))),
+        SyncDecision::SourceNewer
+    );
+    assert_eq!(
+        leaf_with(1, Some(100)).compare(&leaf_with(9, Some(200))),
+        SyncDecision::DestNewer
+    );
+    // Not enough information: copy rather than silently skipping (old `changed()` skipped).
+    assert_eq!(
+        leaf_with(1, None).compare(&leaf_with(2, None)),
+        SyncDecision::Unknown
+    );
+    assert_eq!(
+        leaf_with(1, Some(100)).compare(&leaf_with(2, Some(100))),
+        SyncDecision::Unknown
+    );
+}
+
+#[test]
+fn compare_treats_directories_as_same_and_mixed_kinds_as_mismatch() {
+    let dir = Object::Branch {
+        name: "d".to_string(),
+        id: ObjectId::from("d"),
+        meta: Metadata::new(),
+        children: None,
+    };
+    assert_eq!(dir.compare(&dir.clone()), SyncDecision::Same);
+    assert_eq!(dir.compare(&Object::root()), SyncDecision::Same);
+    assert_eq!(dir.compare(&leaf_with(1, None)), SyncDecision::KindMismatch);
+    assert_eq!(leaf_with(1, None).compare(&dir), SyncDecision::KindMismatch);
+}
+
+#[test]
+fn set_meta_replaces_metadata_and_ignores_root() {
+    let mut object = leaf_with(1, None);
+    let mut meta = Metadata::new();
+    meta.set_size(42);
+    object.set_meta(meta);
+    assert_eq!(object.get_meta().unwrap().size, Some(42));
+
+    let mut root = Object::root();
+    root.set_meta(Metadata::new());
+    assert!(root.get_meta().is_none());
+}

@@ -115,9 +115,11 @@ mv <path> <destination> [vault]
 delete <path> [vault] [-f | --force]
 ```
 
-`delete` refuses to remove a non-empty directory unless `--force` is given. `mkdir`/`touch` refuse to clobber anything already at the path — `touch` is therefore *not* the usual "create or bump the timestamp", since an origin's `put` truncates.
+`delete` refuses to remove a non-empty directory unless `--force` is given. `mkdir`/`touch` refuse to clobber anything already at the path — `touch` is therefore *not* the usual "create or bump the timestamp".
 
-`rename` takes a bare name, not a path; use `mv` to relocate. It is implemented as a copy under the new name followed by deleting the original, because no origin has a rename primitive — correct everywhere, but it costs a full data copy, which is worth knowing for a large object on a remote origin.
+`cp`, `mv`, `put` and `get` **never overwrite without `-f`/`--force`**, whether the destination is an existing directory that already holds that name or an existing file given as the destination. Even with `--force`, a file never replaces a directory, and a directory never replaces a file. Overwriting a file is atomic: readers see the old or the new contents, never a mix.
+
+`rename` takes a bare name, not a path; use `mv` to relocate. Both use the origin's native rename when it has one. For `fs` vaults that's a single atomic `rename(2)`, instant even for a huge directory. Other origins fall back to copying under the new name and then deleting the original. If that copy fails partway, the partial copy is removed and the original is left as it was.
 
 ### Paths
 
@@ -139,16 +141,24 @@ nimbus> cp notes.txt backup:/inbox/copy.txt  # under a new name
 nimbus> mv docs archive:/2026                # directories move recursively
 ```
 
-The destination may be an existing directory (the object keeps its name) or a path that doesn't exist yet (it lands under that new name). An existing *file* as the destination is refused rather than overwritten.
+The destination may be an existing directory (the object keeps its name) or a path that doesn't exist yet (it lands under that new name). An existing *file* as the destination, or one with the same name inside the destination directory, is refused unless `--force` is given.
 
 ### Syncing with a remote origin
 
 ```
-push [vault]           # send local changes to the vault's origin
-pull [vault]            # bring changes from the origin into the vault
+push [vault] [-f | --force]    # send local changes to the vault's origin
+pull [vault] [-f | --force]    # bring changes from the origin into the vault
 ```
 
-`push`/`pull` recursively sync an entire subtree, skipping objects that haven't changed (compared by metadata) rather than re-transferring everything on every run.
+`push`/`pull` recursively sync an entire subtree, copying only files that are **newer** on the source side or missing on the destination. Copies keep the source's modification time, so running the same `push` twice transfers nothing the second time. A destination file that is *newer* than the source (edited since the last sync) is **left alone and reported**, not overwritten:
+
+```
+copied 1, unchanged 12, 1 conflict
+  notes.txt: newer at the destination
+conflicting files were left as they are; rerun with --force to overwrite them
+```
+
+`--force` overwrites those too. A file and a directory with the same name are never overwritten, even with `--force`.
 
 ### Exiting
 
@@ -172,6 +182,7 @@ If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `comma
 - `ls` always reflects the true current state of a vault's origin — it's never served from cache.
 - Content (file bytes) is streamed, not buffered — large files don't get fully loaded into memory during transfer.
 - `mv` and `push`/`pull`'s local↔remote transfers only proceed with the destructive step (delete, in `mv`'s case) after the copy has succeeded.
+- The session file (`$XDG_STATE_HOME/nimbus/session.toml`) is written atomically and with mode `0600`. Each save merges into what's on disk, so a CLI and a TUI open at once don't drop each other's newly registered vaults. A session file that can't be parsed is moved to `session.toml.bak` with a warning, and the next start begins a fresh session.
 - Tab completion currently covers subcommand names and `cd`'s first argument only; other commands' path arguments aren't completed yet. It's a REPL feature — in one-shot mode your shell's completion is what's running.
 - To script several commands in one process, pipe them into the REPL (`printf 'select v\nls\n' | nimbus-cli`). One command per invocation is the other option, and the session file is what carries state between them.
 

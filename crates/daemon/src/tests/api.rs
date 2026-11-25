@@ -420,3 +420,250 @@ fn ids_with_a_null_byte_are_refused() {
         Err(ApiError::InvalidId(_))
     ));
 }
+
+// --- regressions: hostile names, special characters in ids ---
+
+#[tokio::test]
+async fn put_with_a_name_that_escapes_the_vault_is_a_400_and_creates_nothing() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("vault");
+    std::fs::create_dir(&root).unwrap();
+    let base = spawn(state_for(
+        fs_vault("v", root.clone()),
+        false,
+        AuthConfig::None,
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    for name in ["../escaped.txt", "a/b", ".."] {
+        let response = client
+            .put(format!("{base}{VAULT_PREFIX}/v/put/"))
+            .json(&leaf(name))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{name:?}"
+        );
+    }
+    assert!(!outer.path().join("escaped.txt").exists());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn names_with_url_special_characters_round_trip_through_the_daemon() {
+    // The scan's reproduction: sending `a#b` used to overwrite the unrelated object `a`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), b"original").unwrap();
+    let base = spawn(state_for(
+        fs_vault("v", dir.path().to_path_buf()),
+        false,
+        AuthConfig::None,
+    ))
+    .await;
+    let origin = origin_for(&base, "v");
+
+    for name in ["a#b", "a?b", "50%", "sp ace", "ñandú"] {
+        let stored = origin
+            .put(&mut leaf(name), &ObjectId::from(""))
+            .await
+            .unwrap_or_else(|e| panic!("put {name:?}: {e}"));
+        let body = format!("contents of {name}");
+        let payload: nimbus_vault::origin::ByteStream = Box::pin(futures::stream::once({
+            let body = body.clone();
+            async move { Ok(bytes::Bytes::from(body)) }
+        }));
+        origin.send(&stored, payload).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join(name)).unwrap(),
+            body.as_bytes()
+        );
+        let fetched = collect(origin.fetch(&ObjectId::from(name)).await.unwrap()).await;
+        assert_eq!(fetched, body.as_bytes(), "{name:?}");
+    }
+    assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"original");
+}
+
+// --- regressions: modification times travel with the contents ---
+
+#[tokio::test]
+async fn send_applies_the_modified_header_and_pushing_twice_is_a_no_op() {
+    let local_dir = tempfile::tempdir().unwrap();
+    let served_dir = tempfile::tempdir().unwrap();
+    std::fs::write(local_dir.path().join("notes.txt"), b"hello").unwrap();
+    let base = spawn(state_for(
+        fs_vault("v", served_dir.path().to_path_buf()),
+        false,
+        AuthConfig::None,
+    ))
+    .await;
+    let remote = origin_for(&base, "v");
+    let local = fs_vault("local", local_dir.path().to_path_buf());
+    let root = ObjectId::from("");
+
+    let first = local.push(&root, &remote).await.unwrap();
+    assert_eq!(first.copied.len(), 1);
+    let source_time = std::fs::metadata(local_dir.path().join("notes.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let served_time = std::fs::metadata(served_dir.path().join("notes.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(source_time, served_time);
+
+    let second = local.push(&root, &remote).await.unwrap();
+    assert!(second.copied.is_empty(), "{second:?}");
+    assert_eq!(second.unchanged, 1);
+}
+
+#[tokio::test]
+async fn send_with_a_malformed_modified_header_is_a_400() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"keep").unwrap();
+    let base = spawn(state_for(
+        fs_vault("v", dir.path().to_path_buf()),
+        false,
+        AuthConfig::None,
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .put(format!("{base}{VAULT_PREFIX}/v/send/a.txt"))
+        .header(nimbus_vault::MODIFIED_HEADER, "yesterday")
+        .body("new")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"keep");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_route_moves_an_object_natively() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("docs/deep")).unwrap();
+    std::fs::write(dir.path().join("docs/deep/a#1.txt"), b"x").unwrap();
+    std::fs::create_dir(dir.path().join("archive")).unwrap();
+    let inode = std::fs::metadata(dir.path().join("docs")).unwrap().ino();
+    let base = spawn(state_for(
+        fs_vault("v", dir.path().to_path_buf()),
+        false,
+        AuthConfig::None,
+    ))
+    .await;
+    let origin = origin_for(&base, "v").with_rename_url(Some("/rename/{id}".to_string()));
+
+    let moved = origin
+        .rename(
+            &ObjectId::from("docs"),
+            &ObjectId::from("archive"),
+            "old docs",
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.get_name(), "old docs");
+    let target = dir.path().join("archive/old docs");
+    assert_eq!(std::fs::metadata(&target).unwrap().ino(), inode);
+    assert!(target.join("deep/a#1.txt").exists());
+}
+
+#[tokio::test]
+async fn rename_route_rejects_hostile_names_and_destinations() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("vault");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"x").unwrap();
+    let base = spawn(state_for(
+        fs_vault("v", root.clone()),
+        false,
+        AuthConfig::None,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+
+    for body in [
+        serde_json::json!({"destination": "", "name": "../out.txt"}),
+        serde_json::json!({"destination": "../", "name": "out.txt"}),
+    ] {
+        let response = client
+            .post(format!("{base}{VAULT_PREFIX}/v/rename/a.txt"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert!(root.join("a.txt").exists());
+    assert!(!outer.path().join("out.txt").exists());
+}
+
+#[tokio::test]
+async fn rename_route_is_refused_when_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    let base = spawn(state_for(
+        fs_vault("v", dir.path().to_path_buf()),
+        true,
+        AuthConfig::None,
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}{VAULT_PREFIX}/v/rename/a.txt"))
+        .json(&serde_json::json!({"destination": "", "name": "b.txt"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(dir.path().join("a.txt").exists());
+}
+
+// --- regression: malformed requests that aren't about ids are BadRequest, not InvalidId ---
+
+#[test]
+fn a_malformed_modified_header_is_a_bad_request() {
+    let mut headers = HeaderMap::new();
+    headers.insert(nimbus_vault::MODIFIED_HEADER, "yesterday".parse().unwrap());
+    match modified_header(&headers) {
+        Err(ApiError::BadRequest(reason)) => {
+            assert!(reason.contains(nimbus_vault::MODIFIED_HEADER), "{reason}")
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_valid_or_absent_modified_header_parses() {
+    assert!(matches!(modified_header(&HeaderMap::new()), Ok(None)));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        nimbus_vault::MODIFIED_HEADER,
+        "2026-01-02T03:04:05.123456789Z".parse().unwrap(),
+    );
+    let parsed = modified_header(&headers).unwrap().unwrap();
+    assert_eq!(parsed.to_rfc3339(), "2026-01-02T03:04:05.123456789+00:00");
+}
+
+#[tokio::test]
+async fn bad_request_and_invalid_id_both_answer_400_with_their_reason() {
+    use axum::response::IntoResponse;
+    for error in [
+        ApiError::BadRequest("bad header".to_string()),
+        ApiError::InvalidId("bad id".to_string()),
+    ] {
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+}

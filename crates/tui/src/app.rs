@@ -2,7 +2,7 @@ use crate::command;
 use crate::event::{AppEvent, Event, EventHandler};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nimbus_core::app::App as NimbusApp;
+use nimbus_core::app::{App as NimbusApp, SaveOutcome};
 use nimbus_creator::App as CreatorApp;
 use nimbus_vault::object::{Object, ObjectId};
 use ratatui::{DefaultTerminal, widgets::ListState};
@@ -54,6 +54,10 @@ pub struct App {
     /// Names, not indices: a refresh renumbers the list but doesn't rename its contents, so
     /// indices would silently come to mean different objects after any mutation.
     pub marked: HashSet<String>,
+    /// Private (0700) directory holding the temp copies of opened objects; made on first use
+    /// and deleted with the app. Copies handed to a GUI opener live until then, since it may
+    /// still be reading them.
+    pub scratch: Option<tempfile::TempDir>,
     /// `Some(text)` while a `/` filter is narrowing the listing.
     pub filter: Option<String>,
     /// Whether keystrokes are currently going into [`Self::filter`] rather than acting as
@@ -218,6 +222,7 @@ impl Default for App {
             help: None,
             confirm: None,
             marked: HashSet::new(),
+            scratch: None,
             filter: None,
             filtering: false,
             rename: None,
@@ -888,11 +893,11 @@ impl App {
             }
             AppEvent::Push { vault } => {
                 let result = self.nimbus.push(vault).await;
-                self.report(result, "pushed").await;
+                self.report_sync(result, "pushed").await;
             }
             AppEvent::Pull { vault } => {
                 let result = self.nimbus.pull(vault).await;
-                self.report(result, "pulled").await;
+                self.report_sync(result, "pulled").await;
             }
         }
     }
@@ -908,6 +913,20 @@ impl App {
         match result {
             Ok(()) => self.status = Some(format!("{verb} ok")),
             Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    /// Like [`Self::report`] for a push/pull: shows the sync summary, and names the conflicting
+    /// files (which were left untouched) when there are any.
+    async fn report_sync(
+        &mut self,
+        result: anyhow::Result<nimbus_vault::vault::SyncReport>,
+        verb: &str,
+    ) {
+        let summary = result.as_ref().ok().map(|report| sync_status(verb, report));
+        self.report(result.map(|_| ()), verb).await;
+        if let Some(summary) = summary {
+            self.status = Some(summary);
         }
     }
 
@@ -977,6 +996,15 @@ impl App {
         terminal: &mut DefaultTerminal,
         with: OpenWith,
     ) {
+        // Taken *before* the bytes, so a change landing between the two shows up as a
+        // conflict at save time rather than being missed.
+        let opened = match self.nimbus.fresh_object(id.clone()).await {
+            Ok(object) => object,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                return;
+            }
+        };
         let bytes = match self.nimbus.fetch_object_bytes(id.clone()).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -985,9 +1013,22 @@ impl App {
             }
         };
 
-        let dir = std::env::temp_dir().join(format!("nimbus-tui-{}", std::process::id()));
-        let path = dir.join(&name);
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes)) {
+        // The name comes from the vault's origin; joined unchecked, `../x` would write the
+        // fetched bytes outside the temp directory.
+        if let Err(e) = nimbus_vault::object::validate_name(&name) {
+            self.status = Some(e.to_string());
+            return;
+        }
+        // A private directory, not a predictable `/tmp/nimbus-tui-<pid>`: another user could
+        // read the copy there, or plant a symlink for this write to follow.
+        let path = match self.scratch_dir() {
+            Ok(dir) => dir.join(&name),
+            Err(e) => {
+                self.status = Some(format!("couldn't create a temp directory: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, &bytes) {
             self.status = Some(e.to_string());
             return;
         }
@@ -1038,16 +1079,19 @@ impl App {
         // Running a program isn't editing it: the bytes on disk are the ones we fetched, and
         // anything it produced went wherever it wrote it. There's nothing to save back.
         self.status = match launch {
-            Launch::Ran(outcome) => Some(outcome),
+            Launch::Ran(outcome) => {
+                let _ = std::fs::remove_file(&path);
+                Some(outcome)
+            }
             Launch::Failed(failure) => Some(failure),
             Launch::Waited(note) => {
-                let saved = self.write_back(&name, id, &path, &bytes, false).await;
+                let saved = self.write_back(&name, &opened, &path, &bytes, false).await;
                 match (saved, note) {
                     (Some(saved), Some(note)) => Some(format!("{saved} ({note})")),
                     (saved, note) => saved.or(note),
                 }
             }
-            Launch::HandedOff => self.write_back(&name, id, &path, &bytes, true).await,
+            Launch::HandedOff => self.write_back(&name, &opened, &path, &bytes, true).await,
         };
     }
 
@@ -1060,7 +1104,7 @@ impl App {
     async fn write_back(
         &mut self,
         name: &str,
-        id: ObjectId,
+        opened: &Object,
         path: &std::path::Path,
         original: &[u8],
         os_opened: bool,
@@ -1077,17 +1121,53 @@ impl App {
             return Some(if os_opened {
                 format!("opened {name} — edits made after this won't be saved back")
             } else {
+                let _ = std::fs::remove_file(path);
                 format!("closed {name} — unchanged")
             });
         }
 
-        match self.nimbus.write_object_bytes(id, updated).await {
-            Ok(()) => {
+        match self.nimbus.save_edit(opened, updated).await {
+            Ok(SaveOutcome::Saved) => {
+                if !os_opened {
+                    let _ = std::fs::remove_file(path);
+                }
                 self.refresh_objects().await;
                 Some(format!("saved {name}"))
             }
-            Err(e) => Some(format!("couldn't save {name}: {e}")),
+            Ok(SaveOutcome::ChangedMeanwhile) => {
+                // Keep the edit: the scratch directory would be deleted on exit, so take it
+                // out of `TempDir`'s hands and point the user at it.
+                if let Some(dir) = self.scratch.take() {
+                    let _ = dir.keep();
+                }
+                Some(format!(
+                    "{name} changed in the vault while you were editing — not saved; your \
+                     version is at {}",
+                    path.display()
+                ))
+            }
+            Err(e) => {
+                if let Some(dir) = self.scratch.take() {
+                    let _ = dir.keep();
+                }
+                Some(format!(
+                    "couldn't save {name}: {e} — your version is at {}",
+                    path.display()
+                ))
+            }
         }
+    }
+
+    /// The private scratch directory for opened objects, created on first use.
+    fn scratch_dir(&mut self) -> std::io::Result<std::path::PathBuf> {
+        if self.scratch.is_none() {
+            self.scratch = Some(crate::opener::private_scratch_dir()?);
+        }
+        Ok(self
+            .scratch
+            .as_ref()
+            .map(|d| d.path().to_path_buf())
+            .unwrap_or_default())
     }
 
     async fn ascend(&mut self) {
@@ -1293,3 +1373,30 @@ fn meta_modified(object: &Object) -> chrono::DateTime<chrono::Utc> {
         .and_then(|meta| meta.modified)
         .unwrap_or(chrono::DateTime::UNIX_EPOCH)
 }
+
+/// The status-bar line for a finished push/pull. Each conflict is named with its own reason;
+/// they aren't all "newer at the destination". The `--force` hint appears only when one of them
+/// can be forced. The TUI's `:push`/`:pull` have no force option, so the hint points at the CLI.
+pub fn sync_status(verb: &str, report: &nimbus_vault::vault::SyncReport) -> String {
+    let mut status = format!(
+        "{verb}: {} copied, {} unchanged",
+        report.copied.len(),
+        report.unchanged
+    );
+    if !report.conflicts.is_empty() {
+        let skipped: Vec<String> = report
+            .conflicts
+            .iter()
+            .map(|c| format!("{} ({})", c.id, c.reason))
+            .collect();
+        status.push_str(&format!("; left as is: {}", skipped.join(", ")));
+        if report.has_forceable_conflicts() {
+            status.push_str(" — `nimbus push/pull --force` overwrites the newer ones");
+        }
+    }
+    status
+}
+
+#[cfg(test)]
+#[path = "tests/app.rs"]
+mod tests;

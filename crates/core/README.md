@@ -146,13 +146,24 @@ standing in.
   `Branch` only creates the entry itself — it knows nothing about children — so without recursion
   a moved directory would arrive empty and the source would then be deleted. It takes an optional
   `rename_to`, which applies to the **top level only**; descendants keep their own names.
-- **`rename`** is a copy under the new name followed by deleting the original, because `Origin`
-  has no rename primitive (`put` always writes an object under its own `get_name()`). Correct for
-  every origin, but it costs a **full data copy** — worth knowing for a large object on a remote
-  origin. A real `Origin::rename` with an `fs::rename` fast path is the fix if that ever matters.
-- **`cp`/`mv` destinations** may be an existing directory (the object keeps its name) or a path
-  that doesn't exist yet (it lands in its parent under that new name). An existing *file* is
-  refused rather than overwritten, because `put` truncates.
+- **`rename`, and `mv` within one vault**, go through `Vault::rename` (the origin's native,
+  atomic move: one `rename(2)` for `fs`). Only on `VaultError::Unsupported` do they fall back to
+  `deep_copy` under the new name followed by deleting the original (`copy_or_clean_up`). That
+  path removes its partial copy if it fails, so an interrupted move never leaves half a tree.
+- **`cp`/`mv`/`put`/`get` destinations** may be an existing directory (the object keeps its
+  name) or a path that doesn't exist yet (it lands in its parent under that new name). Replacing
+  an existing object needs the `*_with(.., force: true)` variants (`check_placement`), and a
+  file never replaces a directory or vice versa, even forced.
+- **`push`/`pull`** return the vault's `SyncReport` (re-exported as `nimbus_core::SyncReport`),
+  and `push_with`/`pull_with` take `force`. Files newer at the destination are reported as
+  conflicts instead of overwritten.
+- **Saving an edit** (`fresh_object` before opening, `save_edit` after) refuses with
+  `SaveOutcome::ChangedMeanwhile` when the object changed in between, instead of overwriting
+  that change.
+- **Session state** is written with `fsutil::atomic_write` (mode `0600`) and *merged*. Each save
+  applies only the vaults this session registered or forgot to the registry currently on disk,
+  so concurrent sessions don't undo each other. An unparseable state file is moved to `.bak` at
+  startup instead of failing every command.
 - The **into-itself guard** rejects any destination whose path starts with the source's, with no
   exemption for the two being equal — pasting a directory into itself resolves to exactly that,
   and `deep_copy` would otherwise recurse into the copy it had just made, forever. `starts_with`

@@ -24,6 +24,9 @@ impl ErrorBody {
 pub enum ApiError {
     UnknownVault(String),
     InvalidId(String),
+    /// Anything else malformed in the request: a name that isn't one path component, an
+    /// unparseable header. Answered with 400 and the reason.
+    BadRequest(String),
     ReadOnly,
     Vault(VaultError),
 }
@@ -40,7 +43,9 @@ impl IntoResponse for ApiError {
             ApiError::UnknownVault(name) => {
                 (StatusCode::NOT_FOUND, format!("no vault named '{name}'"))
             }
-            ApiError::InvalidId(reason) => (StatusCode::BAD_REQUEST, reason),
+            ApiError::InvalidId(reason) | ApiError::BadRequest(reason) => {
+                (StatusCode::BAD_REQUEST, reason)
+            }
             ApiError::ReadOnly => (
                 StatusCode::FORBIDDEN,
                 "this daemon is serving read-only".to_string(),
@@ -48,6 +53,13 @@ impl IntoResponse for ApiError {
             // `NotFound` is part of the protocol, not a leak: `OriginHTTP` turns this status
             // back into `VaultError::NotFound`, which is what `push`/`pull` match on.
             ApiError::Vault(VaultError::NotFound(what)) => (StatusCode::NOT_FOUND, what),
+            ApiError::Vault(e @ VaultError::Unsupported(_)) => {
+                (StatusCode::NOT_IMPLEMENTED, e.to_string())
+            }
+            // The request itself was bad (a hostile or malformed name/id), not the origin.
+            ApiError::Vault(e @ (VaultError::InvalidName(_) | VaultError::InvalidId(_))) => {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            }
             // Anything else is the origin's own message, which can name a path on this host or
             // the upstream a proxying daemon sits in front of. The operator gets the detail in
             // the log; the client gets the status.

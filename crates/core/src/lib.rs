@@ -10,3 +10,6 @@
 
 pub mod app;
 pub mod config;
+
+/// What a push/pull did, as returned by [`app::App::push`] / [`app::App::pull`].
+pub use nimbus_vault::vault::{SyncConflict, SyncReport};

@@ -5,7 +5,7 @@ use crate::{
     VaultResult,
     config::VaultConfig,
     error::VaultError,
-    object::{Object, ObjectId},
+    object::{Object, ObjectId, SyncDecision},
     origin::{ByteStream, Origin},
 };
 
@@ -225,6 +225,44 @@ impl Vault {
         }
         Ok(children)
     }
+    /// Like [`Self::get`], but always asks the origin and refreshes the cache with the answer.
+    /// For anything that must not act on outdated metadata: sync decisions, overwrite checks,
+    /// saving an edit back.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use nimbus_vault::vault::Vault;
+    /// # async fn example(vault: Vault) -> nimbus_vault::VaultResult<()> {
+    /// let current = vault.get_fresh("notes.txt").await?; // never served from the cache
+    /// # let _ = current;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_fresh(&self, id: impl Into<ObjectId>) -> VaultResult<Object> {
+        let id = id.into();
+        match self.origin.get(&id).await {
+            Ok(object) => {
+                self.objects.lock().await.insert(id, object.clone());
+                Ok(object)
+            }
+            Err(e) => {
+                self.objects.lock().await.remove(&id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether cache key `cached` is `id` itself or something under it. Ids are compared with
+    /// any leading `/` stripped, since origins disagree on whether to keep one.
+    fn is_same_or_descendant(cached: &ObjectId, id: &ObjectId) -> bool {
+        let cached = cached.as_str().trim_start_matches('/');
+        let id = id.as_str().trim_start_matches('/').trim_end_matches('/');
+        id.is_empty()
+            || cached == id
+            || (cached.starts_with(id) && cached[id.len()..].starts_with('/'))
+    }
+
     /// Returns `id`'s `Object`, serving it from the in-memory cache when present and otherwise
     /// fetching it from the origin and caching the result.
     ///
@@ -275,7 +313,11 @@ impl Vault {
     /// # }
     /// ```
     pub async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()> {
-        self.origin.send(object, payload).await
+        let result = self.origin.send(object, payload).await;
+        // Evicted on failure too: a failed send may still have changed the object (an origin
+        // that isn't atomic), and the next `get` re-reading it is cheap insurance.
+        self.objects.lock().await.remove(&object.get_id());
+        result
     }
     /// Writes `object` to the origin and caches it under its own id.
     ///
@@ -303,6 +345,34 @@ impl Vault {
             .insert(stored.get_id(), stored.clone());
         Ok(stored)
     }
+    /// Moves `id` under `new_parent` as `new_name` through the origin's native
+    /// [`Origin::rename`]. That's atomic where the origin supports it, for example a single
+    /// `rename(2)` for `OriginFileSystem`. Returns [`VaultError::Unsupported`] when the origin
+    /// can't, and callers then fall back to copy-then-delete.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use nimbus_vault::{object::ObjectId, vault::Vault};
+    /// # async fn example(vault: Vault) -> nimbus_vault::VaultResult<()> {
+    /// let id = vault.find("draft.txt".into()).await?;
+    /// let archive = vault.find("archive".into()).await?;
+    /// vault.rename(&id, &archive, "final.txt").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn rename(
+        &self,
+        id: &ObjectId,
+        new_parent: &ObjectId,
+        new_name: &str,
+    ) -> VaultResult<Object> {
+        let moved = self.origin.rename(id, new_parent, new_name).await?;
+        let mut cache = self.objects.lock().await;
+        cache.retain(|cached, _| !Self::is_same_or_descendant(cached, id));
+        cache.insert(moved.get_id(), moved.clone());
+        Ok(moved)
+    }
     /// Deletes `id` from the origin and evicts it from the cache.
     ///
     /// # Examples
@@ -317,16 +387,24 @@ impl Vault {
     /// ```
     pub async fn delete(&self, id: &ObjectId) -> VaultResult<()> {
         self.origin.delete(id).await?;
-        self.objects.lock().await.remove(id);
+        let mut cache = self.objects.lock().await;
+        cache.retain(|cached, _| !Self::is_same_or_descendant(cached, id));
         Ok(())
     }
-    /// Recursively syncs `id`'s subtree from `remote` into this vault's origin.
-    /// For each of `remote`'s children under `id`: fetches this vault's copy (if any) and
-    /// compares metadata via `Object::changed`; a missing local copy or diverging metadata
-    /// triggers a `put` (and, for `Leaf`s, a `fetch`+`send` of the payload). `Branch`/`Root`
-    /// children are then recursed into regardless of whether they themselves changed, so their
-    /// descendants are still visited. Errors from `remote`/`self` other than `NotFound`
-    /// short-circuit the whole walk.
+    /// Recursively syncs `id`'s subtree from `remote` into this vault's origin, and reports
+    /// what it did.
+    ///
+    /// Each of `remote`'s children under `id` is compared with this vault's copy via
+    /// [`Object::compare`]:
+    /// - a missing or older local file is copied (`put`, then `fetch` + `send`). The copy keeps
+    ///   the remote's modification time, so pulling again finds nothing to do;
+    /// - a local file that is **newer** than the remote one is left alone and listed in
+    ///   [`SyncReport::conflicts`] (see [`Self::pull_with`] to override);
+    /// - a file on one side and a directory on the other is always a conflict;
+    /// - a missing directory is created, and directories are recursed into.
+    ///
+    /// Names coming from `remote` are validated, so a hostile listing can't write outside the
+    /// vault. Errors other than `NotFound` short-circuit the whole walk.
     ///
     /// # Examples
     ///
@@ -357,33 +435,26 @@ impl Vault {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn pull(&self, id: &ObjectId, remote: &dyn Origin) -> VaultResult<()> {
-        let remote_children = remote.list(id).await?;
-        for mut remote_obj in remote_children {
-            let remote_id = remote_obj.get_id();
-            let needs_sync = match self.get(remote_id.clone()).await {
-                Ok(local_obj) => local_obj.changed(&remote_obj),
-                Err(VaultError::NotFound(_)) => true,
-                Err(e) => return Err(e),
-            };
-
-            if needs_sync {
-                let stored = self.put(&mut remote_obj, id).await?;
-                if let Object::Leaf { .. } = stored {
-                    let bytes = remote.fetch(&remote_id).await?;
-                    self.send(&stored, bytes).await?;
-                }
-            }
-            if matches!(remote_obj, Object::Branch { .. } | Object::Root { .. }) {
-                Box::pin(self.pull(&remote_id, remote)).await?;
-            }
-        }
-        Ok(())
+    pub async fn pull(&self, id: &ObjectId, remote: &dyn Origin) -> VaultResult<SyncReport> {
+        self.pull_with(id, remote, SyncOptions::default()).await
     }
-    /// The mirror image of `pull`: recursively syncs `id`'s subtree from this vault's origin
-    /// out to `remote`, walking children via `self.list` instead of `remote.list` and writing
-    /// through `remote.put`/`remote.send` instead of `self.put`/`self.send`. Same change
-    /// detection and recursion rules as `pull` apply.
+    /// [`Self::pull`] with explicit [`SyncOptions`] — e.g. `force` to overwrite local files
+    /// that are newer than the remote's.
+    pub async fn pull_with(
+        &self,
+        id: &ObjectId,
+        remote: &dyn Origin,
+        options: SyncOptions,
+    ) -> VaultResult<SyncReport> {
+        let mut report = SyncReport::default();
+        let result = sync_tree(remote, self.origin.as_ref(), id, options, &mut report).await;
+        // Writes went straight to the origin; nothing cached about this vault can be trusted.
+        self.objects.lock().await.clear();
+        result.map(|()| report)
+    }
+    /// The mirror image of [`Self::pull`]: recursively syncs `id`'s subtree from this vault's
+    /// origin out to `remote`. Same comparison, conflict and recursion rules: a file that is
+    /// newer on `remote` is reported, not overwritten (see [`Self::push_with`]).
     ///
     /// # Examples
     ///
@@ -396,33 +467,196 @@ impl Vault {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn push(&self, id: &ObjectId, remote: &dyn Origin) -> VaultResult<()> {
-        let local_children = self.list(id.clone()).await?;
+    pub async fn push(&self, id: &ObjectId, remote: &dyn Origin) -> VaultResult<SyncReport> {
+        self.push_with(id, remote, SyncOptions::default()).await
+    }
+    /// [`Self::push`] with explicit [`SyncOptions`] — e.g. `force` to overwrite remote files
+    /// that are newer than this vault's.
+    pub async fn push_with(
+        &self,
+        id: &ObjectId,
+        remote: &dyn Origin,
+        options: SyncOptions,
+    ) -> VaultResult<SyncReport> {
+        let mut report = SyncReport::default();
+        sync_tree(self.origin.as_ref(), remote, id, options, &mut report).await?;
+        Ok(report)
+    }
+}
 
-        for mut local_obj in local_children {
-            let local_id = local_obj.get_id();
+/// Options for [`Vault::pull_with`] / [`Vault::push_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncOptions {
+    /// Overwrite destination files that are newer than the source instead of reporting them as
+    /// conflicts. A file/directory mismatch is still never overwritten.
+    pub force: bool,
+}
 
-            let needs_sync = match remote.get(&local_id).await {
-                Ok(remote_obj) => local_obj.changed(&remote_obj),
-                Err(VaultError::NotFound(_)) => true,
-                Err(e) => return Err(e),
-            };
+/// One object a sync left alone because copying it could lose data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflict {
+    /// The object's id (the same on both sides).
+    pub id: ObjectId,
+    /// Why it was skipped, e.g. `"newer at the destination"`.
+    pub reason: String,
+    /// Whether [`SyncOptions::force`] would have copied it anyway. Only a destination that is
+    /// newer can be forced; a file/directory mismatch or an entry that leaves the vault never is.
+    pub can_force: bool,
+}
 
-            if needs_sync {
-                let stored = remote.put(&mut local_obj, id).await?;
-                if let Object::Leaf { .. } = stored {
-                    let bytes = self.fetch(local_id.clone()).await?;
-                    remote.send(&stored, bytes).await?;
-                }
-            }
+/// What a [`Vault::pull`] / [`Vault::push`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Files copied to the destination, and directories created there.
+    pub copied: Vec<ObjectId>,
+    /// Files that were already identical, so nothing was transferred.
+    pub unchanged: usize,
+    /// Objects skipped to avoid losing data at the destination.
+    pub conflicts: Vec<SyncConflict>,
+}
 
-            if matches!(local_obj, Object::Branch { .. } | Object::Root { .. }) {
-                Box::pin(self.push(&local_id, remote)).await?;
-            }
+impl SyncReport {
+    /// Whether rerunning with [`SyncOptions::force`] would copy any of the conflicts.
+    pub fn has_forceable_conflicts(&self) -> bool {
+        self.conflicts.iter().any(|c| c.can_force)
+    }
+}
+
+impl std::fmt::Display for SyncReport {
+    /// A one-line summary, followed by one line per conflict:
+    /// `copied 2, unchanged 5, 1 conflict` / `  notes.txt: newer at the destination`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.conflicts.len();
+        write!(
+            f,
+            "copied {}, unchanged {}, {n} conflict{}",
+            self.copied.len(),
+            self.unchanged,
+            if n == 1 { "" } else { "s" }
+        )?;
+        for conflict in &self.conflicts {
+            write!(f, "\n  {}: {}", conflict.id, conflict.reason)?;
         }
-
         Ok(())
     }
+}
+
+/// The walk behind both `pull` and `push`: copies `id`'s subtree from `src` to `dst`,
+/// following [`Object::compare`], and records everything in `report`.
+async fn sync_tree(
+    src: &dyn Origin,
+    dst: &dyn Origin,
+    id: &ObjectId,
+    options: SyncOptions,
+    report: &mut SyncReport,
+) -> VaultResult<()> {
+    let children = src.list(id).await?;
+    sync_children(src, dst, id, children, options, report).await
+}
+
+/// Syncs each of `children` (already listed from `src` under `parent`). An entry that resolves
+/// outside its vault on either side, such as a symlink in `$HOME` pointing elsewhere, comes
+/// back as `VaultError::InvalidId`. That entry is skipped and reported as a conflict, and the
+/// rest of the walk carries on. Any other error still ends the sync.
+async fn sync_children(
+    src: &dyn Origin,
+    dst: &dyn Origin,
+    parent: &ObjectId,
+    children: Vec<Object>,
+    options: SyncOptions,
+    report: &mut SyncReport,
+) -> VaultResult<()> {
+    for mut src_obj in children {
+        let src_id = src_obj.get_id();
+        // Also enforced by every origin's `put`; checked here so the error names the culprit
+        // before anything is written.
+        crate::object::validate_name(&src_obj.get_name())?;
+        match sync_entry(src, dst, parent, &mut src_obj, options, report).await {
+            Ok(()) => {}
+            Err(VaultError::InvalidId(_)) => report.conflicts.push(SyncConflict {
+                id: src_id,
+                reason: "leaves the vault (a symlink pointing outside it); skipped".to_string(),
+                can_force: false,
+            }),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Syncs one source entry into `parent` on `dst`. Everything that can be refused (listing a
+/// directory, opening a file) happens *before* anything is created on the destination, so a
+/// skipped entry leaves nothing behind there.
+async fn sync_entry(
+    src: &dyn Origin,
+    dst: &dyn Origin,
+    parent: &ObjectId,
+    src_obj: &mut Object,
+    options: SyncOptions,
+    report: &mut SyncReport,
+) -> VaultResult<()> {
+    let src_id = src_obj.get_id();
+    let dst_obj = match dst.get(&src_id).await {
+        Ok(object) => Some(object),
+        Err(VaultError::NotFound(_)) => None,
+        Err(e) => return Err(e),
+    };
+    let is_dir = matches!(src_obj, Object::Branch { .. } | Object::Root { .. });
+    let decision = match &dst_obj {
+        None => SyncDecision::Unknown,
+        Some(existing) => src_obj.compare(existing),
+    };
+    let conflict = |reason: &str, can_force: bool| SyncConflict {
+        id: src_id.clone(),
+        reason: reason.to_string(),
+        can_force,
+    };
+
+    match decision {
+        SyncDecision::KindMismatch => {
+            report.conflicts.push(conflict(
+                if is_dir {
+                    "a directory here, a file at the destination"
+                } else {
+                    "a file here, a directory at the destination"
+                },
+                false,
+            ));
+            return Ok(());
+        }
+        SyncDecision::DestNewer if !options.force => {
+            report
+                .conflicts
+                .push(conflict("newer at the destination", true));
+            return Ok(());
+        }
+        SyncDecision::Same if !is_dir => {
+            report.unchanged += 1;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    if is_dir {
+        let children = src.list(&src_id).await?;
+        if dst_obj.is_none() {
+            dst.put(src_obj, parent).await?;
+            report.copied.push(src_id.clone());
+        }
+        return Box::pin(sync_children(src, dst, &src_id, children, options, report)).await;
+    }
+
+    let payload = src.fetch(&src_id).await?;
+    let source_meta = src_obj.get_meta();
+    let mut stored = dst.put(src_obj, parent).await?;
+    // Write with the *source's* metadata: the destination then takes the source's
+    // modification time, and the next sync sees the two as identical.
+    if let Some(meta) = source_meta {
+        stored.set_meta(meta);
+    }
+    dst.send(&stored, payload).await?;
+    report.copied.push(stored.get_id());
+    Ok(())
 }
 
 #[cfg(test)]

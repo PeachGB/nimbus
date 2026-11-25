@@ -192,12 +192,21 @@ same stdin and the terminal appears to hang.
 
 Write-back compares content rather than uploading unconditionally, because a plain "look at this
 file" would otherwise rewrite it with a new modification time — enough to make the next
-`push`/`pull` think it diverged. Three honest outcomes:
+`push`/`pull` think it diverged. The object's metadata is captured when it's opened, and the save
+is refused if it changed in the vault meanwhile (another device, a sync, another editor): writing
+anyway would silently discard that change. The outcomes:
 
 - `saved X` — the bytes changed and were written back.
+- `X changed in the vault while you were editing — not saved; your version is at <path>` — nothing
+  was overwritten, and your edited copy is kept at that path (it survives exiting the TUI).
 - `closed X — unchanged` — the editor exited and nothing changed.
 - `opened X — edits made after this won't be saved back` — the OS opener handed off to a GUI app
   and returned immediately, so there is genuinely nothing left to capture.
+
+Temp copies live in a private (`0700`) directory created with `tempfile`, not a predictable
+`/tmp/nimbus-tui-<pid>`, so other users can't read them or plant a symlink there. Each copy is
+deleted once its edit is saved or abandoned, and the whole directory goes when the TUI exits.
+A copy handed to a GUI opener is kept until then, since the app may still be reading it.
 
 How the editor exited is a **note, not a failure** — `saved X (editor exited with exit status: 1)`.
 Editors exit non-zero for reasons that say nothing about whether the file was written (vim's

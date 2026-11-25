@@ -16,7 +16,7 @@ It's usable on its own: nothing here depends on the frontends, and a `Vault` can
 - **`config.rs`** — `VaultConfig`: the on-disk shape of a vault (`name`, an optional `root_id` defaulting to `"/"`, plus an `origin_config`), and `OriginConfig`, a tagged enum (`type = "fs" | "command" | "http" | "vault"`) describing how to build the origin declaratively — the `http` variant also carries an optional `auth` table (`HttpAuth`), which is why it's the variant's last field: it's the only one that serializes as a TOML table, and a table has to come after every plain value in the same struct or `VaultConfig::save` fails on a config it just built. `VaultConfig::build(path)` reads and parses the TOML file and returns the vault's name, root id, and the matching `Box<dyn Origin>`. `OriginConfig::from_file(path)` builds just the `Box<dyn Origin>` from a TOML file containing only the `origin_config` shape (no `name`/`root_id`), for callers that want to talk to an origin directly without opening a `Vault` — see [Building an origin without a vault](#building-an-origin-without-a-vault). `OriginConfig::build(self)` takes `self` by value rather than `&self`, so it moves each variant's fields straight into the `Origin` it constructs instead of cloning them. `VaultConfig::save(path)` writes the config out, creating the parent directory if needed; `VaultConfig::default_dir()`/`default_path(name)` give the conventional location for a new vault's config (see [Where configs live](#where-configs-live)).
 - **`object.rs`** — `Object` (`Leaf` / `Branch` / `Root` variants), `ObjectId` (newtype around `String`, defaults to `ROOT_ID` (`"/"`), with `is_root()`), `Metadata` (size, content type, modified time, free-form `extra` map, plus `hash_value()` for a stable content hash). `Object::push` appends a child id onto a `Branch`/`Root`; `Object::with_id` overwrites an object's id in place (used by origins that rename an object on `put`, e.g. `OriginFileSystem`); `Object::with_name` does the same for the name, which is what turns a copy into a rename — `Origin::put` writes an object under its own `get_name()`, so setting the name before `put` is the only rename primitive there is (both are no-ops for `Root`). `Object::get_name()` returns `ROOT_NAME` (`"##ROOT##"`) for `Root`, which has no real name. `Object::changed(remote)` compares `hash_value()` on both sides' metadata to detect drift between a local and remote copy of the same object, returning `false` if either side has no metadata (e.g. `Root`).
 - **`origin/mod.rs`** — the `Origin` trait (`fetch`, `list`, `get`, `put`, `send`, `delete`, plus `Send + Sync`) that every backend implements.
-- **`origin/fs.rs`** — `OriginFileSystem`: origin backed by a directory on disk. `ObjectId`s are relative paths under `root`. `put` resolves the object's path as `{destination}/{name}`, renames the object in place (via `Object::with_id`) to that path, and creates the file/directory (truncating, for a `Leaf` — `put` creates, `send` fills in). `send` explicitly `flush`es before returning: `tokio::fs::File` buffers, and its `Drop` only starts a best-effort background flush, so without it the bytes weren't guaranteed on disk when `send` returned and a read straight afterwards could come back short or empty.
+- **`origin/fs.rs`** — `OriginFileSystem`: origin backed by a directory on disk. `ObjectId`s are relative paths under `root`. `put` resolves the object's path as `{destination}/{name}`, renames the object in place (via `Object::with_id`) to that path, and creates the file/directory (`put` creates, `send` fills in). Names are validated and every id is resolved inside `root`, symlinks included (see [Symlinks](#symlinks-in-fs-vaults)). `put` creates a missing file but **never truncates** an existing one. `send` replaces contents **atomically**: it writes a hidden sibling temp file (`.nimbus-tmp.*`, which `list` hides), fsyncs it, gives it the object's `modified` time if there is one, renames it over the destination, and fsyncs the directory. Readers see the old contents or the complete new ones, never a mix, and a failed or interrupted transfer leaves the destination untouched. `fsutil::atomic_write` is the same pattern for small files: configs and the session state.
 - **`origin/command.rs`** — `OriginCommand`: origin backed by shell commands, one per operation (`fetch_cmd`, `list_cmd`, `get_cmd`, `put_cmd`, `send_cmd`, `delete_cmd`). Every command runs under `sh -c` and is `{placeholder}`-templated with the object id, name, metadata and kind, plus arbitrary `extra_vars` (guarded by an internal `futures::lock::Mutex`, since `put` needs to set a `destination` var without requiring `&mut self`); `list`/`get` expect the command's stdout to be JSON matching `Object`. `put` runs `put_cmd`, then re-`get`s `"{destination}/{name}"` to return the stored `Object` — it does **not** rename the input object in place, unlike `OriginFileSystem`. See [Command templating](#command-templating) for which placeholders reach which template.
 - **`origin/http.rs`** — `OriginHTTP`: origin backed by a REST-ish HTTP API. `base_url` plus a `{id}`-templated path per operation (`fetch_url`, `list_url`, `get_url`, `put_url`, `send_url`, `delete_url`). Every URL is `base_url` (trailing `/` trimmed) followed by that operation's template with `{id}` substituted. `get`/`list` are `GET`s deserialized as JSON; `fetch` streams the response body; `put` `PUT`s the `Object` as JSON to `put_url` — with `{id}` filled in from the **destination**, not the object — then re-`get`s `"{destination}/{name}"` to return the stored `Object` (again, without mutating the input); `send` `PUT`s the payload stream as the request body of `send_url` (templated with the object's own id); `delete` is a `DELETE`. Any non-2xx response becomes a `VaultError`, with 404 mapped to `NotFound` and 401/403 to an error naming `[origin_config.auth]`, since that's where the cause is. Credentials come from `HttpAuth` (`with_auth`, or an `[auth]` table inside `[origin_config]`) and are attached in the one place every request passes through, so an operation added later can't forget to authenticate — see [Authenticating an HTTP origin](#authenticating-an-http-origin).
 - **`origin/vault.rs`** — `OriginVault`: origin backed by another `Vault` (held as `Arc<Vault>`). Every trait method just forwards to the wrapped vault's method of the same name — see [Using a vault as an origin](#using-a-vault-as-an-origin).
@@ -59,13 +59,34 @@ vault.pull(&root_id, remote.as_ref()).await?;
 vault.push(&root_id, remote.as_ref()).await?;
 ```
 
-Both walk one `list` level at a time (`remote.list`/`self.list`, respectively) and, for every child:
+Both run the same walk (`sync_tree`) with the roles swapped: `pull` reads from `remote` and writes to `self`, `push` the other way round. For every child of the source, one `list` level at a time:
 
-1. Look up the corresponding object on the other side (`self.get`/`remote.get`). A `NotFound` means the object doesn't exist there yet; any other error aborts the whole sync.
-2. If the object is missing, or present but `Object::changed` reports the metadata hashes diverge, `put` the object on the destination and — for `Leaf`s only — `fetch` the payload from the source and `send` it to **the `Object` `put` returned** (not the pre-`put` local variable — see [The `put` contract](#the-put-contract)).
-3. If the child is a `Branch`/`Root`, recurse into it regardless of whether it itself needed syncing, so descendants are still visited.
+1. Validate its name (`object::validate_name`), so a hostile listing can't write outside the destination.
+2. Look up the same id on the destination, **uncached**. `NotFound` means it doesn't exist there yet. Any other error aborts the sync.
+3. Decide with `Object::compare(source, destination)`:
+   - **missing** or `SourceNewer`/`Unknown`: copy. `put`, then `fetch` from the source and `send` to **the `Object` `put` returned** (see [The `put` contract](#the-put-contract)), carrying the **source's metadata** so the copy keeps its modification time;
+   - `Same`: skip, counted as unchanged;
+   - `DestNewer`: skip and record a conflict, because the destination was edited after the source. `SyncOptions { force: true }` (`pull_with`/`push_with`) overwrites instead;
+   - `KindMismatch` (a file on one side, a directory on the other): always a conflict, even when forced.
+4. Directories are created if missing and recursed into.
 
-`pull` and `push` are mirror images of each other (`pull` reads from `remote`/writes to `self`; `push` reads from `self`/writes to `remote`), so the same object is never treated as changed just because a `Root`/`Branch` container's own (nonexistent) metadata differs — see `Object::changed`.
+Both return a `SyncReport { copied, unchanged, conflicts }` (its `Display` is the one-line summary the CLI prints). Because copies keep the source's modification time (`OriginFileSystem::send` applies it; `OriginHTTP` passes it as the `x-nimbus-modified` header, which `nimbus-daemon` honours), running the same `push` or `pull` twice transfers nothing the second time.
+
+`Object::changed` (any metadata difference, no direction) is still there for callers that want it, but sync no longer uses it.
+
+## Moving and renaming
+
+`Origin::rename(id, new_parent, new_name)` moves an object in one step. The default implementation returns `VaultError::Unsupported`. `OriginFileSystem` implements it as a single `rename(2)`, which is atomic and instant for a tree of any size. `OriginVault` delegates. `OriginHTTP` and `OriginCommand` support it only when configured with an optional `rename_url` (`POST`, body `{"destination", "name"}`, served by `nimbus-daemon` at `/rename/{id}`; a `501` answer means unsupported) or `rename_cmd` (`{id}`, `{destination}`, `{name}`). Callers (`nimbus-core`'s `mv`/`rename`) try it first and fall back to copy-then-delete only on `Unsupported`. That fallback deletes its partial copy if it fails partway.
+
+An implementation must never replace a directory, or replace anything with a directory. Replacing a file with a file is allowed, and callers decide whether they want that.
+
+## Symlinks in `fs` vaults
+
+`OriginFileSystem` resolves symlinks before acting and refuses (`VaultError::InvalidId`) any operation whose real path leaves the root. Reading, listing or creating *through* a link (`docs -> /etc`, then `docs/passwd`) is refused. A dangling link is never written through. Links themselves still show up in listings and can be described, deleted (the link, never its target) or renamed. Links that point elsewhere inside the vault work as before.
+
+## HTTP timeouts
+
+`OriginHTTP` gives up connecting after 10 s, and fails a request that receives nothing for 60 s. The second is an idle timeout, not a total one, so a large transfer that keeps moving is never cut off.
 
 ## Command templating
 
@@ -91,6 +112,46 @@ string. `send_cmd` templates are better written against `{id}`, which is always 
 
 The object's own `meta.extra` is applied before the configured `extras`, so a per-object value
 beats a config default.
+
+### Values are shell-quoted
+
+Every substituted value is inserted as **one literal shell word**. Values made only of
+`[A-Za-z0-9_@%+:,./-]` go in as they are; anything else is wrapped in single quotes (an empty value
+becomes `''`). Ids and names come from the other side of a transfer, and before this a file
+named `x'; touch INJECTED; echo '` ran `touch INJECTED`.
+
+Adjacent quoted pieces join into one word, so placeholders still compose inside paths:
+
+```toml
+fetch_cmd = "cat {root}/data/{id}"   # root = "/my data", id = "a b.txt"
+                                     # → cat '/my data'/data/'a b.txt'
+```
+
+**Don't put quotes around a placeholder in the template.** `"{name}"` would pass the quote
+characters through literally (`"'a b'"`). Write `{name}` on its own. A placeholder inside a
+single-quoted string, as in `echo '{"id":"{id}"}'`, works only for plain values like
+`file.txt`. For anything else, build the string in a script that takes the value as an argument.
+
+Breaking change in 0.3.0: templates that wrapped placeholders in quotes need those quotes removed.
+
+### `fetch_cmd` failures
+
+`fetch` checks `fetch_cmd`'s exit status once its output ends. If the command exits non-zero, the
+stream ends with an error carrying its stderr, so a half-finished fetch is never taken for the
+whole object. (Destinations written through `OriginFileSystem::send` then discard the partial
+data and keep their old contents.)
+
+## Object names and ids
+
+Every origin's `put` calls `object::validate_name` on the object's name. A name must be exactly
+one path component: not empty, not `.` or `..`, and free of `/`, `\` and NUL. Otherwise `put`
+fails with `VaultError::InvalidName`. `OriginFileSystem` also refuses any id that resolves outside
+its root (`..` segments, absolute paths, NUL) with `VaultError::InvalidId`. Without these checks a
+remote listing an object named `../../.bashrc` could make `pull` write outside the vault.
+
+`OriginHTTP` percent-encodes ids in URLs (`a#b` → `a%23b`), so `#`, `?`, `%` and spaces reach the
+server intact. Servers must percent-decode the path, as `nimbus-daemon` and the test `server.py`
+do.
 
 ## Where configs live
 
@@ -196,7 +257,7 @@ These are `pub`, so external code (e.g. a custom `Origin`) can reuse the same ke
 
 ## Status
 
-135 unit tests (plus 40 doctests) covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths, plus authentication: every operation carrying the header — one mock per operation, so one that forgot would fail rather than pass unnoticed — no header at all when no credentials are configured, the 401 message, and each way a token can be resolved or refused), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
+192 unit tests (plus 45 doctests) covering `object` (including `ObjectId::default`/`is_root` and `Object::changed`), `error`, `config` (`VaultConfig::build` against real temp TOML files, one per origin variant including nested `vault`, plus `root_id` default/override and inner-vault error propagation; `OriginConfig::from_file` building each origin variant standalone, without a vault), `vault` (via mock `Origin`s, `Vault::new` against a real config file, `find` path resolution, cache behavior for `get`/`list`/`delete`, `pull`/`push` against an in-memory tree `Origin` — copying missing/changed objects, skipping unchanged ones, recursing into branches, and propagating unexpected errors — an end-to-end `push` between two real fs-backed vaults via `OriginVault`, and the `put`-contract regression tests described above), `origin::fs` (against real tempdirs), `origin::command` (against real shell commands like `echo`/`true`/`false`, including a `tokio::time::timeout`-guarded regression test for the `extra_vars` mutex deadlock described below), `origin::http` (against a mock server via `httpmock`, including `put`'s follow-up `get` and its failure/`NotFound` paths, plus authentication: every operation carrying the header — one mock per operation, so one that forgot would fail rather than pass unnoticed — no header at all when no credentials are configured, the 401 message, and each way a token can be resolved or refused), and `origin::vault` (`OriginVault` delegating `get`/`list`/`fetch`/`put`/`send`/`delete` to a real `Vault` backed by `OriginFileSystem`, including `NotFound` propagation).
 
 Regression tests worth knowing about, all in `origin::command`: configured `extras` reaching `put_cmd`/`send_cmd`, `{kind}` distinguishing a leaf from a branch, per-object `meta.extra` beating a config default, and `{destination}` being refreshed rather than cached across two `put`s to different parents.
 

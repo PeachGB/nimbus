@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::{
     VaultResult,
     error::VaultError,
-    object::{Object, ObjectId},
+    object::{Object, ObjectId, validate_name},
     origin::{ByteStream, Origin},
 };
 
@@ -124,6 +124,52 @@ fn resolve_secret(
     Ok(secret)
 }
 
+/// How long to wait for a connection to the server before giving up.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a request may go without receiving *any* bytes. An idle timeout, not a total one,
+/// so a large transfer that keeps moving is never cut off. A stalled server, though, no longer
+/// hangs the CLI/TUI forever.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn http_client() -> reqwest::Client {
+    http_client_with(CONNECT_TIMEOUT, READ_TIMEOUT)
+}
+
+fn http_client_with(connect: std::time::Duration, read: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+        // Only fails if the TLS backend can't initialise, which `Client::new()` would hit too.
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Everything that can't appear raw inside one URL path segment. `/` is deliberately absent:
+/// it separates the id's own segments, which the server splits on.
+const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Percent-encodes `id` for use in a URL path. Without this a name like `a#b` was cut at the
+/// `#` (the rest becomes a fragment the server never sees), so a `send` meant for `a#b`
+/// overwrote the unrelated object `a`. `?` and `%` broke the same way.
+fn encode_id(id: &ObjectId) -> String {
+    percent_encoding::utf8_percent_encode(id.as_str(), PATH_SEGMENT).to_string()
+}
+
 /// An [`crate::origin::Origin`] backed by a REST-ish HTTP API. Each operation is a
 /// `{id}`-templated path appended to `base_url`; `get`/`list` are `GET`s deserialized as
 /// JSON, `fetch` streams the response body, `put` `PUT`s the `Object` as a JSON body, `send`
@@ -194,6 +240,8 @@ pub struct OriginHTTP {
     put_url: String,
     send_url: String,
     delete_url: String,
+    /// Optional `{id}`-templated path for a native move; see [`OriginHTTP::with_rename_url`].
+    rename_url: Option<String>,
 
     /// Sent on every request; `None` when the origin has no credentials configured.
     auth: Option<reqwest::header::HeaderValue>,
@@ -220,9 +268,31 @@ impl OriginHTTP {
             put_url,
             send_url,
             delete_url,
+            rename_url: None,
             auth: None,
-            client: reqwest::Client::new(),
+            client: http_client(),
         }
+    }
+
+    /// Replaces the default timeouts: `connect` (10 s) to establish a connection, and `read`
+    /// (60 s), how long a request may go without receiving any bytes. `read` is an idle
+    /// timeout, so a transfer that keeps moving is never cut off.
+    pub fn with_timeouts(
+        mut self,
+        connect: std::time::Duration,
+        read: std::time::Duration,
+    ) -> Self {
+        self.client = http_client_with(connect, read);
+        self
+    }
+
+    /// Enables [`Origin::rename`]: `POST <rename_url>` with a JSON body
+    /// `{"destination": <parent id>, "name": <new name>}`, answered with the moved `Object`.
+    /// `nimbus-daemon` serves this at `/rename/{id}`. Without it, or when the server answers
+    /// `501 Not Implemented`, moves fall back to copy-then-delete.
+    pub fn with_rename_url(mut self, rename_url: Option<String>) -> Self {
+        self.rename_url = rename_url;
+        self
     }
 
     /// Presents `auth` on every request this origin makes.
@@ -275,7 +345,7 @@ impl OriginHTTP {
         format!(
             "{}{}",
             self.base_url.trim_end_matches('/'),
-            template.replace(&format!("{{{}}}", crate::PLACEHOLDER_ID), id.as_str())
+            template.replace(&format!("{{{}}}", crate::PLACEHOLDER_ID), &encode_id(id))
         )
     }
 
@@ -297,6 +367,9 @@ impl OriginHTTP {
         match response.status() {
             s if s.is_success() => Ok(response),
             reqwest::StatusCode::NOT_FOUND => Err(VaultError::NotFound(url.to_string())),
+            reqwest::StatusCode::NOT_IMPLEMENTED => Err(VaultError::Unsupported(format!(
+                "the server at {url} doesn't support this operation"
+            ))),
             // The one status whose cause is in the config rather than at the other end: say so
             // instead of leaving a bare "401" for the user to interpret.
             s @ (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
@@ -339,18 +412,50 @@ impl Origin for OriginHTTP {
     }
 
     async fn put(&self, object: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
+        validate_name(&object.get_name())?;
         let url = self.url(&self.put_url, destination);
         self.execute(self.client.put(&url).json(object), &url)
             .await?;
-        let new_id = ObjectId::from(format!("{}/{}", destination.as_str(), object.get_name()));
+        let new_id = ObjectId::from(format!(
+            "{}/{}",
+            destination.as_str().trim_end_matches('/'),
+            object.get_name()
+        ));
         self.get(&new_id).await
     }
 
     async fn send(&self, object: &Object, payload: ByteStream) -> VaultResult<()> {
         let url = self.url(&self.send_url, &object.get_id());
         let body = reqwest::Body::wrap_stream(payload);
-        self.execute(self.client.put(&url).body(body), &url).await?;
+        let mut request = self.client.put(&url).body(body);
+        if let Some(modified) = object.get_meta().and_then(|meta| meta.modified) {
+            request = request.header(
+                crate::MODIFIED_HEADER,
+                modified.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            );
+        }
+        self.execute(request, &url).await?;
         Ok(())
+    }
+
+    async fn rename(
+        &self,
+        id: &ObjectId,
+        new_parent: &ObjectId,
+        new_name: &str,
+    ) -> VaultResult<Object> {
+        let Some(template) = &self.rename_url else {
+            return Err(VaultError::Unsupported(
+                "rename (no rename_url configured)".into(),
+            ));
+        };
+        validate_name(new_name)?;
+        let url = self.url(template, id);
+        let body = serde_json::json!({ "destination": new_parent.as_str(), "name": new_name });
+        let response = self
+            .execute(self.client.post(&url).json(&body), &url)
+            .await?;
+        Ok(response.json().await?)
     }
 
     async fn delete(&self, id: &ObjectId) -> VaultResult<()> {

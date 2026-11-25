@@ -337,6 +337,7 @@ fn a_saved_http_config_with_auth_can_be_read_back() {
             put_url: "/put/{id}".to_string(),
             send_url: "/send/{id}".to_string(),
             delete_url: "/delete/{id}".to_string(),
+            rename_url: None,
             auth: crate::origin::http::HttpAuth::Bearer {
                 token: None,
                 token_env: Some("NIMBUS_TEST_ROUNDTRIP_TOKEN".to_string()),
@@ -400,4 +401,77 @@ fn save_still_works_for_a_bare_relative_filename() {
     std::env::set_current_dir(previous).unwrap();
     result.unwrap();
     assert!(dir.path().join("bare.toml").is_file());
+}
+
+// --- regressions: atomic saves; literal tokens aren't world-readable ---
+
+#[cfg(unix)]
+#[test]
+fn save_makes_a_config_holding_a_literal_token_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mode_of =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let http = |auth| OriginConfig::Http {
+        base_url: Some("https://example.com".to_string()),
+        list_url: "/list/{id}".to_string(),
+        fetch_url: "/fetch/{id}".to_string(),
+        get_url: "/get/{id}".to_string(),
+        put_url: "/put/{id}".to_string(),
+        send_url: "/send/{id}".to_string(),
+        delete_url: "/delete/{id}".to_string(),
+        rename_url: None,
+        auth,
+    };
+
+    let secret = dir.path().join("secret.toml");
+    VaultConfig::new(
+        "s".to_string(),
+        ObjectId::default(),
+        http(crate::origin::http::HttpAuth::Bearer {
+            token: Some("hunter2".to_string()),
+            token_env: None,
+            token_file: None,
+        }),
+    )
+    .save(&secret)
+    .unwrap();
+    assert_eq!(mode_of(&secret), 0o600);
+
+    // A token taken from the environment isn't in the file, so nothing to hide.
+    let plain = dir.path().join("plain.toml");
+    VaultConfig::new(
+        "p".to_string(),
+        ObjectId::default(),
+        http(crate::origin::http::HttpAuth::Bearer {
+            token: None,
+            token_env: Some("TOKEN".to_string()),
+            token_file: None,
+        }),
+    )
+    .save(&plain)
+    .unwrap();
+    assert_ne!(mode_of(&plain), 0o600);
+}
+
+#[test]
+fn save_replaces_an_existing_config_without_leaving_temp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.toml");
+    std::fs::write(&path, "old contents that are much longer than the new ones").unwrap();
+    VaultConfig::new(
+        "v".to_string(),
+        ObjectId::default(),
+        OriginConfig::Fs {
+            root: "/srv".into(),
+        },
+    )
+    .save(&path)
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("name = \"v\"")
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }

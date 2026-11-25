@@ -1,4 +1,4 @@
-use futures::{StreamExt, lock::Mutex};
+use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::process::Output;
@@ -8,9 +8,63 @@ use tokio_util::io::ReaderStream;
 use crate::{
     VaultResult,
     error::VaultError,
-    object::{Metadata, Object, ObjectId},
+    object::{Metadata, Object, ObjectId, validate_name},
     origin::{ByteStream, Origin},
 };
+
+/// Makes `value` a single literal word for `sh`. Values made only of characters the shell treats
+/// as plain (`[A-Za-z0-9_@%+:,./-]`) are left as they are, so ordinary names and paths read the
+/// same in the expanded command. Anything else is wrapped in single quotes, with embedded `'`
+/// written as `'\''`.
+///
+/// Every placeholder goes through this. Names and ids come from the *other* side of a transfer,
+/// and pasting them raw into `sh -c` let a file named `x'; rm -rf ~; echo '` run commands.
+/// Because a quoted value is still one shell word, placeholders compose inside paths
+/// (`{root}/data/{id}`) but must not be wrapped in quotes in the template itself.
+fn sh_quote(value: &str) -> std::borrow::Cow<'_, str> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_@%+:,./-".contains(c);
+    if !value.is_empty() && value.chars().all(plain) {
+        std::borrow::Cow::Borrowed(value)
+    } else {
+        std::borrow::Cow::Owned(format!("'{}'", value.replace('\'', r"'\''")))
+    }
+}
+
+/// Expands every `{key}` in `template` that `vars` has, shell-quoting each value, in **one
+/// pass**: text that came from a value is never scanned again. Replacing one placeholder at a
+/// time did re-scan it, so a remote object named `{x}` whose metadata carried
+/// `x = "$(cmd)"` expanded to `''$(cmd)''`, which the quotes no longer protect, and ran
+/// `cmd`. Unknown `{keys}` are left as they are.
+fn render(template: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find(['}', '{']) {
+            Some(close) if after.as_bytes()[close] == b'}' => {
+                let key = &after[..close];
+                match vars.get(key) {
+                    Some(value) => out.push_str(&sh_quote(value)),
+                    None => {
+                        out.push('{');
+                        out.push_str(key);
+                        out.push('}');
+                    }
+                }
+                rest = &after[close + 1..];
+            }
+            // A `{` with no matching `}` before the next `{` is literal text (JSON in an
+            // `echo '...'` template, say).
+            _ => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// An [`crate::origin::Origin`] backed by a shell command per operation. Each command is a
 /// `{placeholder}`-templated string, substituted with the object id/name/metadata plus any
@@ -63,7 +117,9 @@ pub struct OriginCommand {
     put_cmd: String,
     send_cmd: String,
     delete_cmd: String,
-    extra_vars: Mutex<HashMap<String, String>>,
+    /// Optional native move; see [`OriginCommand::with_rename_cmd`].
+    rename_cmd: Option<String>,
+    extra_vars: HashMap<String, String>,
 }
 
 /// Identifies which of `OriginCommand`'s configured command templates to run.
@@ -124,19 +180,30 @@ impl OriginCommand {
             put_cmd,
             send_cmd,
             delete_cmd,
-            extra_vars: Mutex::new(extra_vars.unwrap_or_default()),
+            rename_cmd: None,
+            extra_vars: extra_vars.unwrap_or_default(),
         }
     }
+
+    /// Enables [`Origin::rename`] through `rename_cmd`, templated with `{id}` (what to move),
+    /// `{destination}` (the new parent's id), `{name}` (the new name) and the configured
+    /// extras. Without it, moves fall back to copy-then-delete. Make the command atomic if you
+    /// can, e.g. a single `mv`.
+    pub fn with_rename_cmd(mut self, rename_cmd: Option<String>) -> Self {
+        self.rename_cmd = rename_cmd;
+        self
+    }
+    #[cfg(test)]
     fn interpolate_one<I: AsRef<str>>(template: &mut String, key: &str, val: I) {
-        *template = template.replace(&format!("{{{key}}}"), val.as_ref());
+        let vars = HashMap::from([(key.to_string(), val.as_ref().to_string())]);
+        *template = render(template, &vars);
     }
+    #[cfg(test)]
     fn interpolate(template: &mut String, vars: &HashMap<String, String>) {
-        for (k, v) in vars {
-            *template = template.replace(&format!("{{{k}}}"), v);
-        }
+        *template = render(template, vars);
     }
     async fn bootstrap_cmd_id(&self, t: &CmdType, id: &ObjectId) -> String {
-        let mut cmd = match t {
+        let cmd = match t {
             CmdType::Fetch => self.fetch_cmd.clone(),
             CmdType::List => self.list_cmd.clone(),
             CmdType::Get => self.get_cmd.clone(),
@@ -144,11 +211,9 @@ impl OriginCommand {
             CmdType::Delete => self.delete_cmd.clone(),
             CmdType::Send => self.send_cmd.clone(),
         };
-        Self::interpolate_one(&mut cmd, crate::PLACEHOLDER_ID, id.as_str());
-        let vars = self.extra_vars.lock().await;
-        Self::interpolate(&mut cmd, &vars);
-
-        cmd
+        let mut vars = self.extra_vars.clone();
+        vars.insert(crate::PLACEHOLDER_ID.to_string(), id.to_string());
+        render(&cmd, &vars)
     }
     /// Builds a `put`/`send` command template, substituting the object's own fields plus the
     /// configured `extra_vars`.
@@ -157,6 +222,18 @@ impl OriginCommand {
     /// whose `put_cmd`/`send_cmd` reference a `{helper}` or `{root}` placeholder would run with
     /// the literal braces still in the string.
     async fn bootstrap_cmd_object(&self, t: &CmdType, object: &Object) -> VaultResult<String> {
+        self.bootstrap_cmd_object_with(t, object, &HashMap::new())
+            .await
+    }
+    /// [`Self::bootstrap_cmd_object`] plus `call_vars`: values that belong to this one call, such
+    /// as `put`'s `{destination}`. Passed in rather than stored on `self`, so concurrent calls
+    /// can't see each other's values.
+    async fn bootstrap_cmd_object_with(
+        &self,
+        t: &CmdType,
+        object: &Object,
+        call_vars: &HashMap<String, String>,
+    ) -> VaultResult<String> {
         let cmd = match t {
             CmdType::Put | CmdType::Send => {
                 let Some(Metadata {
@@ -184,24 +261,28 @@ impl OriginCommand {
                     Object::Leaf { .. } => crate::OBJECT_KIND_LEAF,
                 };
 
-                let mut command = match t {
-                    CmdType::Put => self.put_cmd.clone(),
-                    CmdType::Send => self.send_cmd.clone(),
+                let template = match t {
+                    CmdType::Put => &self.put_cmd,
+                    CmdType::Send => &self.send_cmd,
                     _ => unreachable!(),
                 };
-                let c = &mut command;
-                Self::interpolate_one(c, crate::PLACEHOLDER_ID, object.get_id());
-                Self::interpolate_one(c, crate::PLACEHOLDER_NAME, object.get_name());
-                Self::interpolate_one(c, crate::PLACEHOLDER_SIZE, size);
-                Self::interpolate_one(c, crate::PLACEHOLDER_CONTENT_TYPE, content_type);
-                Self::interpolate_one(c, crate::PLACEHOLDER_MODIFIED, modified);
-                Self::interpolate_one(c, crate::PLACEHOLDER_KIND, kind);
-                // The object's own extras first, so a per-object value beats the config default.
-                Self::interpolate(c, &extra);
-                let vars = self.extra_vars.lock().await;
-                Self::interpolate(c, &vars);
-
-                command
+                // Lowest precedence first: config extras, then the object's own extras (a
+                // per-object value beats the config default), then per-call values, then the
+                // built-in placeholders, which nothing can override.
+                let mut vars = self.extra_vars.clone();
+                vars.extend(extra);
+                vars.extend(call_vars.clone());
+                for (key, value) in [
+                    (crate::PLACEHOLDER_ID, object.get_id().to_string()),
+                    (crate::PLACEHOLDER_NAME, object.get_name()),
+                    (crate::PLACEHOLDER_SIZE, size),
+                    (crate::PLACEHOLDER_CONTENT_TYPE, content_type),
+                    (crate::PLACEHOLDER_MODIFIED, modified),
+                    (crate::PLACEHOLDER_KIND, kind.to_string()),
+                ] {
+                    vars.insert(key.to_string(), value);
+                }
+                render(template, &vars)
             }
             _ => return Err(VaultError::InvalidMethodCall),
         };
@@ -232,20 +313,56 @@ impl OriginCommand {
 #[async_trait::async_trait]
 impl Origin for OriginCommand {
     async fn fetch(&self, id: &ObjectId) -> VaultResult<ByteStream> {
+        use tokio::io::AsyncReadExt;
+
         let cmd = self.bootstrap_cmd_id(&CmdType::Fetch, id).await;
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // A consumer that stops reading early (or fails on a later chunk) drops the
+            // stream, and with it the child — don't leave it running or as a zombie.
+            .kill_on_drop(true)
             .spawn()?;
 
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| VaultError::Generic("failed to open stdout".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| VaultError::Generic("failed to open stderr".into()))?;
+        // Drained concurrently: a command that writes a lot to stderr would otherwise block on
+        // a full pipe and never finish its stdout.
+        let stderr = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        });
 
-        let stream = ReaderStream::new(stdout).map(|chunk| chunk.map_err(VaultError::from));
-        Ok(Box::pin(stream))
+        // The exit status only exists once stdout is exhausted, so it's checked as one last
+        // step of the stream. Without it a fetch_cmd that died half-way ended the stream
+        // "cleanly", and the partial output was sent on as the object's complete contents.
+        let id = id.to_string();
+        let status = futures::stream::once(async move {
+            let status = child.wait().await?;
+            if status.success() {
+                return Ok(None);
+            }
+            let stderr = stderr.await.unwrap_or_default();
+            Err(VaultError::Generic(format!(
+                "fetch_cmd failed for {id} ({status}): {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )))
+        })
+        .filter_map(
+            |outcome: VaultResult<Option<bytes::Bytes>>| async move { outcome.transpose() },
+        );
+
+        let body = ReaderStream::new(stdout).map(|chunk| chunk.map_err(VaultError::from));
+        Ok(Box::pin(body.chain(status)))
     }
     async fn list(&self, id: &ObjectId) -> VaultResult<Vec<Object>> {
         let objects: Vec<Object> = self.cmd_json(CmdType::List, id).await?;
@@ -256,17 +373,16 @@ impl Origin for OriginCommand {
         Ok(object)
     }
     async fn put(&self, obj: &mut Object, destination: &ObjectId) -> VaultResult<Object> {
-        {
-            // Overwritten every call, not inserted once: `extra_vars` outlives the operation, so
-            // keeping the first destination would silently send every later `put` to wherever the
-            // first one happened to go.
-            let mut vars = self.extra_vars.lock().await;
-            vars.insert(
-                crate::PLACEHOLDER_DESTINATION.into(),
-                destination.to_string(),
-            );
-        }
-        let cmd = self.bootstrap_cmd_object(&CmdType::Put, obj).await?;
+        validate_name(&obj.get_name())?;
+        // Per call, never stored on `self`: shared state let concurrent puts (the daemon serves
+        // requests in parallel) run with each other's destination.
+        let call_vars = HashMap::from([(
+            crate::PLACEHOLDER_DESTINATION.to_string(),
+            destination.to_string(),
+        )]);
+        let cmd = self
+            .bootstrap_cmd_object_with(&CmdType::Put, obj, &call_vars)
+            .await?;
         let output = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -281,7 +397,12 @@ impl Origin for OriginCommand {
                 stderr.trim()
             )));
         }
-        let new_id = ObjectId::from(format!("{}/{}", destination.as_str(), obj.get_name()));
+        // Trimmed like `OriginHTTP::put`: destination `/` plus `a.txt` is `/a.txt`, not `//a.txt`.
+        let new_id = ObjectId::from(format!(
+            "{}/{}",
+            destination.as_str().trim_end_matches('/'),
+            obj.get_name()
+        ));
         self.get(&new_id).await
     }
     async fn send(&self, object: &Object, mut payload: ByteStream) -> VaultResult<()> {
@@ -294,14 +415,26 @@ impl Origin for OriginCommand {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| VaultError::Generic("failed to open send_cmd stdin".into()))?;
 
-        while let Some(chunk) = payload.next().await {
-            stdin.write_all(&chunk?).await?;
+        let written = async {
+            while let Some(chunk) = payload.next().await {
+                stdin.write_all(&chunk?).await?;
+            }
+            Ok::<(), VaultError>(())
+        }
+        .await;
+        if let Err(e) = written {
+            // Kill *before* stdin closes. Closing it first would look like a normal end of
+            // input to the script, which would then commit the partial payload as the whole
+            // object.
+            let _ = child.kill().await;
+            return Err(e);
         }
         drop(stdin);
         let output = child.wait_with_output().await?;
@@ -318,6 +451,42 @@ impl Origin for OriginCommand {
     async fn delete(&self, id: &ObjectId) -> VaultResult<()> {
         let _output = self.cmd(CmdType::Delete, id).await?;
         Ok(())
+    }
+    async fn rename(
+        &self,
+        id: &ObjectId,
+        new_parent: &ObjectId,
+        new_name: &str,
+    ) -> VaultResult<Object> {
+        let Some(template) = &self.rename_cmd else {
+            return Err(VaultError::Unsupported(
+                "rename (no rename_cmd configured)".into(),
+            ));
+        };
+        validate_name(new_name)?;
+        let mut vars = self.extra_vars.clone();
+        vars.insert(crate::PLACEHOLDER_ID.to_string(), id.to_string());
+        vars.insert(
+            crate::PLACEHOLDER_DESTINATION.to_string(),
+            new_parent.to_string(),
+        );
+        vars.insert(crate::PLACEHOLDER_NAME.to_string(), new_name.to_string());
+        let cmd = render(template, &vars);
+
+        let output = Command::new("sh").arg("-c").arg(&cmd).output().await?;
+        if !output.status.success() {
+            return Err(VaultError::Generic(format!(
+                "rename_cmd failed for {}: {}",
+                id.as_str(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let new_id = ObjectId::from(format!(
+            "{}/{}",
+            new_parent.as_str().trim_end_matches('/'),
+            new_name
+        ));
+        self.get(&new_id).await
     }
 }
 

@@ -21,6 +21,7 @@ crossterm.workspace = true
 nimbus-core = { version = "0.2.1", path = "../core" }
 nimbus-creator = { version = "0.2.1", path = "../creator" }
 nimbus-vault = { version = "0.2.1", path = "../vault" }
+tempfile.workspace = true
 ratatui.workspace = true
 chrono.workspace = true
 tokio.workspace = true

@@ -87,6 +87,15 @@ impl Origin for OriginVault {
     async fn delete(&self, id: &ObjectId) -> VaultResult<()> {
         self.vault.delete(id).await
     }
+
+    async fn rename(
+        &self,
+        id: &ObjectId,
+        new_parent: &ObjectId,
+        new_name: &str,
+    ) -> VaultResult<Object> {
+        self.vault.rename(id, new_parent, new_name).await
+    }
 }
 
 #[cfg(test)]

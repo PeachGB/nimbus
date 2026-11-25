@@ -55,6 +55,21 @@ pub enum VaultError {
     /// The vault is unlocked when a locked state was expected.
     #[error("Vault is unlocked")]
     Unlocked,
+    /// An object name that can't be used as a single path component (see
+    /// [`crate::object::validate_name`]). Names come from the other side of a transfer, so this
+    /// is what stops a remote from naming its way out of the destination directory.
+    #[error(
+        "Invalid object name {0:?}: a name can't be empty, '.' or '..', or contain '/', '\\' or NUL"
+    )]
+    InvalidName(String),
+    /// An object id that resolves outside the vault it was given to — `..` segments, an
+    /// absolute path, a NUL byte, or a symlink pointing out of the root.
+    #[error("Invalid object id {0:?}: it escapes the vault")]
+    InvalidId(String),
+    /// The origin can't do this operation natively (e.g. [`crate::origin::Origin::rename`]).
+    /// Callers that have a fallback, like copy-then-delete for a move, should use it.
+    #[error("Unsupported by this origin: {0}")]
+    Unsupported(String),
     /// An origin-specific operation failed; the string carries the origin's own error detail.
     #[error("Origin Error: {0}")]
     OriginError(String),

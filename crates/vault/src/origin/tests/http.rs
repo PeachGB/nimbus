@@ -476,3 +476,199 @@ fn a_token_that_cannot_be_a_header_is_refused_when_the_origin_is_built() {
 
     assert!(result.is_err());
 }
+
+// --- regressions: ids are percent-encoded, names are checked ---
+
+#[test]
+fn url_percent_encodes_characters_that_would_change_the_url() {
+    let origin = OriginHTTP::new(
+        "http://x".to_string(),
+        "/fetch/{id}".to_string(),
+        "/list/{id}".to_string(),
+        "/get/{id}".to_string(),
+        "/put/{id}".to_string(),
+        "/send/{id}".to_string(),
+        "/delete/{id}".to_string(),
+    );
+    let url = |id: &str| origin.url(&origin.send_url, &ObjectId::from(id));
+    // `#` used to start a fragment, so the server saw `/send/a` and overwrote `a`.
+    assert_eq!(url("a#b"), "http://x/send/a%23b");
+    assert_eq!(url("a?b"), "http://x/send/a%3Fb");
+    assert_eq!(url("50%"), "http://x/send/50%25");
+    assert_eq!(url("sp ace"), "http://x/send/sp%20ace");
+    assert_eq!(url("ñ"), "http://x/send/%C3%B1");
+    // `/` still separates segments; plain ids are unchanged.
+    assert_eq!(url("docs/a#b.txt"), "http://x/send/docs/a%23b.txt");
+    assert_eq!(url("/docs/notes.txt"), "http://x/send//docs/notes.txt");
+}
+
+#[tokio::test]
+async fn put_into_root_slash_does_not_produce_a_double_slash_id() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::PUT).path("/put//");
+        then.status(200);
+    });
+    let get = server.mock(|when, then| {
+        when.method(Method::GET).path("/get//file.txt");
+        then.status(200).json_body(serde_json::json!({
+            "Leaf": {"name": "file.txt", "id": "/file.txt",
+                     "meta": {"size": null, "content_type": null, "modified": null, "extra": {}}}
+        }));
+    });
+    let origin = make_origin(&server);
+    let mut object = Object::Leaf {
+        name: "file.txt".to_string(),
+        id: ObjectId::from("file.txt"),
+        meta: Metadata::new(),
+    };
+
+    origin.put(&mut object, &ObjectId::from("/")).await.unwrap();
+    // `/` + `file.txt` → `/file.txt`, not `//file.txt` (which encodes to `/get///file.txt`).
+    get.assert();
+}
+
+#[tokio::test]
+async fn put_rejects_names_that_are_not_one_path_component() {
+    let server = MockServer::start();
+    let put = server.mock(|when, then| {
+        when.method(Method::PUT);
+        then.status(200);
+    });
+    let origin = make_origin(&server);
+    for name in ["../x", "a/b", ".."] {
+        let mut object = Object::Leaf {
+            name: name.to_string(),
+            id: ObjectId::from("x"),
+            meta: Metadata::new(),
+        };
+        let result = origin.put(&mut object, &ObjectId::from("")).await;
+        assert!(
+            matches!(result, Err(VaultError::InvalidName(_))),
+            "{name:?}"
+        );
+    }
+    // Rejected before anything was sent.
+    put.assert_hits(0);
+}
+
+#[tokio::test]
+async fn rename_without_a_rename_url_is_unsupported() {
+    let server = MockServer::start();
+    let origin = make_origin(&server);
+    let result = origin
+        .rename(&ObjectId::from("a"), &ObjectId::from(""), "b")
+        .await;
+    assert!(matches!(result, Err(VaultError::Unsupported(_))));
+}
+
+#[tokio::test]
+async fn a_501_answer_to_rename_is_unsupported_so_callers_fall_back() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::POST).path("/rename/a");
+        then.status(501);
+    });
+    let origin = make_origin(&server).with_rename_url(Some("/rename/{id}".to_string()));
+    let result = origin
+        .rename(&ObjectId::from("a"), &ObjectId::from(""), "b")
+        .await;
+    assert!(
+        matches!(result, Err(VaultError::Unsupported(_))),
+        "{result:?}"
+    );
+}
+
+// --- regressions: a stalled server fails the request instead of hanging forever ---
+
+/// A server that accepts connections and then never answers.
+async fn stalled_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket); // keep it open, read nothing, write nothing
+        }
+    });
+    format!("http://{address}")
+}
+
+fn origin_at(base: String) -> OriginHTTP {
+    OriginHTTP::new(
+        base,
+        "/fetch/{id}".to_string(),
+        "/list/{id}".to_string(),
+        "/get/{id}".to_string(),
+        "/put/{id}".to_string(),
+        "/send/{id}".to_string(),
+        "/delete/{id}".to_string(),
+    )
+}
+
+#[tokio::test]
+async fn a_request_to_a_stalled_server_times_out() {
+    let origin = origin_at(stalled_server().await).with_timeouts(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(300),
+    );
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        origin.list(&ObjectId::from("")),
+    )
+    .await
+    .expect("the request hung instead of timing out");
+    assert!(matches!(result, Err(VaultError::HTTP(_))), "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn the_read_timeout_is_idle_based_so_a_slow_but_moving_body_completes() {
+    // A body that trickles in for longer than the read timeout, but never pauses that long.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            socket.write_all(b"x").await.unwrap();
+        }
+    });
+    let origin = origin_at(format!("http://{address}")).with_timeouts(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(400),
+    );
+
+    let mut stream = origin.fetch(&ObjectId::from("big")).await.unwrap();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+    // ~1 s in total, well past the 400 ms read timeout.
+    assert_eq!(body, b"xxxxxxxxxx");
+}
+
+#[tokio::test]
+async fn an_unreachable_server_fails_fast() {
+    // Bind then drop, so nothing listens on that port.
+    let address = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    let origin = origin_at(format!("http://{address}"));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        origin.get(&ObjectId::from("a")),
+    )
+    .await
+    .expect("connecting hung");
+    assert!(result.is_err());
+}

@@ -250,3 +250,50 @@ fn resolve_reads_the_file_and_then_applies_the_flags() {
     assert_eq!(config.vaults_path, PathBuf::from("/from/file"));
     assert_eq!(config.bind, "127.0.0.1:2222".parse().unwrap());
 }
+
+// --- regressions: the generated config is written atomically, and kept private with a token ---
+
+#[test]
+fn the_generated_default_config_is_written_whole_and_parses_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/daemon_config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A stale, longer file in the way must be replaced completely, not partially overwritten.
+    std::fs::write(&path, "x".repeat(4096)).unwrap();
+    let mut initial = FileConfig::initial();
+    initial.vaults_path = Some(dir.path().join("vaults"));
+
+    initial.write(&path).unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let parsed: FileConfig = toml::from_str(&raw).unwrap();
+    assert_eq!(parsed.vaults_path, Some(dir.path().join("vaults")));
+    assert!(!raw.contains("xxxx"));
+    // No temp file left next to it.
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_holding_a_bearer_token_is_written_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mode_of = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    let mut with_token = FileConfig::initial();
+    with_token.vaults_path = Some(dir.path().join("vaults"));
+    with_token.auth = Some(AuthConfig::Bearer {
+        token: "s3cr3t".to_string(),
+    });
+    let secret = dir.path().join("secret.toml");
+    with_token.write(&secret).unwrap();
+    assert_eq!(mode_of(&secret), 0o600);
+
+    let mut open = FileConfig::initial();
+    open.vaults_path = Some(dir.path().join("vaults"));
+    let plain = dir.path().join("plain.toml");
+    open.write(&plain).unwrap();
+    assert_ne!(mode_of(&plain), 0o600);
+}
