@@ -21,7 +21,7 @@ path = "src/bin/creator.rs"
 color-eyre.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
-nimbus-vault = { version = "0.2.1", path = "../vault" }
+nimbus-vault = { version = "0.3.0", path = "../vault" }
 dirs.workspace = true
 
 [dev-dependencies]

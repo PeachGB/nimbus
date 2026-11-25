@@ -20,7 +20,7 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
-nimbus-vault = { version = "0.2.1", path = "../vault/" }
+nimbus-vault = { version = "0.3.0", path = "../vault/" }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 toml.workspace = true
