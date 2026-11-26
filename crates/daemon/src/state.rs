@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use nimbus_vault::vault::Vault;
+use nimbus_vault::{config::ConfigAdvisory, vault::Vault};
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tracing::warn;
 
@@ -74,6 +74,7 @@ fn load_vaults(dir: &Path) -> Result<HashMap<String, Vault>> {
                 continue;
             }
         };
+        warn_about(&path, vault.advisories());
 
         let name = vault.get_name().clone();
         if let Some(previous) = sources.get(&name) {
@@ -88,6 +89,23 @@ fn load_vaults(dir: &Path) -> Result<HashMap<String, Vault>> {
     }
 
     Ok(vaults)
+}
+
+/// Logs the advisories gathered when the vault at `path` was opened. Every one matters on a
+/// server: an encrypted vault served from here (directly or wrapped in another vault) means
+/// this host holds the key and serves plaintext, which defeats encryption at rest against
+/// whoever runs the host.
+fn warn_about(path: &Path, advisories: &[ConfigAdvisory]) {
+    for advisory in advisories {
+        match advisory {
+            ConfigAdvisory::Encrypted => warn!(
+                path = %path.display(),
+                "{advisory}. For storage the server can't read, keep the crypt vault on the \
+                 client and point its inner origin at this daemon"
+            ),
+            _ => warn!(path = %path.display(), "{advisory}"),
+        }
+    }
 }
 
 #[cfg(test)]

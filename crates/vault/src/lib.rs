@@ -161,6 +161,9 @@
 
 /// On-disk (TOML) configuration for a [`vault::Vault`] and the [`origin::Origin`] it wraps.
 pub mod config;
+/// Encryption at rest: the nimbus-crypt object format, [`crypt::CryptKey`], and streaming
+/// [`crypt::encrypt`] / [`crypt::decrypt`].
+pub mod crypt;
 /// The crate's error type, [`error::VaultError`], and the [`VaultResult`] alias built from it.
 pub mod error;
 /// Atomic file replacement ([`fsutil::atomic_write`]), the temp-file naming it shares with the
@@ -174,6 +177,9 @@ pub mod object;
 /// The [`origin::Origin`] trait and its built-in implementations (`fs`, `http`, `command`,
 /// `vault`).
 pub mod origin;
+/// [`parse::parse_toml`]: config parsing whose errors never quote the file, since it can hold a
+/// secret.
+pub mod parse;
 /// [`secret::Secret`], a string for credentials whose `Debug` never shows it.
 pub mod secret;
 /// [`vault::Vault`], the tree-like view over an `Origin` that ties everything together.

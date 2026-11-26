@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use nimbus_vault::{
-    config::OriginConfig,
+    config::{ConfigAdvisory, OriginConfig},
     error::VaultError,
     object::{Metadata, Object, ObjectId},
     origin::ByteStream,
@@ -53,6 +53,8 @@ pub struct App {
     /// survive: neither can drop a vault the other added, or bring back one it forgot.
     registered: HashSet<String>,
     forgotten: HashSet<String>,
+    /// Warnings and notes not yet taken by the frontend; see [`Self::take_warnings`].
+    warnings: Vec<String>,
 }
 
 /// What [`App::migrate_legacy_session`] found at the legacy (temp-dir) session path.
@@ -104,6 +106,7 @@ impl Default for App {
             saved_session: None,
             registered: HashSet::new(),
             forgotten: HashSet::new(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -253,41 +256,46 @@ impl App {
     /// The session file for this run, after moving a legacy one into place where there can be
     /// one. Logs one line about what happened to a legacy file; a refused or failed move only
     /// warns, and the session then starts from whatever is at the new path.
-    fn init_session_path() -> Result<PathBuf> {
+    fn init_session_path(warnings: &mut Vec<String>) -> Result<PathBuf> {
         let state_dir = dirs::state_dir();
         let legacy = Self::legacy_session_path(state_dir.as_deref(), &std::env::temp_dir());
         let path = Self::session_path(state_dir, dirs::data_local_dir())?;
         if let Some(legacy) = legacy {
-            Self::report_migration(&path, &legacy, Self::migrate_legacy_session(&path, &legacy));
+            let outcome = Self::migrate_legacy_session(&path, &legacy);
+            warnings.extend(Self::describe_migration(&path, &legacy, outcome));
         }
         Ok(path)
     }
 
-    /// Prints the one line [`Self::init_session_path`] logs about a legacy session file.
-    fn report_migration(path: &Path, legacy: &Path, outcome: std::io::Result<LegacySession>) {
+    /// The one line worth reporting about what happened to a legacy session file, if any.
+    fn describe_migration(
+        path: &Path,
+        legacy: &Path,
+        outcome: std::io::Result<LegacySession>,
+    ) -> Option<String> {
         match outcome {
-            Ok(LegacySession::None) => {}
-            Ok(LegacySession::Moved) => eprintln!(
+            Ok(LegacySession::None) => None,
+            Ok(LegacySession::Moved) => Some(format!(
                 "NOTE: moved the session file from {} to {}",
                 legacy.display(),
                 path.display()
-            ),
-            Ok(LegacySession::KeptNew) => eprintln!(
+            )),
+            Ok(LegacySession::KeptNew) => Some(format!(
                 "NOTE: ignoring the old session file {}: {} is the one in use (delete the old \
                  one to silence this)",
                 legacy.display(),
                 path.display()
-            ),
-            Ok(LegacySession::Refused(reason)) => eprintln!(
+            )),
+            Ok(LegacySession::Refused(reason)) => Some(format!(
                 "WARNING: not importing the old session file {}: {reason}. It was left as it \
                  is; this session starts without it",
                 legacy.display()
-            ),
-            Err(e) => eprintln!(
+            )),
+            Err(e) => Some(format!(
                 "WARNING: couldn't move the session file from {} to {}: {e}",
                 legacy.display(),
                 path.display()
-            ),
+            )),
         }
     }
     pub fn init() -> Result<Self> {
@@ -303,15 +311,16 @@ impl App {
             (None, None)
         };
 
-        let state_path = Self::init_session_path()?;
-        let saved = Self::load_state(&state_path)?;
+        let mut warnings = Vec::new();
+        let state_path = Self::init_session_path(&mut warnings)?;
+        let saved = Self::load_state(&state_path, &mut warnings)?;
 
         let saved_session = saved
             .current_vault
             .map(|vault| (vault, saved.cwd_path.unwrap_or_else(|| PathBuf::from("/"))));
 
         let vault_configs = saved.vault_configs;
-        let vaults = Self::open_vaults(&vault_configs);
+        let vaults = Self::open_vaults(&vault_configs, &mut warnings);
 
         let mut app = App {
             vaults,
@@ -325,6 +334,7 @@ impl App {
             saved_session,
             registered: HashSet::new(),
             forgotten: HashSet::new(),
+            warnings,
         };
 
         if cli_config.default_local_vault && !app.vaults.contains_key(LOCAL_VAULT_NAME) {
@@ -351,21 +361,47 @@ impl App {
     /// can be unbuildable *temporarily*, e.g. an `[origin_config.auth]` whose `token_env`
     /// isn't exported in this shell. Dropping the entry would have the next [`Self::save`]
     /// unregister the vault for good over that.
-    fn open_vaults(registry: &HashMap<String, PathBuf>) -> HashMap<String, Vault> {
+    /// The warnings worth a client's attention among the advisories `vault` gathered when it
+    /// was opened from `path`: an exposed key file. Being encrypted is expected here (the
+    /// client is where the key belongs), so that one isn't shown.
+    fn vault_warnings(path: &Path, vault: &Vault) -> Vec<String> {
+        vault
+            .advisories()
+            .iter()
+            .filter(|advisory| !matches!(advisory, ConfigAdvisory::Encrypted))
+            .map(|advisory| format!("WARNING: {}: {advisory}", path.display()))
+            .collect()
+    }
+
+    /// Opens every vault in the registry, adding to `warnings` the ones whose config doesn't
+    /// build right now (they're skipped) and what the ones that did build have to say.
+    fn open_vaults(
+        registry: &HashMap<String, PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> HashMap<String, Vault> {
         let mut vaults = HashMap::new();
         for (name, cfg_path) in registry {
             match Vault::new(cfg_path.clone()) {
                 Ok(vault) => {
+                    warnings.extend(Self::vault_warnings(cfg_path, &vault));
                     vaults.insert(name.clone(), vault);
                 }
-                Err(e) => eprintln!(
+                Err(e) => warnings.push(format!(
                     "WARNING: vault '{name}' ({}) can't be opened, so it won't be usable this \
                      session: {e}",
                     cfg_path.display()
-                ),
+                )),
             }
         }
         vaults
+    }
+
+    /// Takes the warnings and notes gathered since the last call: from loading the session
+    /// and opening vaults ([`Self::init`]), restoring the session, and registering vaults.
+    /// The core never prints them itself; the CLI prints them and the TUI shows them in its
+    /// status bar, where a line written to the terminal would be painted over.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -413,7 +449,7 @@ impl App {
     /// can't be read or parsed.
     fn read_state(path: &Path) -> Result<Option<SavedState>> {
         match std::fs::read_to_string(path) {
-            Ok(raw) => Ok(Some(toml::from_str(&raw)?)),
+            Ok(raw) => Ok(Some(nimbus_vault::parse::parse_toml(&raw, path)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -422,19 +458,22 @@ impl App {
     /// [`Self::read_state`] for startup. A file that exists but doesn't parse (left truncated
     /// by an older version, or edited by hand) is moved aside to `<name>.bak` with a warning,
     /// and the session starts fresh, instead of every command failing until it's fixed by hand.
-    fn load_state(path: &Path) -> Result<SavedState> {
+    fn load_state(path: &Path, warnings: &mut Vec<String>) -> Result<SavedState> {
         match Self::read_state(path) {
             Ok(saved) => Ok(saved.unwrap_or_default()),
-            Err(e) if e.downcast_ref::<toml::de::Error>().is_some() => {
+            Err(e)
+                if e.downcast_ref::<nimbus_vault::parse::ConfigParseError>()
+                    .is_some() =>
+            {
                 let mut backup = path.as_os_str().to_owned();
                 backup.push(".bak");
                 let backup = PathBuf::from(backup);
                 std::fs::rename(path, &backup)?;
-                eprintln!(
+                warnings.push(format!(
                     "WARNING: {} couldn't be read ({e}); moved it to {} and started a new session",
                     path.display(),
                     backup.display()
-                );
+                ));
                 Ok(SavedState::default())
             }
             Err(e) => Err(e),
@@ -451,7 +490,9 @@ impl App {
             return Ok(());
         };
         if let Err(e) = self.select(vault_name.clone()) {
-            eprintln!("WARNING: couldn't restore the previous session: {e}");
+            self.warnings.push(format!(
+                "WARNING: couldn't restore the previous session: {e}"
+            ));
             // A vault that's still *registered* keeps its saved position: `select` only sees
             // the vaults that opened, so this is also what a config that failed to build this
             // run looks like (a `token_env` that isn't exported in this shell). Clearing it
@@ -468,7 +509,10 @@ impl App {
         // `select` already put us at the vault's root, so a directory that has since been
         // moved or deleted leaves us somewhere valid.
         if let Err(e) = self.cd(Some(path.to_string_lossy().into_owned())).await {
-            eprintln!("WARNING: couldn't return to '{}': {e}", path.display());
+            self.warnings.push(format!(
+                "WARNING: couldn't return to '{}': {e}",
+                path.display()
+            ));
         }
         Ok(())
     }
@@ -762,17 +806,18 @@ impl App {
             .canonicalize()
             .map_err(|e| anyhow!("CAN'T OPEN VAULT CONFIG {}: {e}", cfg.display()))?;
         let vault = Vault::new(cfg.clone())?;
+        self.warnings.extend(Self::vault_warnings(&cfg, &vault));
         let name = vault.get_name().clone();
 
         if let Some(existing) = self.vault_configs.get(&name)
             && existing != &cfg
         {
             if Self::is_same_config(existing, &cfg) {
-                eprintln!(
+                self.warnings.push(format!(
                     "NOTE: vault '{name}' was registered as {}; now stored as {}",
                     existing.display(),
                     cfg.display()
-                );
+                ));
             } else {
                 return Err(anyhow!(
                     "VAULT '{}' IS ALREADY REGISTERED (config: {}) — FORGET IT FIRST OR PICK ANOTHER NAME",

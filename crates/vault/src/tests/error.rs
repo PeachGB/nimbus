@@ -51,11 +51,17 @@ fn json_error_converts_via_from() {
 }
 
 #[test]
-fn toml_error_converts_via_from() {
-    let toml_err = toml::from_str::<toml::Value>("not = = valid").unwrap_err();
-    let vault_err: VaultError = toml_err.into();
+fn config_parse_error_converts_via_from() {
+    let parse_err =
+        crate::parse::parse_toml::<toml::Value>("not = = valid", std::path::Path::new("v.toml"))
+            .unwrap_err();
+    let vault_err: VaultError = parse_err.into();
     assert!(matches!(vault_err, VaultError::Toml(_)));
-    assert!(vault_err.to_string().starts_with("Toml Error:"));
+    assert!(
+        vault_err
+            .to_string()
+            .starts_with("config error: v.toml: syntax error")
+    );
 }
 
 #[test]

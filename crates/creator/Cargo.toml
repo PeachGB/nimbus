@@ -22,7 +22,9 @@ color-eyre.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 nimbus-vault = { version = "0.3.0", path = "../vault" }
+zeroize.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+toml.workspace = true

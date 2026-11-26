@@ -60,6 +60,8 @@ impl IntoResponse for ApiError {
             ApiError::Vault(e @ (VaultError::InvalidName(_) | VaultError::InvalidId(_))) => {
                 (StatusCode::BAD_REQUEST, e.to_string())
             }
+            // A client asking for something it may not do, not the origin failing: no error log.
+            ApiError::Vault(e @ VaultError::Reserved(_)) => (StatusCode::CONFLICT, e.to_string()),
             // Anything else is the origin's own message, which can name a path on this host or
             // the upstream a proxying daemon sits in front of. The operator gets the detail in
             // the log; the client gets the status.

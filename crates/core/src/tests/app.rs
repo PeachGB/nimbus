@@ -21,6 +21,7 @@ fn make_app(vaults: HashMap<String, Vault>) -> App {
         saved_session: None,
         registered: HashSet::new(),
         forgotten: HashSet::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -1367,7 +1368,11 @@ fn a_vault_whose_config_does_not_build_is_skipped_but_stays_registered() {
         ("broken".to_string(), dir.path().join("missing.toml")),
     ]);
 
-    let vaults = App::open_vaults(&registry);
+    let mut warnings = Vec::new();
+    let vaults = App::open_vaults(&registry, &mut warnings);
+    // Collected for the frontend to show, not printed: a TUI would paint over a printed line.
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("'broken'") && warnings[0].contains("can't be opened"));
 
     assert!(vaults.contains_key("good"));
     assert!(!vaults.contains_key("broken"));
@@ -2001,9 +2006,11 @@ fn a_corrupt_session_file_is_moved_aside_instead_of_blocking_startup() {
     let path = dir.path().join("session.toml");
     std::fs::write(&path, "vault_configs = { truncated").unwrap();
 
-    let saved = App::load_state(&path).unwrap();
+    let mut warnings = Vec::new();
+    let saved = App::load_state(&path, &mut warnings).unwrap();
     assert!(saved.vault_configs.is_empty());
     assert!(!path.exists());
+    assert!(warnings[0].contains("session.toml.bak"), "{warnings:?}");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("session.toml.bak")).unwrap(),
         "vault_configs = { truncated"
@@ -2013,7 +2020,7 @@ fn a_corrupt_session_file_is_moved_aside_instead_of_blocking_startup() {
 #[test]
 fn a_missing_session_file_is_a_fresh_session() {
     let dir = tempfile::tempdir().unwrap();
-    let saved = App::load_state(&dir.path().join("none.toml")).unwrap();
+    let saved = App::load_state(&dir.path().join("none.toml"), &mut Vec::new()).unwrap();
     assert!(saved.vault_configs.is_empty() && saved.current_vault.is_none());
 }
 
@@ -2388,4 +2395,51 @@ fn a_legacy_session_file_owned_by_another_user_is_refused() {
     assert!(error.contains("owned by uid"), "{error}");
     let error = App::check_owned_entry(dir.path(), true, mine.wrapping_add(1)).unwrap_err();
     assert!(error.contains("owned by uid"), "{error}");
+}
+
+// --- warnings are collected for the frontend ---
+
+/// A crypt vault config in `dir` over a local `data` dir, with its key file at `mode`.
+#[cfg(unix)]
+fn crypt_vault_config(dir: &Path, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    nimbus_vault::crypt::create_key_file(&dir.join("v.key")).unwrap();
+    std::fs::set_permissions(dir.join("v.key"), std::fs::Permissions::from_mode(mode)).unwrap();
+    let path = dir.join("v.toml");
+    std::fs::write(
+        &path,
+        "name = \"secure\"\n\n[origin_config]\ntype = \"crypt\"\nkey_file = \"v.key\"\n\n\
+         [origin_config.inner]\ntype = \"fs\"\nroot = \"data\"\n",
+    )
+    .unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn registering_a_vault_with_an_exposed_key_file_leaves_a_warning_to_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crypt_vault_config(dir.path(), 0o644);
+    let mut app = make_app(HashMap::new());
+
+    app.new_vault(config).unwrap();
+
+    let warnings = app.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("accessible to other users"),
+        "{warnings:?}"
+    );
+    assert!(app.take_warnings().is_empty(), "taking drains them");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_encrypted_vault_alone_is_nothing_to_warn_a_client_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crypt_vault_config(dir.path(), 0o600);
+    let mut app = make_app(HashMap::new());
+    app.new_vault(config).unwrap();
+    assert!(app.take_warnings().is_empty());
 }

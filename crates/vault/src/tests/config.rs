@@ -881,3 +881,331 @@ fn a_non_utf8_config_dir_is_refused_when_config_dir_is_used() {
         assert!(error.contains("UTF-8"), "{error}");
     }
 }
+
+/// The three ways a token line can be malformed, each with the secret it must not echo.
+const MALFORMED_TOKEN_LINES: [(&str, &str); 3] = [
+    ("token = \"SUPERSECRET-123\" extra", "SUPERSECRET-123"),
+    ("token = 12345678", "12345678"),
+    (
+        "token = \"t\"\ntoken_env = [\"SUPERSECRET-456\"]",
+        "SUPERSECRET-456",
+    ),
+];
+
+#[test]
+fn a_malformed_token_line_is_never_echoed_by_the_loader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.toml");
+    for (line, secret) in MALFORMED_TOKEN_LINES {
+        std::fs::write(
+            &path,
+            format!(
+                "name = \"remote\"\n\n[origin_config]\ntype = \"http\"\n\
+                 list_url = \"/l\"\nfetch_url = \"/f\"\nget_url = \"/g\"\nput_url = \"/p\"\n\
+                 send_url = \"/s\"\ndelete_url = \"/d\"\n\n\
+                 [origin_config.auth]\ntype = \"bearer\"\n{line}\n"
+            ),
+        )
+        .unwrap();
+        let error = match VaultConfig::build(path.clone()) {
+            Ok(_) => panic!("{line:?} should not parse"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, VaultError::Toml(_)), "{error:?}");
+        for shown in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#}"),
+        ] {
+            assert!(!shown.contains(secret), "{line:?} leaked: {shown}");
+            assert!(shown.contains("vault.toml"), "{shown}");
+        }
+    }
+}
+
+// --- crypt ---
+
+/// Writes a fresh key's text form to `dir/name` with `mode`, returning the text.
+fn write_key_file(dir: &Path, name: &str, mode: u32) -> String {
+    let text = crate::crypt::CryptKey::generate()
+        .unwrap()
+        .to_text()
+        .to_string();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("{text}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    text
+}
+
+/// A crypt vault config in `dir` whose key line is `key_line` and whose inner fs root is
+/// `data` (relative), returning its path.
+fn write_crypt_config(dir: &Path, key_line: &str) -> PathBuf {
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    let path = dir.join("secure.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "name = \"secure\"\n\n[origin_config]\ntype = \"crypt\"\n{key_line}\n\n\
+             [origin_config.inner]\ntype = \"fs\"\nroot = \"data\"\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn a_crypt_config_builds_with_paths_relative_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key_file(dir.path(), "secure.key", 0o600);
+    let config = write_crypt_config(dir.path(), "key_file = \"secure.key\"");
+
+    let (name, _, origin) = VaultConfig::build(config).unwrap();
+    assert_eq!(name, "secure");
+    let mut leaf = crate::object::Object::Leaf {
+        name: "n.txt".into(),
+        id: "n.txt".into(),
+        meta: Default::default(),
+    };
+    let stored = origin.put(&mut leaf, &ObjectId::from("/")).await.unwrap();
+    origin
+        .send(
+            &stored,
+            futures::StreamExt::boxed(futures::stream::iter([Ok(bytes::Bytes::from_static(
+                b"PLAINTEXT-IN-DATA",
+            ))])),
+        )
+        .await
+        .unwrap();
+    // The inner root resolved to dir/data, and holds ciphertext.
+    let stored_bytes = std::fs::read(dir.path().join("data/n.txt")).unwrap();
+    assert!(!stored_bytes.windows(17).any(|w| w == b"PLAINTEXT-IN-DATA"));
+    assert!(dir.path().join("data/.nimbus-crypt").is_file());
+}
+
+#[test]
+fn a_crypt_key_can_come_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = crate::crypt::CryptKey::generate()
+        .unwrap()
+        .to_text()
+        .to_string();
+    let name = "NIMBUS_TEST_CRYPT_KEY_FROM_ENV";
+    unsafe { std::env::set_var(name, &text) };
+    let config = write_crypt_config(dir.path(), &format!("key_env = \"{name}\""));
+    let built = VaultConfig::build(config);
+    unsafe { std::env::remove_var(name) };
+    assert!(built.is_ok());
+}
+
+#[test]
+fn a_crypt_config_needs_exactly_one_key_source() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key_file(dir.path(), "secure.key", 0o600);
+    for (line, expected) in [
+        ("", "set one of key_file or key_env"),
+        (
+            "key_file = \"secure.key\"\nkey_env = \"NIMBUS_TEST_UNUSED\"",
+            "only one",
+        ),
+    ] {
+        let config = write_crypt_config(dir.path(), line);
+        let error = match VaultConfig::build(config) {
+            Ok(_) => panic!("{line:?} should be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "{line:?}: {error}");
+    }
+}
+
+#[test]
+fn a_bad_key_is_refused_without_showing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "SECRETKEYMATERIAL0123456789abcdefghijklmnopq";
+    std::fs::write(
+        dir.path().join("bad.key"),
+        format!("nimbus-crypt-key-1:{body}!"),
+    )
+    .unwrap();
+    let config = write_crypt_config(dir.path(), "key_file = \"bad.key\"");
+    let error = match VaultConfig::build(config) {
+        Ok(_) => panic!("a malformed key should be refused"),
+        Err(error) => error,
+    };
+    for shown in [
+        error.to_string(),
+        format!("{error:?}"),
+        format!("{error:#}"),
+    ] {
+        assert!(!shown.contains("SECRETKEYMATERIAL"), "{shown}");
+        assert!(shown.contains("bad.key"), "{shown}");
+    }
+
+    // A key pasted inline, as an unknown field, isn't echoed by the parse error either.
+    let config = write_crypt_config(dir.path(), &format!("key = \"nimbus-crypt-key-1:{body}\""));
+    let error = match VaultConfig::build(config) {
+        Ok(_) => panic!("an inline key isn't a field"),
+        Err(error) => error,
+    };
+    for shown in [error.to_string(), format!("{error:?}")] {
+        assert!(!shown.contains("SECRETKEYMATERIAL"), "{shown}");
+    }
+}
+
+#[test]
+fn crypt_relative_to_resolves_the_key_file_and_the_inner_origin() {
+    let config = OriginConfig::Crypt {
+        key_file: Some("keys/v.key".into()),
+        key_env: None,
+        inner: Box::new(OriginConfig::Fs {
+            root: "data".into(),
+        }),
+    };
+    match config.relative_to(Path::new("/etc/nimbus")).unwrap() {
+        OriginConfig::Crypt {
+            key_file, inner, ..
+        } => {
+            assert_eq!(key_file, Some(PathBuf::from("/etc/nimbus/keys/v.key")));
+            assert!(
+                matches!(*inner, OriginConfig::Fs { ref root } if root == Path::new("/etc/nimbus/data"))
+            );
+        }
+        _ => panic!("expected a crypt config"),
+    }
+}
+
+/// An http origin config with `auth` and placeholder urls.
+fn http_with_auth(auth: crate::origin::http::HttpAuth) -> OriginConfig {
+    OriginConfig::Http {
+        base_url: Some("https://example.com".to_string()),
+        list_url: "/list/{id}".to_string(),
+        fetch_url: "/fetch/{id}".to_string(),
+        get_url: "/get/{id}".to_string(),
+        put_url: "/put/{id}".to_string(),
+        send_url: "/send/{id}".to_string(),
+        delete_url: "/delete/{id}".to_string(),
+        rename_url: None,
+        tls: None,
+        auth,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_token_inside_a_crypt_origin_still_makes_the_config_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.toml");
+    let crypt = |auth| OriginConfig::Crypt {
+        key_file: Some("v.key".into()),
+        key_env: None,
+        inner: Box::new(http_with_auth(auth)),
+    };
+    VaultConfig::new(
+        "v".to_string(),
+        ObjectId::default(),
+        crypt(crate::origin::http::HttpAuth::Bearer {
+            token: Some("hunter2".into()),
+            token_env: None,
+            token_file: None,
+        }),
+    )
+    .save(&path)
+    .unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // And it round-trips, the inner table after the key line.
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.find("key_file").unwrap() < written.find("[origin_config.inner]").unwrap());
+    let read_back: VaultConfig = toml::from_str(&written).unwrap();
+    assert!(matches!(
+        read_back.origin_config,
+        OriginConfig::Crypt { .. }
+    ));
+}
+
+/// The advisories a vault opened from `config` reports.
+fn advisories_of(config: &Path) -> Vec<ConfigAdvisory> {
+    crate::vault::Vault::new(config.to_path_buf())
+        .unwrap()
+        .advisories()
+        .to_vec()
+}
+
+#[cfg(unix)]
+#[test]
+fn advisories_flag_an_encrypted_vault_and_an_exposed_key_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key_file(dir.path(), "private.key", 0o600);
+    write_key_file(dir.path(), "shared.key", 0o644);
+
+    let private = write_crypt_config(dir.path(), "key_file = \"private.key\"");
+    assert_eq!(advisories_of(&private), vec![ConfigAdvisory::Encrypted]);
+    let shared = write_crypt_config(dir.path(), "key_file = \"shared.key\"");
+    assert_eq!(
+        advisories_of(&shared),
+        vec![
+            ConfigAdvisory::Encrypted,
+            ConfigAdvisory::KeyFileExposed {
+                path: dir.path().join("shared.key"),
+                mode: 0o644
+            }
+        ]
+    );
+    let plain = dir.path().join("plain.toml");
+    std::fs::write(
+        &plain,
+        "name = \"p\"\n[origin_config]\ntype = \"fs\"\nroot = \"data\"\n",
+    )
+    .unwrap();
+    assert!(advisories_of(&plain).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn advisories_come_through_a_vault_wrapping_a_crypt_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key_file(dir.path(), "shared.key", 0o644);
+    write_crypt_config(dir.path(), "key_file = \"shared.key\"");
+    let outer = dir.path().join("outer.toml");
+    std::fs::write(
+        &outer,
+        "name = \"outer\"\n\n[origin_config]\ntype = \"vault\"\npath = \"secure.toml\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        advisories_of(&outer),
+        vec![
+            ConfigAdvisory::Encrypted,
+            ConfigAdvisory::KeyFileExposed {
+                path: dir.path().join("shared.key"),
+                mode: 0o644
+            }
+        ]
+    );
+}
+
+#[test]
+fn vault_configs_pointing_at_each_other_are_refused_not_followed_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, target) in [("a", "b"), ("b", "a")] {
+        std::fs::write(
+            dir.path().join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[origin_config]\ntype = \"vault\"\npath = \"{target}.toml\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let error = match crate::vault::Vault::new(dir.path().join("a.toml")) {
+        Ok(_) => panic!("a cycle of configs should not open"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("nested more than"), "{error}");
+}

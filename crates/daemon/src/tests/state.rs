@@ -112,3 +112,111 @@ fn load_fails_naming_a_missing_token_file() {
 
     assert!(error.contains("missing-token"), "{error}");
 }
+
+/// Log lines written while a test runs, in memory.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Runs `f` with every log line it writes captured, returning them.
+fn logs_of(f: impl FnOnce()) -> String {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn serving_a_crypt_vault_warns_that_this_host_holds_the_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("data")).unwrap();
+    let key = nimbus_vault::crypt::CryptKey::generate().unwrap().to_text();
+    std::fs::write(dir.path().join("secret.key"), format!("{}\n", key.as_str())).unwrap();
+    std::fs::set_permissions(
+        dir.path().join("secret.key"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("secret.toml"),
+        "name = \"secret\"\n\n[origin_config]\ntype = \"crypt\"\nkey_file = \"secret.key\"\n\n\
+         [origin_config.inner]\ntype = \"fs\"\nroot = \"data\"\n",
+    )
+    .unwrap();
+
+    let mut vaults = HashMap::new();
+    let logs = logs_of(|| vaults = load_vaults(dir.path()).unwrap());
+
+    assert!(vaults.contains_key("secret"));
+    assert!(logs.contains("encrypted at rest"), "{logs}");
+    assert!(
+        logs.contains("keep the crypt vault on the client"),
+        "{logs}"
+    );
+    assert!(logs.contains("accessible to other users"), "{logs}");
+    assert!(!logs.contains(&key[20..]), "{logs}");
+}
+
+#[test]
+fn a_plain_vault_gets_no_crypt_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    write_vault_config(dir.path(), "plain", "plain");
+    let logs = logs_of(|| {
+        load_vaults(dir.path()).unwrap();
+    });
+    assert!(!logs.contains("encrypted"), "{logs}");
+}
+
+#[test]
+fn serving_a_vault_that_wraps_a_crypt_vault_warns_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let vaults = dir.path().join("vaults");
+    let hidden = dir.path().join("hidden");
+    std::fs::create_dir_all(&vaults).unwrap();
+    std::fs::create_dir_all(hidden.join("data")).unwrap();
+    let key = nimbus_vault::crypt::CryptKey::generate().unwrap().to_text();
+    std::fs::write(hidden.join("secret.key"), format!("{}\n", key.as_str())).unwrap();
+    std::fs::write(
+        hidden.join("secret.toml"),
+        "name = \"secret\"\n\n[origin_config]\ntype = \"crypt\"\nkey_file = \"secret.key\"\n\n\
+         [origin_config.inner]\ntype = \"fs\"\nroot = \"data\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vaults.join("wrapper.toml"),
+        format!(
+            "name = \"wrapper\"\n\n[origin_config]\ntype = \"vault\"\npath = \"{}\"\n",
+            hidden.join("secret.toml").display()
+        ),
+    )
+    .unwrap();
+
+    let mut loaded = HashMap::new();
+    let logs = logs_of(|| loaded = load_vaults(&vaults).unwrap());
+
+    assert!(loaded.contains_key("wrapper"));
+    assert!(logs.contains("encrypted at rest"), "{logs}");
+}

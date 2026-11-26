@@ -39,6 +39,11 @@ axum-server = { version = "0.7.3", default-features = false, features = ["tls-ru
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 sha2 = "0.10"
+# Encryption at rest (nimbus-vault's `crypt`): ring is already in the tree through rustls, so its
+# ChaCha20-Poly1305, HKDF and OS RNG add no new crypto crate; zeroize and base64 are in the tree too.
+ring = "0.17"
+zeroize = "1"
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 1

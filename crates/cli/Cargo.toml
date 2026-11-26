@@ -19,7 +19,11 @@ homepage.workspace = true
 clap.workspace = true
 tokio.workspace = true
 nimbus-core = { version = "0.3.0", path = "../core/" }
+nimbus-vault = { version = "0.3.0", path = "../vault/" }
 nimbus-creator = { version = "0.3.0", path = "../creator/" }
 ratatui.workspace = true
 anyhow.workspace = true
 rustyline = "18.0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

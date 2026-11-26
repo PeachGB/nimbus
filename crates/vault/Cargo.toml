@@ -21,6 +21,9 @@ futures.workspace = true
 percent-encoding = "2.3"
 rustls.workspace = true
 sha2.workspace = true
+ring.workspace = true
+zeroize.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -36,3 +39,7 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 httpmock = "0.7"
 rcgen.workspace = true
 tokio-rustls.workspace = true
+# Only for an independent cross-check of the nimbus-crypt test vectors (crypt/tests/vectors.rs):
+# decrypting with a second implementation proves the format, not just ring's round trip.
+chacha20poly1305 = "0.10"
+hkdf = "0.12"

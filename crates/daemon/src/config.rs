@@ -170,7 +170,7 @@ impl Config {
         let file = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+            nimbus_vault::parse::parse_toml(&raw, &path)?
         } else if explicit {
             return Err(anyhow!("no config file at {}", path.display()));
         } else {

@@ -125,7 +125,7 @@ fn resolve_secret(
                 VaultError::Generic(format!("auth: environment variable '{name}' is not set"))
             })?
             .into(),
-        (None, None, Some(path)) => crate::fsutil::read_secret(path)
+        (None, None, Some(path)) => crate::fsutil::read_secret_zeroizing(path)
             .map_err(|e| VaultError::Generic(format!("auth: reading {}: {e}", path.display())))?
             .into(),
         (None, None, None) => {

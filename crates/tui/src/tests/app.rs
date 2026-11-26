@@ -68,3 +68,38 @@ fn sync_status_hints_at_force_only_when_something_can_be_forced() {
     };
     assert!(sync_status("pushed", &report).contains("--force"));
 }
+
+#[test]
+fn startup_warnings_end_up_in_the_status_bar_text() {
+    // What `App::default` puts in `status`: the TUI owns the terminal, so nothing it would
+    // print could be seen.
+    assert_eq!(with_warnings(None, vec![]), None);
+    assert_eq!(
+        with_warnings(None, vec!["WARNING: a".into(), "NOTE: b".into()]),
+        Some("WARNING: a  ·  NOTE: b".to_string())
+    );
+    assert_eq!(
+        with_warnings(Some("vault registered".into()), vec!["WARNING: key".into()]),
+        Some("vault registered  ·  WARNING: key".to_string())
+    );
+}
+
+#[test]
+fn a_creator_wizard_that_kept_a_key_says_so_in_the_status_bar() {
+    let kept = CreatorOutcome {
+        config: None,
+        unsaved_key_file: Some(PathBuf::from("/keys/v.key")),
+    };
+    assert_eq!(
+        unsaved_key_status(&kept),
+        Some(nimbus_creator::kept_key_notice(std::path::Path::new(
+            "/keys/v.key"
+        )))
+    );
+
+    let cancelled = CreatorOutcome {
+        config: None,
+        unsaved_key_file: None,
+    };
+    assert_eq!(unsaved_key_status(&cancelled), None);
+}

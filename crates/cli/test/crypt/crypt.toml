@@ -1,0 +1,11 @@
+# TEST-ONLY: an encrypted vault for trying the REPL by hand. Its key, TEST-ONLY.key, is
+# committed to the repository, so this vault protects nothing; never reuse that key.
+name = "crypt-vault"
+
+[origin_config]
+type = "crypt"
+key_file = "TEST-ONLY.key"
+
+[origin_config.inner]
+type = "fs"
+root = "data"

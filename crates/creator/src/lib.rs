@@ -7,7 +7,7 @@ pub mod builder;
 pub mod event;
 pub mod ui;
 
-pub use app::App;
+pub use app::{App, Outcome, kept_key_notice};
 pub use builder::OriginKind;
 
 /// Runs the vault-creator wizard against an already-initialized `terminal`. The caller owns
@@ -22,6 +22,15 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     App::new().run(terminal)
+}
+
+/// [`run`], returning the whole [`Outcome`]: the config written, and a key file kept without
+/// one. Show [`kept_key_notice`] for the latter once the terminal is restored.
+pub fn run_for_outcome<B: Backend>(terminal: &mut Terminal<B>) -> color_eyre::Result<Outcome>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    App::new().run_for_outcome(terminal)
 }
 
 #[cfg(test)]

@@ -181,7 +181,7 @@ impl OriginKind {
 /// relative paths against its own directory instead, so the answer is stored absolute to keep
 /// the meaning the user typed, whether or not they pressed Tab. An answer that can't be made
 /// absolute (an empty one, or an unreadable cwd) is kept as typed.
-fn absolute_answer(answer: String) -> PathBuf {
+pub(crate) fn absolute_answer(answer: String) -> PathBuf {
     let path = PathBuf::from(expand_tilde(&answer));
     std::path::absolute(&path).unwrap_or(path)
 }

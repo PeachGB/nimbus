@@ -12,7 +12,7 @@ use rustyline::{Context, Helper, Result};
 /// command missing here still runs, it just won't be offered.
 const SUBCOMMANDS: &[&str] = &[
     "ls", "vaults", "select", "new", "forget", "cd", "put", "get", "mkdir", "touch", "rename",
-    "delete", "cp", "mv", "push", "pull", "exit",
+    "delete", "cp", "mv", "push", "pull", "keygen", "decrypt", "exit",
 ];
 
 /// Completes subcommand names as the first word of the line, and vault/directory names as

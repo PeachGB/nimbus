@@ -73,7 +73,7 @@ This repo is a Cargo workspace with six crates:
 | [`nimbus-cli`](crates/cli/README.md) | `cargo install nimbus-cli` | One command per invocation, or an interactive REPL. |
 | [`nimbus-daemon`](crates/daemon/README.md) | `cargo install nimbus-daemon` | Serves a directory of vaults over HTTP or HTTPS, for the `http` origin to mount. |
 | [`nimbus-creator`](crates/creator/README.md) | `cargo install nimbus-creator` | An interactive Ratatui wizard that builds a `vault.toml`, embeddable from another frontend. |
-| [`nimbus-vault`](crates/vault/README.md) | `cargo add nimbus-vault` | The library everything else is built on: `Object`, `Vault`, `Origin` and its four implementations. |
+| [`nimbus-vault`](crates/vault/README.md) | `cargo add nimbus-vault` | The library everything else is built on: `Object`, `Vault`, `Origin` and its five implementations. |
 | [`nimbus-core`](crates/core/README.md) | `cargo add nimbus-core` | The shared core of the frontends above: `App`, holding the vault registry, current vault/cwd, local staging vault, and session persistence. |
 
 The two libraries are two layers, and which one you want depends on how far up you
@@ -169,7 +169,7 @@ known limits (operations block the event loop; there's no undo or trash).
   `find(path)` resolves a `/`-separated path to an `ObjectId` by walking the tree
   one `list` call per component.
 
-Four built-in origins ship in `nimbus-vault`:
+Five built-in origins ship in `nimbus-vault`:
 
 - `OriginFileSystem` (`fs`) — a directory on disk, via `tokio::fs`.
 - `OriginHTTP` (`http`) — any REST-ish API, with a `{id}`-templated URL per operation.
@@ -177,6 +177,8 @@ Four built-in origins ship in `nimbus-vault`:
   hatch (see below).
 - `OriginVault` (`vault`) — another `Vault`, wrapped so it can act as an origin
   in its own right (see [Using a vault as an origin](#using-a-vault-as-an-origin)).
+- `OriginCrypt` (`crypt`) — another origin's objects encrypted at rest; see
+  [Encrypted vaults](crates/vault/README.md#encrypted-vaults-type--crypt).
 
 A vault is fully described by a TOML file, deserialized into `VaultConfig` /
 `OriginConfig`:
@@ -241,13 +243,33 @@ type = "vault"
 path = "inner.toml"
 ```
 
+```toml
+# vault.toml — another origin's objects, encrypted at rest
+name = "notes"
+
+[origin_config]
+type = "crypt"
+key_file = "notes.key"   # or key_env = "NIMBUS_NOTES_KEY"; losing the key loses the data
+
+[origin_config.inner]    # where the ciphertext is stored: any origin
+type = "fs"
+root = "/mnt/backup/notes"
+```
+
+The key never reaches the inner origin, so a server, bucket or backup disk only holds
+ciphertext; names, sizes and modification times stay visible. See
+[Encrypted vaults](crates/vault/README.md#encrypted-vaults-type--crypt).
+
+> New in 0.4.0 (unreleased). Until then, clone the repo and build from the checkout: `cargo install --path crates/cli` (or `crates/tui`)
+
 **Relative paths resolve against the directory of the config file that contains them**,
 not the current directory, so a config means the same thing wherever nimbus starts
 (`inner.toml` above is the file next to `vault.toml`). Absolute paths are used as they
 are, and `~` is not expanded. The fields this covers:
 
-- in a vault config: the `fs` `root`, the `vault` `path`, and for `http` the auth
-  `token_file` and the tls `ca_file`;
+- in a vault config: the `fs` `root`, the `vault` `path`, for `http` the auth
+  `token_file` and the tls `ca_file`, and for `crypt` the `key_file` (its inner origin's
+  paths resolve against the same directory);
 - in `cli_config.toml`: `local_vault_path`;
 - in `daemon_config.toml`: `vaults_path`, `[tls]` `cert_file` and `key_file`, and the
   `[auth]` `token_file`.
@@ -306,6 +328,8 @@ nimbus> mv <PATH> <DESTINATION> [VAULT] [--force]  # move, within or across vaul
 nimbus> delete <PATH> [VAULT] [--force]      # delete an object
 nimbus> push [VAULT] [--force]               # sync the local vault out to a vault
 nimbus> pull [VAULT] [--force]               # sync a vault into the local vault
+nimbus> keygen <PATH>                        # write a new key for a crypt vault
+nimbus> decrypt <IN> <OUT> --key-file <KEY>  # recover one encrypted file, no vault needed
 nimbus> exit                                 # save session state and quit
 ```
 
@@ -386,6 +410,7 @@ Every binary shares the same layout, all derived from `nimbus_vault::config_home
 | `<config>/.nimbus/cli_config.toml` | `default_local_vault`, `local_vault_path` |
 | `<config>/.nimbus/daemon_config.toml` | `vaults_path`, `bind`, `read_only`, `allow_insecure_http`, `[auth]` (`token` or `token_file`), `[tls]` |
 | `<config>/.nimbus/vaults/<name>.toml` | where the creator wizard saves new vault configs |
+| a crypt vault's key file | wherever its `key_file` says (relative to the vault config); `nimbus-cli keygen <path>` or the creator wizard writes one `0600` (on Unix). Keep it private and backed up: losing it loses the data |
 | `<state>/nimbus/session.toml` | the registry of `name → config path` (absolute), plus the vault and directory the last session ended in. `<state>` is `$XDG_STATE_HOME` or `~/.local/state` on Linux, `~/Library/Application Support` on macOS, and `%LOCALAPPDATA%` on Windows. Never the temp directory: with no such directory nimbus refuses to start rather than keep a session the system may delete. On macOS and Windows only (the systems where older versions used it), a session file left in the temp directory (`<temp>/nimbus/session.toml`) is moved over once. On macOS only if it is a regular file you own that no one else can write, in a directory that is the same (anything else is left alone with a warning); Windows's temp directory is per-user. If both exist, the new one wins and the old one is left alone |
 
 A vault config can live anywhere — `new <path>` registers it from wherever it is.
@@ -508,8 +533,9 @@ cargo clippy --workspace --all-targets
 
 [`crates/cli/test/`](crates/cli/test/README.md) holds a hand-run vault config **per
 origin type** — `fs`, `http` (served by a stdlib Python reference origin), `command`
-(a POSIX-sh reference origin), and a vault wrapping another vault — so features can
-be exercised against something other than a plain filesystem.
+(a POSIX-sh reference origin), a vault wrapping another vault, and an encrypted `crypt`
+vault with a committed test-only key — so features can be exercised against something
+other than a plain filesystem.
 
 Their paths are relative to each config file (see [The model](#the-model)), so they work
 from any directory. Point `XDG_STATE_HOME` at a scratch directory first and your real
@@ -531,7 +557,7 @@ See that README for the per-origin walkthrough.
   chunks, never as one big in-memory blob.
 - **Origin-agnostic sync** — `pull`/`push` are written entirely against the
   `Origin` trait, so the same sync logic works between any two backends: disk,
-  HTTP, shell command, another vault, or a mix of the four.
+  HTTP, shell command, another vault, an encrypted one, or a mix of the five.
 
 ## License
 

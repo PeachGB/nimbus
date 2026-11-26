@@ -682,3 +682,147 @@ async fn bad_request_and_invalid_id_both_answer_400_with_their_reason() {
         );
     }
 }
+
+/// The recommended topology for encryption at rest: the crypt origin on the client, pointed at
+/// a daemon that serves a plain fs vault. The daemon only ever stores and serves ciphertext.
+#[tokio::test]
+async fn a_client_side_crypt_vault_over_the_daemon_stores_only_ciphertext() {
+    use futures::TryStreamExt;
+    use nimbus_vault::{
+        crypt::{CryptError, CryptKey},
+        origin::crypt::OriginCrypt,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let base = spawn(state_for(
+        fs_vault("store", dir.path().to_path_buf()),
+        false,
+        Auth::None,
+    ))
+    .await;
+    let key = CryptKey::generate().unwrap();
+    let client = OriginCrypt::new(Box::new(origin_for(&base, "store")), key.clone());
+    let secret = b"PLAINTEXT-THE-SERVER-MUST-NOT-SEE".repeat(3000);
+
+    let stored = client
+        .put(&mut leaf("secret.txt"), &ObjectId::default())
+        .await
+        .unwrap();
+    client
+        .send(
+            &stored,
+            futures::stream::iter([Ok(bytes::Bytes::from(secret.clone()))]).boxed(),
+        )
+        .await
+        .unwrap();
+
+    // The client reads plaintext, with plaintext sizes, and never sees the marker.
+    let read: Vec<bytes::Bytes> = client
+        .fetch(&stored.get_id())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(read.concat(), secret);
+    let listed = client.list(&ObjectId::default()).await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(
+        listed[0].get_meta().unwrap().size,
+        Some(secret.len() as u64)
+    );
+
+    // The daemon's disk, and what it serves to anyone without the key, is ciphertext.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!(!bytes.windows(33).any(|w| w == &secret[..33]));
+    }
+    let raw: Vec<bytes::Bytes> = origin_for(&base, "store")
+        .fetch(&stored.get_id())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(raw.concat().starts_with(b"NMBC"));
+
+    // Another key is refused before it writes anything.
+    let other = OriginCrypt::new(
+        Box::new(origin_for(&base, "store")),
+        CryptKey::generate().unwrap(),
+    );
+    let error = other.list(&ObjectId::default()).await.unwrap_err();
+    assert!(
+        matches!(error, VaultError::Crypt(CryptError::WrongKey)),
+        "{error:?}"
+    );
+}
+
+/// A daemon serving a crypt vault takes ids from its clients, dot segments included: none of
+/// them may reach the vault's key marker.
+#[tokio::test]
+async fn a_client_cannot_reach_the_marker_of_a_crypt_vault_the_daemon_serves() {
+    use nimbus_vault::{crypt::CryptKey, origin::crypt::OriginCrypt};
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::generate().unwrap();
+    let crypt = OriginCrypt::new(
+        Box::new(OriginFileSystem::new(dir.path().to_path_buf())),
+        key.clone(),
+    );
+    let vault =
+        Vault::from_parts("secret".to_string(), Arc::new(crypt), ObjectId::from("")).unwrap();
+    let base = spawn(state_for(vault, false, Auth::None)).await;
+    let client = origin_for(&base, "secret");
+
+    // A first write through the daemon creates the marker.
+    let stored = client
+        .put(&mut leaf("a.txt"), &ObjectId::default())
+        .await
+        .unwrap();
+    client
+        .send(
+            &stored,
+            futures::stream::iter([Ok(bytes::Bytes::from_static(b"a"))]).boxed(),
+        )
+        .await
+        .unwrap();
+    let marker = dir.path().join(".nimbus-crypt");
+    let before = std::fs::read(&marker).unwrap();
+
+    // Raw requests, as an attacker would send them: a client library resolves `./` before
+    // sending, but an encoded slash reaches the daemon (and the origin) as `./.nimbus-crypt`.
+    let http = reqwest::Client::new();
+    // Refused as a conflict (409), the client's mistake, not a server error.
+    for spelling in [
+        ".nimbus-crypt",
+        ".%2F.nimbus-crypt",
+        ".%2F%2F.nimbus-crypt",
+        "%2E%2F.nimbus-crypt",
+        ".NIMBUS-CRYPT",
+        ".%5C.nimbus-crypt",
+        ".nimbus-crypt.",
+    ] {
+        let url = |op: &str| format!("{base}{VAULT_PREFIX}/secret/{op}/{spelling}");
+        // Delete reaches the guard before any lookup: always a 409.
+        let deleted = http.delete(url("delete")).send().await.unwrap();
+        assert_eq!(deleted.status(), 409, "delete of {spelling}");
+        let sent = http.put(url("send")).body("x").send().await.unwrap();
+        // The daemon looks the object up before sending to it. On a case-sensitive filesystem
+        // a case or trailing-dot spelling doesn't exist, so that is a 404 (the marker isn't
+        // reachable either way); where it does exist (macOS, Windows), the guard says 409.
+        let only_another_spelling =
+            spelling.chars().any(|c| c.is_ascii_uppercase()) || spelling.ends_with('.');
+        if only_another_spelling && sent.status() == 404 {
+            continue;
+        }
+        assert_eq!(sent.status(), 409, "send to {spelling}");
+        let body = sent.text().await.unwrap();
+        assert!(body.contains("reserved by nimbus-crypt"), "{body}");
+    }
+
+    assert_eq!(std::fs::read(&marker).unwrap(), before);
+    let again = OriginCrypt::new(
+        Box::new(OriginFileSystem::new(dir.path().to_path_buf())),
+        key,
+    );
+    assert_eq!(again.list(&ObjectId::default()).await.unwrap().len(), 1);
+}

@@ -59,9 +59,9 @@ key_file  = "/etc/nimbus/key.pem"
 
 ### The vaults directory
 
-Every `*.toml` under `vaults_path` is opened as a vault, exactly as `nimbus-cli`'s `new` would open it (see [`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md) for the `origin_config` shape). Each vault config resolves its own relative paths (an `fs` `root`, say) against its own directory, as everywhere else. A vault is addressed in URLs by the `name` **inside** the config, not by its file name.
+Every `*.toml` under `vaults_path` is opened as a vault, exactly as `nimbus-cli`'s `new` would open it (see [`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md) for the `origin_config` shape). A `crypt` vault served from here draws a warning at startup: the daemon then holds its key and serves plaintext. For storage the server can't read, keep the crypt vault on the client and point its inner origin at a plain vault served here. Each vault config resolves its own relative paths (an `fs` `root`, say) against its own directory, as everywhere else. A vault is addressed in URLs by the `name` **inside** the config, not by its file name.
 
-A config that fails to open is logged and skipped, so one bad file doesn't stop the rest from being served. Two configs claiming the same name is fatal — serving one of them at random would silently hand out the wrong data.
+A config that fails to open is logged and skipped, so one bad file doesn't stop the rest from being served. A config that doesn't parse is logged by file, line and column, never by a value or a line, since it may hold a token; the same goes for `daemon_config.toml` itself. Two configs claiming the same name is fatal — serving one of them at random would silently hand out the wrong data.
 
 Nothing stops a served vault from having an `http` origin of its own, which makes the daemon a proxy in front of another one.
 
@@ -81,7 +81,7 @@ Nothing stops a served vault from having an `http` origin of its own, which make
 
 Ids arrive percent-encoded (`OriginHTTP` encodes `#`, `?`, `%`, spaces…) and are decoded before use. Object names in a `put` or `rename` body must be a single path component (`object::validate_name`), and anything else is a `400`, so a client can't create files outside the vault. `send` accepts an optional `x-nimbus-modified` header (RFC 3339): the stored file takes that modification time, which is how a `push` through the daemon ends up idempotent. A malformed value is a `400`.
 
-Errors are `{"error": "..."}` with a status: `404` for an unknown vault or a missing object, `400` for a rejected id, name or header, `401` unauthenticated, `403` read-only, `501` when the vault's origin can't do the operation natively (clients then fall back), `500` for an origin failure. The `404` matters — `OriginHTTP` turns it back into `VaultError::NotFound`, which is what `Vault::push`/`pull` match on to decide an object needs creating.
+Errors are `{"error": "..."}` with a status: `404` for an unknown vault or a missing object, `400` for a rejected id, name or header, `401` unauthenticated, `403` read-only, `501` when the vault's origin can't do the operation natively (clients then fall back), `409` when the operation would touch an encrypted vault's reserved `.nimbus-crypt` marker, `500` for an origin failure. The `404` matters — `OriginHTTP` turns it back into `VaultError::NotFound`, which is what `Vault::push`/`pull` match on to decide an object needs creating.
 
 The `500` is the one case where the client isn't told what went wrong: the origin's own message can name a path on the serving host, or the upstream a proxying daemon sits in front of. That detail is logged at `error` level instead, so the operator has it and the caller doesn't.
 

@@ -5,6 +5,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 /// Prefix of the in-flight temp files written next to a destination before they are renamed
 /// over it. [`OriginFileSystem`](crate::origin::fs::OriginFileSystem)'s
@@ -172,15 +173,36 @@ pub fn resolve_against(dir: &Path, path: PathBuf) -> PathBuf {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn read_secret(path: &Path) -> std::io::Result<String> {
-    let raw = std::fs::read_to_string(path)?;
-    let secret = raw.trim_end_matches(['\r', '\n']);
-    if secret.is_empty() {
+    read_secret_zeroizing(path).map(|secret| secret.as_str().to_owned())
+}
+
+/// [`read_secret`], with the secret kept in a buffer that is wiped when dropped. The file is
+/// read into that buffer, trimmed in place and turned into the string without a copy, so no
+/// unwiped copy of the text is left in freed memory (beyond what the OS keeps). For key
+/// material.
+pub fn read_secret_zeroizing(path: &Path) -> std::io::Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new(std::fs::read(path)?);
+    let len = bytes
+        .iter()
+        .rposition(|&b| b != b'\r' && b != b'\n')
+        .map_or(0, |last| last + 1);
+    bytes.truncate(len);
+    if bytes.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "the file is empty",
         ));
     }
-    Ok(secret.to_string())
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(text) => Ok(Zeroizing::new(text)),
+        Err(error) => {
+            error.into_bytes().zeroize();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the file isn't UTF-8 text",
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

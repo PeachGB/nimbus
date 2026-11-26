@@ -28,7 +28,11 @@ use thiserror::Error;
 /// let err = VaultError::NotFound("notes.txt".to_string());
 /// assert_eq!(err.to_string(), "Object not found: notes.txt");
 /// ```
+///
+/// Marked `#[non_exhaustive]`: variants are added as features are, so a `match` outside this
+/// crate needs a wildcard arm.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum VaultError {
     /// A catch-all error for conditions that don't fit a more specific variant.
     #[error("Vault error: {0}")]
@@ -70,6 +74,10 @@ pub enum VaultError {
     /// Callers that have a fallback, like copy-then-delete for a move, should use it.
     #[error("Unsupported by this origin: {0}")]
     Unsupported(String),
+    /// The object is reserved and can't be created, replaced, moved or deleted, such as a crypt
+    /// vault's key marker. The caller asked for something it may not do, not a failure.
+    #[error("Reserved: {0}")]
+    Reserved(String),
     /// An origin-specific operation failed; the string carries the origin's own error detail.
     #[error("Origin Error: {0}")]
     OriginError(String),
@@ -82,9 +90,14 @@ pub enum VaultError {
     /// Wraps a `reqwest::Error` from the HTTP origin.
     #[error("HTTP Error{0}")]
     HTTP(#[from] reqwest::Error),
-    /// Wraps a `toml::de::Error` from parsing a `VaultConfig`/`OriginConfig` TOML file.
-    #[error("Toml Error:{0}")]
-    Toml(#[from] toml::de::Error),
+    /// A `VaultConfig`/`OriginConfig` TOML file that didn't parse. Says where and what kind of
+    /// mistake, never the file's text, which can hold a token (see [`crate::parse`]).
+    #[error("config error: {0}")]
+    Toml(#[from] crate::parse::ConfigParseError),
+    /// An object couldn't be encrypted or decrypted, or a key couldn't be read (see
+    /// [`crate::crypt`]).
+    #[error("encryption: {0}")]
+    Crypt(#[from] crate::crypt::CryptError),
     /// Wraps a `toml::ser::Error` from serializing a `VaultConfig` (e.g. `VaultConfig::save`).
     #[error("Toml Error:{0}")]
     TomlSer(#[from] toml::ser::Error),

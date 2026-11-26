@@ -27,7 +27,7 @@ impl CliConfig {
             });
         }
         let raw = std::fs::read_to_string(&path)?;
-        let config: CliConfig = toml::from_str(&raw)?;
+        let config: CliConfig = nimbus_vault::parse::parse_toml(&raw, &path)?;
         config.relative_to(&path)
     }
 

@@ -12,24 +12,33 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 /// A secret string, such as a bearer token, for config fields that hold credentials. Its
 /// `Debug` never shows the value, so a struct holding one can derive `Debug` safely. It
 /// serializes as the plain string, so config files are unchanged. There is deliberately no
-/// `==`: compare with [`Secret::matches`].
+/// `==`: compare with [`Secret::matches`]. Its memory is wiped when it is dropped (each clone's
+/// too), and [`From<Zeroizing<String>>`](Secret#impl-From<Zeroizing<String>>-for-Secret) takes
+/// a secret read into a wiped buffer without copying it. It can't wipe copies made before or
+/// after it: the config file's text and `toml`'s buffers for an inline `token`, the copy
+/// `std::env::var` returns and the process environment itself, and the header and `reqwest`
+/// copies made to send it. That's one reason `token_file` and `token_env` are preferred over an
+/// inline token.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
 impl Secret {
-    /// The secret itself, for the one place that needs it: comparing a presented token.
+    /// The secret itself, for the places that must send or use it, such as building the
+    /// `Authorization` header. To check a credential, use [`Secret::matches`].
     pub fn expose(&self) -> &str {
         &self.0
     }
 
     /// Whether `presented` is this secret, compared in constant time so the response time
     /// doesn't reveal how many leading bytes matched. Use this, never `expose() ==`, to check a
-    /// credential.
+    /// credential. The length still shows in the timing, as with any comparison of this kind;
+    /// only where the first difference lies is hidden.
     pub fn matches(&self, presented: &[u8]) -> bool {
         constant_time_eq(self.0.as_bytes(), presented)
     }
@@ -43,6 +52,21 @@ impl Secret {
 impl From<String> for Secret {
     fn from(secret: String) -> Self {
         Secret(secret)
+    }
+}
+
+/// Moves the text out of a wiped buffer (as [`crate::fsutil::read_secret_zeroizing`] returns)
+/// without copying it, so the only copy left is this secret's own, wiped on drop.
+impl From<Zeroizing<String>> for Secret {
+    fn from(mut secret: Zeroizing<String>) -> Self {
+        Secret(std::mem::take(&mut *secret))
+    }
+}
+
+/// Wipes the secret's memory, spare capacity included.
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 

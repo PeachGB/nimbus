@@ -642,3 +642,36 @@ fn path_flags_stay_relative_to_the_current_directory() {
         })
     );
 }
+
+#[test]
+fn a_malformed_config_never_echoes_the_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("daemon_config.toml");
+    for (line, secret) in [
+        ("token = \"SUPERSECRET-123\" extra", "SUPERSECRET-123"),
+        ("token = 12345678", "12345678"),
+        ("token = [\"SUPERSECRET-456\"]", "SUPERSECRET-456"),
+    ] {
+        std::fs::write(
+            &path,
+            format!("vaults_path = \"/srv/vaults\"\n\n[auth]\ntype = \"bearer\"\n{line}\n"),
+        )
+        .unwrap();
+        let args = Args {
+            config: Some(path.clone()),
+            ..Args::default()
+        };
+        let error = Config::resolve(&args).unwrap_err();
+        for shown in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#}"),
+        ] {
+            assert!(!shown.contains(secret), "{line:?} leaked: {shown}");
+        }
+        assert!(
+            format!("{error:#}").contains("daemon_config.toml"),
+            "{error:#}"
+        );
+    }
+}

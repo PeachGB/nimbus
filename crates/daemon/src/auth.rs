@@ -83,7 +83,7 @@ impl AuthConfig {
 fn bearer_secret(token: Option<&Secret>, token_file: Option<&Path>) -> Result<Secret> {
     let secret = match (token, token_file) {
         (Some(token), None) => token.clone(),
-        (None, Some(path)) => read_token_file(path)?.into(),
+        (None, Some(path)) => read_token_file(path)?,
         (None, None) => return Err(anyhow!("auth: set one of token or token_file")),
         (Some(_), Some(_)) => return Err(anyhow!("auth: set only one of token or token_file")),
     };
@@ -93,10 +93,12 @@ fn bearer_secret(token: Option<&Secret>, token_file: Option<&Path>) -> Result<Se
     Ok(secret)
 }
 
-/// Reads `path` as a token file (see [`nimbus_vault::fsutil::read_secret`]), naming the file in
-/// any error, an empty one included.
-fn read_token_file(path: &Path) -> Result<String> {
-    nimbus_vault::fsutil::read_secret(path)
+/// Reads `path` as a token file (see [`nimbus_vault::fsutil::read_secret_zeroizing`]) straight
+/// into a [`Secret`], with no unwiped copy along the way, naming the file in any error, an empty
+/// one included.
+fn read_token_file(path: &Path) -> Result<Secret> {
+    nimbus_vault::fsutil::read_secret_zeroizing(path)
+        .map(Secret::from)
         .with_context(|| format!("reading bearer token file {}", path.display()))
 }
 

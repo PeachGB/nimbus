@@ -1,9 +1,13 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 use crate::{
     VaultResult,
-    config::VaultConfig,
+    config::{ConfigAdvisory, VaultConfig},
     error::VaultError,
     object::{Object, ObjectId, SyncDecision},
     origin::{ByteStream, Origin},
@@ -79,6 +83,7 @@ pub struct Vault {
     origin: Arc<dyn Origin>,
     objects: Mutex<HashMap<ObjectId, Object>>,
     root: ObjectId,
+    advisories: Vec<ConfigAdvisory>,
 }
 impl std::fmt::Debug for Vault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,6 +103,7 @@ impl Vault {
             origin,
             objects: Mutex::new(HashMap::new()),
             root,
+            advisories: Vec::new(),
         })
     }
     /// Reads a `VaultConfig` from the TOML file at `from` and builds the `Vault` it describes.
@@ -112,8 +118,22 @@ impl Vault {
     /// # Ok::<(), nimbus_vault::error::VaultError>(())
     /// ```
     pub fn new(from: PathBuf) -> VaultResult<Self> {
-        let (name, root_id, origin) = VaultConfig::build(from)?;
-        Self::from_parts(name, Arc::from(origin), root_id)
+        Self::open_nested(&from, 0)
+    }
+
+    /// [`Vault::new`] for a config reached through `depth` nested `vault` origins.
+    pub(crate) fn open_nested(from: &Path, depth: usize) -> VaultResult<Self> {
+        let loaded = VaultConfig::load(from, depth)?;
+        let mut vault = Self::from_parts(loaded.name, Arc::from(loaded.origin), loaded.root_id)?;
+        vault.advisories = loaded.advisories;
+        Ok(vault)
+    }
+
+    /// What is worth telling the user about how this vault is configured, gathered when it was
+    /// opened from its config (nested vault configs included): that it is encrypted at rest,
+    /// that a key file is readable by other users. Empty for a vault built in code.
+    pub fn advisories(&self) -> &[ConfigAdvisory] {
+        &self.advisories
     }
 
     #[cfg(test)]
@@ -123,6 +143,7 @@ impl Vault {
             origin,
             root: root_id,
             objects: Mutex::new(HashMap::new()),
+            advisories: Vec::new(),
         }
     }
     /// Returns the vault's configured name.

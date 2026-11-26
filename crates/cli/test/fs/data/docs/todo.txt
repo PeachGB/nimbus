@@ -1,3 +1,3 @@
-- probar ls
-- probar cd
-- probar get/put
+- try ls
+- try cd
+- try get/put

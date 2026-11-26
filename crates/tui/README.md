@@ -276,7 +276,7 @@ would quietly rejoin the next bulk operation.
 ## Testing against other origins
 
 To drive it against origins other than a plain filesystem, see
-[`crates/cli/test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md), which holds a vault config per origin type (`fs`,
+[`crates/cli/test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md), which holds a vault config per origin type (`crypt` included; `fs`,
 `http`, `command`, and a vault wrapping another vault) along with reference `http`/`command`
 origin implementations. Their paths are relative to each config file, so they work from any directory.
 

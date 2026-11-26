@@ -3,7 +3,7 @@ use crate::event::{AppEvent, Event, EventHandler};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nimbus_core::app::{App as NimbusApp, SaveOutcome};
-use nimbus_creator::App as CreatorApp;
+use nimbus_creator::{App as CreatorApp, Outcome as CreatorOutcome};
 use nimbus_vault::object::{Object, ObjectId};
 use ratatui::{DefaultTerminal, widgets::ListState};
 use std::collections::HashSet;
@@ -192,15 +192,32 @@ impl App {
     }
 }
 
+/// `message` (if any) and then each of `warnings`, as one status-bar text (it wraps), or
+/// `None` when there is nothing to say.
+fn with_warnings(message: Option<String>, warnings: Vec<String>) -> Option<String> {
+    let parts: Vec<String> = message.into_iter().chain(warnings).collect();
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
+}
+
+/// The status-bar text for a creator wizard that kept a key file without saving a config, or
+/// `None` when it didn't.
+fn unsaved_key_status(outcome: &CreatorOutcome) -> Option<String> {
+    let notices = outcome
+        .unsaved_key_file
+        .as_deref()
+        .map(nimbus_creator::kept_key_notice);
+    with_warnings(None, notices.into_iter().collect())
+}
+
 impl Default for App {
     fn default() -> Self {
-        let nimbus = match NimbusApp::init() {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("ERROR: {}", e);
-                NimbusApp::default()
-            }
+        // Nothing can be printed here: the terminal already belongs to the TUI, which would
+        // paint over it. What init has to say goes in the status bar instead.
+        let (mut nimbus, startup_error) = match NimbusApp::init() {
+            Ok(a) => (a, None),
+            Err(e) => (NimbusApp::default(), Some(format!("ERROR: {e}"))),
         };
+        let status = with_warnings(startup_error, nimbus.take_warnings());
         let vaults = nimbus.vault_names();
         let mut vault_state = ListState::default();
         if !vaults.is_empty() {
@@ -215,7 +232,7 @@ impl Default for App {
             objects: Vec::new(),
             visible: Vec::new(),
             object_state: ListState::default(),
-            status: None,
+            status,
             command: None,
             creator: None,
             clipboard: None,
@@ -288,9 +305,10 @@ impl App {
     ) -> color_eyre::Result<()> {
         if let Some(creator) = self.creator.as_mut() {
             creator.handle_key_event(key_event)?;
-            if !creator.is_running() {
-                let outcome = self.creator.take().and_then(CreatorApp::into_outcome);
-                self.finish_creator_wizard(outcome);
+            if !creator.is_running()
+                && let Some(creator) = self.creator.take()
+            {
+                self.finish_creator_wizard(creator.into_result());
             }
             return Ok(());
         }
@@ -808,7 +826,7 @@ impl App {
                 match self.nimbus.new_vault(PathBuf::from(path)) {
                     Ok(()) => {
                         self.refresh_vaults();
-                        self.status = Some("vault registered".to_string());
+                        self.set_status_with_warnings("vault registered".to_string());
                     }
                     Err(e) => self.status = Some(e.to_string()),
                 }
@@ -930,19 +948,28 @@ impl App {
         }
     }
 
-    /// Registers the vault the creator wizard just wrote a config for, or does nothing if it
-    /// was cancelled (`outcome` is `None`).
-    fn finish_creator_wizard(&mut self, outcome: Option<PathBuf>) {
-        let Some(path) = outcome else {
+    /// Registers the vault the creator wizard just wrote a config for. A wizard that stopped
+    /// without saving registers nothing, but a key file it kept is reported in the status bar.
+    fn finish_creator_wizard(&mut self, outcome: CreatorOutcome) {
+        if let Some(status) = unsaved_key_status(&outcome) {
+            self.status = Some(status);
+        }
+        let Some(path) = outcome.config else {
             return;
         };
         match self.nimbus.new_vault(path) {
             Ok(()) => {
                 self.refresh_vaults();
-                self.status = Some("vault created".to_string());
+                self.set_status_with_warnings("vault created".to_string());
             }
             Err(e) => self.status = Some(e.to_string()),
         }
+    }
+
+    /// Shows `message` in the status bar, followed by any warnings the core gathered while
+    /// doing it (an exposed key file on a newly registered vault, say).
+    fn set_status_with_warnings(&mut self, message: String) {
+        self.status = with_warnings(Some(message), self.nimbus.take_warnings());
     }
 
     async fn enter_vault(&mut self, name: String) {

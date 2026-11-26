@@ -678,6 +678,15 @@ async fn an_unreachable_server_fails_fast() {
 }
 
 #[test]
+fn the_auth_header_is_marked_sensitive() {
+    // `sensitive` is what keeps the header out of reqwest's own `{:?}` and logging.
+    let origin = origin_with_auth(&bearer("s3cr3t-header")).unwrap();
+    let header = origin.auth.as_ref().unwrap();
+    assert!(header.is_sensitive());
+    assert!(!format!("{header:?}").contains("s3cr3t-header"));
+}
+
+#[test]
 fn no_debug_view_shows_the_token() {
     let token = "s3cr3t-in-debug";
     let auth = bearer(token);

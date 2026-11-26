@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     VaultResult,
+    crypt::CryptKey,
     error::VaultError,
     fsutil,
     object::ObjectId,
     origin::{
         Origin,
         command::OriginCommand,
+        crypt::OriginCrypt,
         fs::OriginFileSystem,
         http::{HttpAuth, HttpTls, OriginHTTP},
         vault::OriginVault,
@@ -79,11 +81,35 @@ impl VaultConfig {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn build(from: PathBuf) -> VaultResult<(String, ObjectId, Box<dyn Origin>)> {
-        let dir = fsutil::config_dir(&from)?;
+        let loaded = Self::load(&from, 0)?;
+        Ok((loaded.name, loaded.root_id, loaded.origin))
+    }
+
+    /// [`VaultConfig::build`], also returning the advisories gathered while building, at
+    /// nesting `depth` (how many `vault` origins lead here). Too deep is an error: it is almost
+    /// certainly a cycle of configs pointing at each other.
+    pub(crate) fn load(from: &Path, depth: usize) -> VaultResult<LoadedVault> {
+        if depth > MAX_NESTING {
+            return Err(VaultError::Generic(format!(
+                "{}: vault configs nested more than {MAX_NESTING} deep (do they point at each \
+                 other?)",
+                from.display()
+            )));
+        }
+        let dir = fsutil::config_dir(from)?;
         let cfg = std::fs::read_to_string(from)?;
-        let cfg: VaultConfig = toml::from_str(&cfg)?;
-        let origin = cfg.origin_config.relative_to(&dir)?.build()?;
-        Ok((cfg.name, cfg.root_id, origin))
+        let cfg: VaultConfig = crate::parse::parse_toml(&cfg, from)?;
+        let mut advisories = Vec::new();
+        let origin = cfg
+            .origin_config
+            .relative_to(&dir)?
+            .build_nested(&mut advisories, depth)?;
+        Ok(LoadedVault {
+            name: cfg.name,
+            root_id: cfg.root_id,
+            origin,
+            advisories,
+        })
     }
 
     /// Builds a `VaultConfig` from its parts, without reading anything from disk. Useful for
@@ -110,13 +136,7 @@ impl VaultConfig {
     /// `Some(0o600)` when the config holds a credential in plain text (an HTTP `token`), so
     /// other users on the machine can't read it. `None` keeps the default permissions.
     fn file_mode(&self) -> Option<u32> {
-        match &self.origin_config {
-            OriginConfig::Http {
-                auth: HttpAuth::Bearer { token: Some(_), .. },
-                ..
-            } => Some(0o600),
-            _ => None,
-        }
+        self.origin_config.holds_secret().then_some(0o600)
     }
 
     /// Directory new vault configs are written to by default: `vaults/` under
@@ -203,8 +223,12 @@ mod tests;
 /// type = "vault"
 /// path = "inner.toml"
 /// ```
+///
+/// Marked `#[non_exhaustive]`: new origin types are added over time, so a `match` outside this
+/// crate needs a wildcard arm.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum OriginConfig {
     /// Builds an [`crate::origin::command::OriginCommand`]: an origin backed by a shell
     /// command per operation.
@@ -278,6 +302,20 @@ pub enum OriginConfig {
         /// directory when loaded from a file.
         path: PathBuf,
     },
+    /// Builds an [`crate::origin::crypt::OriginCrypt`]: every object of the `inner` origin
+    /// encrypted at rest with a key that never leaves this machine (see [`crate::crypt`]).
+    Crypt {
+        /// File holding the key's text form (`nimbus-crypt-key-1:…`), relative to the config's
+        /// directory. Exactly one of this or `key_env`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_file: Option<PathBuf>,
+        /// Environment variable holding the key's text form. Exactly one of this or `key_file`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_env: Option<String>,
+        /// The origin the ciphertext is stored in. Last, because it serializes as a TOML table
+        /// (`[origin_config.inner]`) and a table has to come after every plain value.
+        inner: Box<OriginConfig>,
+    },
 }
 impl OriginConfig {
     /// Reads an `OriginConfig` from the TOML file at `from` and builds the `Origin` it
@@ -303,8 +341,8 @@ impl OriginConfig {
     /// ```
     pub fn from_file(from: PathBuf) -> VaultResult<Box<dyn Origin>> {
         let dir = fsutil::config_dir(&from)?;
-        let cfg = std::fs::read_to_string(from)?;
-        let cfg: OriginConfig = toml::from_str(&cfg)?;
+        let cfg = std::fs::read_to_string(&from)?;
+        let cfg: OriginConfig = crate::parse::parse_toml(&cfg, &from)?;
         cfg.relative_to(&dir)?.build()
     }
 
@@ -338,6 +376,15 @@ impl OriginConfig {
             },
             OriginConfig::Vault { path } => OriginConfig::Vault {
                 path: fsutil::resolve_against(dir, path),
+            },
+            OriginConfig::Crypt {
+                key_file,
+                key_env,
+                inner,
+            } => OriginConfig::Crypt {
+                key_file: key_file.map(|path| fsutil::resolve_against(dir, path)),
+                key_env,
+                inner: Box::new(inner.relative_to(dir)?),
             },
             OriginConfig::Http {
                 auth,
@@ -414,6 +461,17 @@ impl OriginConfig {
     /// # Ok::<(), nimbus_vault::error::VaultError>(())
     /// ```
     pub fn build(self) -> VaultResult<Box<dyn Origin>> {
+        self.build_nested(&mut Vec::new(), 0)
+    }
+
+    /// [`OriginConfig::build`], appending to `advisories` what is worth telling the user about
+    /// this origin and everything it wraps, nested vault configs included. `depth` counts the
+    /// `vault` origins that led here (see [`VaultConfig::load`]).
+    fn build_nested(
+        self,
+        advisories: &mut Vec<ConfigAdvisory>,
+        depth: usize,
+    ) -> VaultResult<Box<dyn Origin>> {
         match self {
             OriginConfig::Command {
                 list_cmd,
@@ -456,8 +514,24 @@ impl OriginConfig {
                 }))
             }
             OriginConfig::Vault { path } => {
-                let vault = Vault::new(path)?;
+                let vault = Vault::open_nested(&path, depth + 1)?;
+                advisories.extend(vault.advisories().iter().cloned());
                 Ok(Box::new(OriginVault::new(Arc::new(vault))))
+            }
+            OriginConfig::Crypt {
+                key_file,
+                key_env,
+                inner,
+            } => {
+                let key = CryptKey::load(key_file.as_deref(), key_env.as_deref())?;
+                advisories.push(ConfigAdvisory::Encrypted);
+                if let Some(path) = key_file
+                    && let Some(mode) = key_file_exposed(&path)
+                {
+                    advisories.push(ConfigAdvisory::KeyFileExposed { path, mode });
+                }
+                let inner = inner.build_nested(advisories, depth)?;
+                Ok(Box::new(OriginCrypt::new(inner, key)))
             }
         }
     }
@@ -507,4 +581,81 @@ fn with_config_dir(
     }
     extras.insert(CONFIG_DIR_KEY.to_string(), dir.to_string());
     Ok(extras)
+}
+
+impl OriginConfig {
+    /// Whether this config, or one nested in it, holds a credential in plain text (an inline
+    /// HTTP `token`), so a file containing it is written `0600`. A crypt origin never holds its
+    /// key inline, but its inner origin might hold a token.
+    fn holds_secret(&self) -> bool {
+        match self {
+            OriginConfig::Http {
+                auth: HttpAuth::Bearer { token: Some(_), .. },
+                ..
+            } => true,
+            OriginConfig::Crypt { inner, .. } => inner.holds_secret(),
+            _ => false,
+        }
+    }
+}
+
+/// Something about a vault config worth telling the user that doesn't stop it from opening,
+/// gathered while the vault is built (nested vault configs included); see
+/// [`crate::vault::Vault::advisories`]. Each program decides which ones to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigAdvisory {
+    /// The vault is encrypted at rest and this process holds its key, so it reads and writes
+    /// plaintext. Expected on a client; on a server it means the server can read the data.
+    Encrypted,
+    /// A crypt key file other users can read or write.
+    KeyFileExposed {
+        /// The key file.
+        path: PathBuf,
+        /// Its permission bits, e.g. `0o644`.
+        mode: u32,
+    },
+}
+
+impl std::fmt::Display for ConfigAdvisory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigAdvisory::Encrypted => f.write_str(
+                "the vault is encrypted at rest, and this process holds its key and serves \
+                 plaintext",
+            ),
+            ConfigAdvisory::KeyFileExposed { path, mode } => write!(
+                f,
+                "crypt key file {} is accessible to other users (mode {mode:o}); chmod 600 it",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// How many `vault` origins may lead to a config before it is taken for a cycle.
+const MAX_NESTING: usize = 16;
+
+/// What [`VaultConfig::load`] produces.
+pub(crate) struct LoadedVault {
+    pub name: String,
+    pub root_id: ObjectId,
+    pub origin: Box<dyn Origin>,
+    pub advisories: Vec<ConfigAdvisory>,
+}
+
+/// The permission bits of `path` when users other than its owner can read or write it (Unix
+/// only; elsewhere `None`).
+fn key_file_exposed(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        (mode & 0o077 != 0).then_some(mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }

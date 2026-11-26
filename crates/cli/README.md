@@ -41,13 +41,13 @@ Set `default_local_vault = false` if you don't want the CLI touching your filesy
 
 ### Vault definitions
 
-Each vault you register (other than the automatic `LOCAL` one) is defined by its own `.toml` file — see [`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md) for the full `origin_config` shape (`fs`, `http`, `command`, `vault`), including [`[origin_config.auth]`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md#authenticating-an-http-origin) for an `http` origin that needs credentials (a [`nimbus-daemon`](https://github.com/PeachGB/nimbus/blob/main/crates/daemon/README.md), typically — keep the token in an environment variable, not in the config file). Register one with:
+Each vault you register (other than the automatic `LOCAL` one) is defined by its own `.toml` file — see [`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md) for the full `origin_config` shape (`fs`, `http`, `command`, `vault`, `crypt`), including [`[origin_config.auth]`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md#authenticating-an-http-origin) for an `http` origin that needs credentials (a [`nimbus-daemon`](https://github.com/PeachGB/nimbus/blob/main/crates/daemon/README.md), typically — keep the token in an environment variable, not in the config file). Register one with:
 
 ```
 nimbus> new /path/to/vault.toml
 ```
 
-or launch the interactive wizard (built on [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator)) by running `new` with no path — it prompts for a name, root id, origin type, and that origin's fields, then writes and registers the resulting `vault.toml`. The wizard defaults to saving under `~/.config/.nimbus/vaults/<name>.toml`, so vaults you create stay together and can be found again; the path is editable, and it refuses to overwrite an existing config. A path you type for a field (an `fs` root, an inner vault's config) is relative to the directory you ran `new` from, and is saved absolute, because paths in a saved config resolve against the config's own directory.
+or launch the interactive wizard (built on [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator)) by running `new` with no path — it prompts for a name, root id, origin type, that origin's fields, and whether to encrypt the vault at rest, then writes and registers the resulting `vault.toml` (an encrypted vault's new key is shown once and written only after you confirm you have a backup; see [`nimbus-creator`](https://github.com/PeachGB/nimbus/tree/main/crates/creator#encrypted-vaults)). The wizard defaults to saving under `~/.config/.nimbus/vaults/<name>.toml`, so vaults you create stay together and can be found again; the path is editable, and it refuses to overwrite an existing config. A path you type for a field (an `fs` root, an inner vault's config) is relative to the directory you ran `new` from, and is saved absolute, because paths in a saved config resolve against the config's own directory.
 
 Registering a name that's already taken by a *different* config is refused, since replacing it would leave the original vault unreachable. Use `forget <vault>` to free the name first. Re-registering the **same** config path is fine — that's how an edit to a config file gets picked up.
 
@@ -168,6 +168,36 @@ exit                   # save session state and quit
 
 `Ctrl-C`/`Ctrl-D` also exit the REPL.
 
+### Encryption keys and recovery
+
+```
+keygen <path>                                          # write a new key for a crypt vault
+decrypt <input> <output> (--key-file <f> | --key-env <var>) [-f | --force]
+```
+
+`keygen` writes a new random key to a **new** file, readable by you only (`0600`), and never
+overwrites an existing one (the `new` wizard can also create one for an encrypted vault);
+point a `crypt` vault's `key_file` at it (see
+[Encrypted vaults](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md#encrypted-vaults-type--crypt)).
+**Losing the key loses the data**, so back it up somewhere other than the vault's storage, a
+password manager say. A key file other users can read draws a warning whenever its vault is
+opened.
+
+`decrypt` is the recovery tool: it decrypts one stored object straight from its file (say, a
+file copied off a backup disk or out of a bucket) into a new file, with no vault config,
+registry or server involved. The output appears only once the whole object has decrypted and
+checked out, readable by you only: a wrong key or a damaged or truncated file leaves nothing
+behind. An existing output is refused without `--force`, and then replaced atomically.
+
+On a filesystem without hard links (FAT/exFAT, as on most USB sticks, and many network mounts),
+a new output or key file is copied into place instead, so a crash midway can leave a partial
+one; on Windows these files take the directory's permissions rather than `0600`.
+
+Both work as one-shot commands and in the REPL. As one-shot commands they run before nimbus
+loads its config and session, so they work even when those can't load.
+
+> New in 0.4.0 (unreleased). Until then, clone the repo and build from the checkout: `cargo install --path crates/cli`
+
 ## Writing a custom origin
 
 If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `command` lets you wire up arbitrary shell commands. Each operation gets its own command template with `{id}`, `{name}`, `{size}`, `{content_type}`, `{modified}`, `{kind}` (`leaf`/`branch`) and `{destination}` (where applicable) substituted in, plus any custom `extras` you define — see [`crates/vault/README.md`](https://github.com/PeachGB/nimbus/blob/main/crates/vault/README.md) for the full reference:
@@ -188,7 +218,7 @@ If none of the built-in origins (`fs`, `http`, `vault`) fit your backend, `comma
 
 ## Testing against other origins
 
-[`test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md) holds a vault config per origin type (`fs`, `http`, `command`, and a vault wrapping another vault), including reference `http` and `command` origin implementations to run them against. Their paths are relative to each config file, so they work from any directory; export a scratch `XDG_STATE_HOME` before you start so your real vault registry is left untouched — see that README for the per-origin walkthrough.
+[`test/`](https://github.com/PeachGB/nimbus/blob/main/crates/cli/test/README.md) holds a vault config per origin type (`fs`, `http`, `command`, a vault wrapping another vault, and an encrypted `crypt` vault whose key, `TEST-ONLY.key`, is public in the repository and must never protect real data), including reference `http` and `command` origin implementations to run them against. Their paths are relative to each config file, so they work from any directory; export a scratch `XDG_STATE_HOME` before you start so your real vault registry is left untouched — see that README for the per-origin walkthrough.
 
 ## License
 

@@ -9,6 +9,8 @@ use bytes::Bytes;
 
 /// [`command::OriginCommand`]: an origin backed by a shell command per operation.
 pub mod command;
+/// [`crypt::OriginCrypt`]: another origin's objects, encrypted at rest.
+pub mod crypt;
 /// [`fs::OriginFileSystem`]: an origin backed by a directory on disk.
 pub mod fs;
 /// [`http::OriginHTTP`]: an origin backed by a REST-ish HTTP API.

@@ -1,7 +1,7 @@
 # test vaults
 
-One config per `type` of `OriginConfig` (`crates/vault/src/config.rs`), for trying the
-REPL by hand against each one. The commands below are typed at the REPL prompt
+One config per `type` of `OriginConfig` (`crates/vault/src/config.rs`: `fs`, `command`,
+`http`, `vault` and `crypt`), for trying the REPL by hand against each one. The commands below are typed at the REPL prompt
 (`nimbus />>`).
 
 The paths inside the `.toml` files are relative to each config file's own directory
@@ -132,3 +132,36 @@ ls
 cd docs
 ls
 ```
+
+## crypt/ — `type = "crypt"`
+
+An encrypted vault over a local `fs` origin (`crypt/data/`). The files in `data/` are
+ciphertext (each starts with `NMBC`), plus the hidden `.nimbus-crypt` marker; through the
+vault they read as `fs/`'s `notes.txt` and `docs/todo.txt`, copied in with `cp`.
+
+**`TEST-ONLY.key` is public: it is committed to the repository, so anyone can read it and
+this vault protects nothing.** It must never protect real data; make your own key with
+`keygen`. Git checks it out readable by everyone, so nimbus warns about it until you
+`chmod 600` it:
+
+```sh
+chmod 600 crates/cli/test/crypt/TEST-ONLY.key
+```
+
+```
+new crates/cli/test/crypt/crypt.toml
+select crypt-vault
+ls
+cd docs
+ls
+```
+
+Recovering a file without any vault, as you would from a backup copy of `data/`:
+
+```sh
+cargo run -p nimbus-cli -- decrypt crates/cli/test/crypt/data/notes.txt /tmp/notes.txt \
+    --key-file crates/cli/test/crypt/TEST-ONLY.key
+```
+
+A new key of your own: `cargo run -p nimbus-cli -- keygen /path/to/new.key` (it refuses to
+overwrite an existing file).

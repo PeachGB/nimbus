@@ -138,3 +138,33 @@ fn config_dir_of_an_absolute_path_is_its_parent() {
     let dir = config_dir(Path::new("/etc/nimbus/x.toml")).unwrap();
     assert_eq!(dir, PathBuf::from("/etc/nimbus"));
 }
+
+#[test]
+fn read_secret_zeroizing_trims_like_read_secret() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("key");
+    for (written, read) in [
+        ("k3y\r\n", "k3y"),
+        ("k3y\n\n", "k3y"),
+        ("  k 3y\n", "  k 3y"),
+    ] {
+        std::fs::write(&path, written).unwrap();
+        assert_eq!(
+            read_secret_zeroizing(&path).unwrap().as_str(),
+            read,
+            "{written:?}"
+        );
+    }
+}
+
+#[test]
+fn read_secret_zeroizing_refuses_empty_and_non_utf8_files() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("key");
+    for written in [&b""[..], b"\n\r\n", b"\xff\xfe secret"] {
+        std::fs::write(&path, written).unwrap();
+        let error = read_secret_zeroizing(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{written:?}");
+        assert!(!error.to_string().contains("secret"), "{error}");
+    }
+}

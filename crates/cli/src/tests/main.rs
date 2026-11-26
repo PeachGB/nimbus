@@ -250,3 +250,70 @@ fn sample_command_vault_templates_use_root_not_a_hardcoded_path() {
         );
     }
 }
+
+#[test]
+fn collected_warnings_are_printed_one_per_line() {
+    let mut out = Vec::new();
+    write_warnings(
+        &mut out,
+        &["WARNING: first".to_string(), "NOTE: second".to_string()],
+    );
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "WARNING: first\nNOTE: second\n"
+    );
+}
+
+#[test]
+fn parses_keygen_and_decrypt_which_need_no_app() {
+    let keygen = parse(&["keygen", "v.key"]);
+    assert!(matches!(&keygen, Commands::Keygen { path } if path == &PathBuf::from("v.key")));
+    assert!(!keygen.needs_app());
+
+    let decrypt = parse(&["decrypt", "in", "out", "--key-file", "v.key", "--force"]);
+    assert!(matches!(
+        &decrypt,
+        Commands::Decrypt {
+            key_file: Some(_),
+            key_env: None,
+            force: true,
+            ..
+        }
+    ));
+    assert!(!decrypt.needs_app());
+    assert!(parse(&["ls"]).needs_app());
+}
+
+#[test]
+fn decrypt_needs_exactly_one_key_source() {
+    let try_parse =
+        |args: &[&str]| Cli::try_parse_from(std::iter::once("nimbus").chain(args.iter().copied()));
+    assert!(try_parse(&["decrypt", "in", "out"]).is_err());
+    assert!(try_parse(&["decrypt", "in", "out", "--key-file", "k", "--key-env", "K"]).is_err());
+    assert!(try_parse(&["decrypt", "in", "out", "--key-env", "K"]).is_ok());
+}
+
+#[test]
+fn a_key_kept_without_a_config_is_reported() {
+    let kept = nimbus_creator::Outcome {
+        config: None,
+        unsaved_key_file: Some(PathBuf::from("/keys/v.key")),
+    };
+    let mut out = Vec::new();
+    write_unsaved_key_notice(&mut out, &kept);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "{}\n",
+            nimbus_creator::kept_key_notice(std::path::Path::new("/keys/v.key"))
+        )
+    );
+
+    let saved = nimbus_creator::Outcome {
+        config: Some(PathBuf::from("/vaults/v.toml")),
+        unsaved_key_file: None,
+    };
+    let mut out = Vec::new();
+    write_unsaved_key_notice(&mut out, &saved);
+    assert!(out.is_empty());
+}

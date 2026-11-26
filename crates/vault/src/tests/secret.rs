@@ -39,3 +39,13 @@ fn secret_matches_only_the_same_bytes() {
     }
     assert!(Secret::from("").matches(b""));
 }
+
+#[test]
+fn a_secret_takes_a_wiped_buffer_without_copying_it() {
+    let text = zeroize::Zeroizing::new("s3cr3t".to_string());
+    let address = text.as_ptr();
+    let secret = Secret::from(text);
+    assert_eq!(secret.expose(), "s3cr3t");
+    // The same allocation, moved rather than copied.
+    assert_eq!(secret.expose().as_ptr(), address);
+}
